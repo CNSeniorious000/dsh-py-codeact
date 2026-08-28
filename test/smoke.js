@@ -72,6 +72,17 @@ await check('redundant re-import is flagged', 'import json', (r) => {
   assert.match(r.note, /`json` is already imported/)
 })
 
+// The hint only fires when a name is rebound to the object it already holds, so it has to tell an import apart from a coincidental self-assignment — and the disassembly that does so is now cached, which is exactly the kind of change that silently removes a feature while making it fast.
+await check('a coincidental rebind is not mistaken for a re-import', 'zz = 1\nzz = zz', (r) => {
+  assert.equal(r.ok, true)
+  assert.equal(r.note, undefined, 'only imports earn the hint')
+})
+
+// Interned values (`None`, `True`, small ints) make every top-level iteration take the hint path. Re-disassembling the whole cell there cost 771ms against 0.1ms for the same work in a function body — for a hint that never fired.
+await check('a hot top-level loop does not pay for the hint', 'import time\n_t = time.perf_counter()\nfor _i in [None] * 20000:\n    _j = _i\n(time.perf_counter() - _t) < 0.2', (r) => {
+  assert.equal(r.repr, 'True', 'rebinding an interned value 20k times must not re-scan the cell each round')
+})
+
 await check('from __dsh__.tools import <name>', 'from __dsh__.tools import read\nawait read(file_path="/etc/hosts")', (r) => {
   assert.equal(r.ok, true)
   assert.match(r.repr, /'from': 'read'/)

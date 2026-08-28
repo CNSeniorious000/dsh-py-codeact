@@ -1,6 +1,6 @@
 {
   "name": "dsh-py-codeact",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CodeAct agent loop for the DeepSeek Harness: a persistent IPython session as the model's action space, with harness tools bridged in as a virtual `__dsh__.tools` module.",
   "license": "MIT",
   "repository": {

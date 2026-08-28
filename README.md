@@ -176,10 +176,8 @@ By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `L
 
 ## Install
 
-Not on npm — install from the repository:
-
 ```sh
-dsh plugin --profile <name> add github:CNSeniorious000/dsh-py-codeact
+dsh plugin --profile <name> add dsh-py-codeact
 ```
 
 Then add the row from `example/agent.cordis.yml` to a preset you own.

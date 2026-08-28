@@ -1,0 +1,33 @@
+# The `py-codeact` agent preset: the standard coding agent, with a persistent Python REPL as its action space instead of one-shot `run_code`.
+#
+# Copy this into ${DSH_HOME:-$HOME/.dsh}/.agent-presets/py-codeact/agent.cordis.yml (start from `copy('standard', 'py-codeact')` via ctx.agentPresets, then apply the two edits below — a composition written from scratch usually forgets a realm or a consumer row).
+#
+# The two edits, relative to a copy of `standard`:
+#
+#   1. Add the `py-codeact` row below.
+#   2. Leave `tools.mode` at its default `native`. dsh's own Code Mode (`mode: code`) would ALSO reserve `run_code` and add its `tools:sdk` section — two code-execution surfaces in one prompt confuses the model. This plugin is a normal tool, so `native` is exactly right.
+#
+# PLANE: this row publishes no service — the kernels are private to the plugin fiber, keyed by session — so it needs NO `isolate` realm and sits loose, like `tool-bash`. It only CONSUMES the host `tools`, `systemPrompt`, and `sessions` registries; wrapping it in a realm would starve it of exactly those.
+
+- id: py-codeact
+  name: dsh-py-codeact
+  config:
+    # Omit both `command` and `python` to spawn `uv run --script py/kernel.py`, which provisions IPython from the script's PEP 723 header. First use pays a resolve; warm afterwards.
+    #
+    # `python` names an interpreter that ALREADY has ipython + objprint — a prepared project venv, so the model can import the project's own packages:
+    #   python: /path/to/.venv/bin/python
+    #
+    # `command` is the full argv escape hatch:
+    #   command: ['uv', 'run', '--with', 'pandas', '--script', '...']
+
+    # Model-facing tool name. Keep it distinct from `run_code` — and from an MCP IPython server's, if one is mounted (see the README).
+    toolName: python
+
+    # 'code' (default): `python` is the ONLY directly callable tool; everything else is reachable solely as `from __dsh__.tools import ...` inside a cell.
+    # 'both' keeps the native schemas too — for debugging a composition.
+    mode: code
+
+    # false (default) spawns with an allowlisted environment — PATH, HOME, TMPDIR, LANG, LC_ALL, TERM — so no ambient credentials reach model code. (Not an EMPTY env like the worker-thread runtime: CPython running IPython needs a profile dir and a PATH for shell escapes.) Set true to pass the whole harness environment through.
+    inheritEnv: false
+
+# TRUST: this is bash-equivalent. The kernel is containment (separate process, empty env), NOT a security boundary — model code can import `os` and do anything the harness user can. Compose it only where you would compose `tool-bash`, and keep the host sandbox/approval rows in place: they still gate every BRIDGED tool call, because sub-dispatches re-enter the full pre-execute -> guards -> execute -> post-execute pipeline.

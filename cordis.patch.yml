@@ -1,0 +1,10 @@
+# Profile-level row for the BROWSER half only.
+#
+# The client bundle is served for packages named by an enabled Loader entry, and an agent preset's rows are per-session — they are not in the profile's entry list at boot, so a preset-only mount never gets its card served. This row puts the package in that list.
+#
+# `uiOnly` makes the host half a no-op here: mounting it at profile level would register `python` globally and apply exclusive mode's guard to EVERY preset. The real host half is mounted by the agent preset row.
+- insert:
+    - id: py-codeact-ui
+      name: dsh-py-codeact
+      config:
+        uiOnly: true

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "pep723": {
+    // https://docs.renovatebot.com/modules/manager/pep723/
+    // https://packaging.python.org/en/latest/specifications/inline-script-metadata/
+    // The pep723 manager matches nothing by default; py/kernel.py carries its deps (ipython, objprint) in an inline `# /// script` block, not in a lockfile.
+    "managerFilePatterns": [
+      "/^.*\\.py$/"
+    ]
+  }
+}

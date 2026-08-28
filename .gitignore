@@ -1,0 +1,12 @@
+node_modules/
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+
+# Session-local agent state, never part of the package
+.remember/
+.claude/
+.DS_Store

@@ -1,0 +1,12 @@
+line-length = 200
+# The PEP 723 header on py/kernel.py pins `requires-python = ">=3.12"`; stated rather than
+# inferred so ruff does not read whatever interpreter it happens to find.
+target-version = "py312"
+
+[lint]
+extend-select = ["I", "N", "W", "UP", "RUF", "FURB", "C4", "ARG", "PIE", "PTH", "RSE", "SIM", "SLF", "B", "FA", "TC", "ISC", "ASYNC"]
+
+[format]
+# Comments and docstrings are written as one line each, however long; ruff format leaves them
+# alone, and no line-length rule is selected, so nothing rewraps them behind our back.
+docstring-code-format = false

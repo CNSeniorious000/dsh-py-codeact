@@ -18,7 +18,7 @@ Wire protocol: JSON-lines on fd 3. stdout/stderr stay free for native writes.
 
 Every frame but `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
 
-  host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","params":[...]}]}
+  host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","returns","params":[...]}]}
                   {"t":"exec","id":N,"shell":S,"code":"...","tools":[...]}
                   {"t":"result","id":N,"ok":true,"value":<json>}
                   {"t":"result","id":N,"ok":false,"tool":"read","message":"..."}
@@ -233,7 +233,8 @@ def _make_binding(bridge: Bridge, spec):
     if dropped:
         params.append(inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD))
     with contextlib.suppress(ValueError, TypeError):
-        call.__signature__ = inspect.Signature(params)  # type: ignore
+        # The return annotation matters as much as the parameters here: it is what `read?` can tell the model that no amount of re-reading the call site can. Same source as the prompt block, so the two never disagree.
+        call.__signature__ = inspect.Signature(params, return_annotation=spec.get("returns") or "Any")  # type: ignore
     return call
 
 

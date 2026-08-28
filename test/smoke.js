@@ -424,6 +424,21 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL points at getattr for names that are not identifiers\n       ${error.message}`)
   }
+  // The return type is the one thing a model cannot recover by reading harder: an unknown return shape costs a whole turn per tool — call once, print, then write the cell that uses it.
+  try {
+    const rendered = renderToolsSection([
+      { name: 'read', parameters: { properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } },
+      { name: 'glob', parameters: { properties: { pattern: { type: 'string' } }, required: ['pattern'] }, output: { type: 'array', items: { type: 'string' } } },
+    ])
+    assert.match(rendered, /async def read\(\*, file_path: str\) -> str: \.\.\./, "a tool's declared output type must reach the signature")
+    assert.match(rendered, /async def glob\(\*, pattern: str\) -> list\[str\]: \.\.\./, 'including container types')
+    // `schemas()` has no `output`; only `sdkSchemas()` carries it. Rendering `Any` there is right — asserting a wrong type would be worse than admitting ignorance.
+    assert.match(renderToolsSection([{ name: 'read', parameters: {} }]), /async def read\(\) -> Any: \.\.\./, 'a schema with no output falls back to Any')
+    console.log('  ok   renders each tool\'s real return type')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
+  }
   // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])

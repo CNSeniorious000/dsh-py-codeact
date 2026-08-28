@@ -58,7 +58,22 @@ Docstring: Read a file from the workspace. Results include line numbers…
 
 That is why the prompt block carries signatures only — the descriptions are one `?` away instead of resident in every request. Annotations are rendered host-side with dsh's own exported `jsonSchemaToPy`, so there is no second JSON-Schema mapper to drift.
 
-The **return** type comes from the tool's own `output` schema, by way of `ctx.tools.sdkSchemas(scope)` — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders `Any`; claiming a type nobody declared would be worse than admitting ignorance. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.
+The **return** type comes from the tool's own `output` schema, by way of `ctx.tools.sdkSchemas(scope)` — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders `Any`; claiming a type nobody declared would be worse than admitting ignorance.
+
+Every object in that schema is declared as a named `TypedDict` above the signatures, because for an MCP tool the flat form is not merely vague — it is the whole message. dsh's MCP client resolves a call to the **envelope** `{ content, structuredContent }` and declares exactly that as the tool's output, so a model told only `dict[str, Any]` is not told the envelope exists: it reaches for the payload directly, gets nothing, and spends the turn printing the result to find the wrapper — the exact cost this annotation is here to remove.
+
+```python
+class McpCalendarListEventsOutputStructuredContent(TypedDict):
+    result: str
+
+class McpCalendarListEventsOutput(TypedDict):
+    content: list[Any]
+    structuredContent: McpCalendarListEventsOutputStructuredContent
+
+async def mcp__calendar__list_events(*, calendar_id: str) -> McpCalendarListEventsOutput: ...
+```
+
+`jsonSchemaToPy` cannot do this and says so — it is context-free, and naming a `TypedDict` needs the render context `renderToolsSdkPy` supplies. That renderer is not reusable here: it emits a whole document in Code Mode's own `tools.name(args)` contract. So only the object and array branches are handled locally, every leaf still going through `jsonSchemaToPy` — a place to hang the names, not a second JSON-Schema mapper. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.
 
 ### MCP tools work, with nothing special
 
@@ -161,7 +176,7 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 - **Native writes are not captured.** stdout/stderr are captured at the Python level, so `print` is captured but a subprocess writing to fd 1 is not. Use `subprocess.run(..., capture_output=True)`, or `%run`. (Anything that does reach fd 1/2 — including IPython's own colored traceback, deliberately routed there — is retained only for the crash message.)
 - **Scope is not optional.** The visible tool set comes from `ctx.tools.sdkSchemas(scope)` — the scope being the agent. Omitting it yields the *global* view, which in a preset composition holds only host-registered tools; the preset's own `read`/`bash`/`edit` live in the agent scope and vanish. The prompt section reads `assembly.scope`, and the kernel's name list is resent with every cell (restrictions and mid-conversation tool changes can move a tool in or out between calls).
 - **Pick a `toolName` nothing else answers to.** With an MCP IPython server also mounted, a model told to "use the python tool" reaches for `mcp__py__ipython_execute_code` — which has no `tools` binding — and then reports that your tool does not exist.
-- **MCP return types are shapeless.** An MCP tool's canonical value is the envelope (`content`, plus `structuredContent` when the server advertises an output schema), and `jsonSchemaToPy` collapses an object to `dict[str, Any]` — so the annotation says a dict arrives without saying which keys. dsh renders that shape as a `TypedDict` for Code Mode via `renderToolsSdkPy`, but that renderer emits a whole document in Code Mode's own `tools.name(args)` contract, not a line per signature. Since the envelope is uniform, a sentence of prose buys more here than a per-tool emitter that would duplicate dsh's mapper.
+- **A shape Python cannot name stays vague.** A field whose key is not a valid identifier degrades its own class back to `dict[str, Any]` rather than emitting a body that will not parse — the tool stays callable and only that one annotation goes quiet. Same for a schema with no declared properties: `Any` beats claiming a type nobody declared.
 - **Cold start.** The PEP 723 environment is resolved on first use (`uv python find --script`). Warm afterwards; pass `python` to skip it.
 
   The interpreter is then spawned **directly**, never behind `uv run --script`. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an `[the interpreter was restarted]` notice nothing actually caused. `alive` is likewise tracked from the exit event rather than read off `proc.killed`, which Node sets on any `kill()` call, including a signal the process survived.

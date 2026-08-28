@@ -439,6 +439,46 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
   }
+  // An MCP call resolves to the ENVELOPE dsh's client builds — `{ content, structuredContent }` —
+  // and that is what the tool declares as its output. Collapsed to `dict[str, Any]` the model is
+  // not told the wrapper is there, so it reaches for the payload directly and burns a turn
+  // discovering the shape. The declaration is the whole point: it has to name the envelope AND
+  // the server's own payload inside it.
+  try {
+    const structuredContent = { type: 'object', properties: { result: { type: 'string' } }, required: ['result'] }
+    const rendered = renderToolsSection([{
+      name: 'mcp__calendar__list_events',
+      parameters: { properties: { calendar_id: { type: 'string' } }, required: ['calendar_id'] },
+      output: { type: 'object', properties: { content: { type: 'array', items: {} }, structuredContent }, required: ['content', 'structuredContent'] },
+    }])
+    assert.match(rendered, /async def mcp__calendar__list_events\(\*, calendar_id: str\) -> McpCalendarListEventsOutput: \.\.\./, 'the signature names the declared type, not `dict[str, Any]`')
+    assert.match(rendered, /class McpCalendarListEventsOutput\(TypedDict\):\n {4}content: list\[Any\]\n {4}structuredContent: McpCalendarListEventsOutputStructuredContent/, 'the envelope is spelled out')
+    assert.match(rendered, /class McpCalendarListEventsOutputStructuredContent\(TypedDict\):\n {4}result: str/, "and so is the server's own payload")
+    assert.ok(
+      rendered.indexOf('class McpCalendarListEventsOutputStructuredContent') < rendered.indexOf('class McpCalendarListEventsOutput('),
+      'a nested class is declared before the class that references it',
+    )
+    assert.match(rendered, /from typing import Any, TypedDict\n/, 'the import lists what the render used and nothing else — every field here is required, so no `NotRequired`')
+    console.log('  ok   an MCP envelope is declared, not flattened')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL an MCP envelope is declared, not flattened\n       ${error.message}`)
+  }
+  // A class body Python cannot parse is worse than a vague annotation, and `oneOf` branches that
+  // degrade to the same text are a choice the model does not actually have.
+  try {
+    const rendered = renderToolsSection([
+      { name: 'odd_keys', parameters: { properties: {} }, output: { type: 'object', properties: { 'not-a-name': { type: 'string' } }, required: ['not-a-name'] } },
+      { name: 'optional_keys', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } }, required: ['a'] } },
+    ])
+    assert.match(rendered, /async def odd_keys\(\) -> dict\[str, Any\]: \.\.\./, 'a field Python cannot name degrades that one class, and only it')
+    assert.ok(!rendered.includes('not-a-name'), 'no unparsable class body is emitted')
+    assert.match(rendered, /class OptionalKeysOutput\(TypedDict\):\n {4}a: str\n {4}b: NotRequired\[str\]/, 'an optional key is NotRequired')
+    console.log('  ok   an unnameable field degrades its class, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL an unnameable field degrades its class, not the block\n       ${error.message}`)
+  }
   // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])

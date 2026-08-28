@@ -144,7 +144,7 @@ await check('exception returns an IPython traceback, kernel survives', '1 / 0', 
 
 await check('state intact after the exception', 'counter', (r) => assert.equal(r.repr, '40'))
 
-// fd 3 is non-blocking, so a frame past the socket send buffer (8 KiB on macOS) used to be short-written mid-JSON, silently. The next frame concatenated onto the stump, the host dropped one unparseable blob, and the session wedged: no `done` ever arrived and every later cell hung too.
+// fd 3 is non-blocking, so a frame past the socket send buffer (8 KiB on macOS) used to be short-written mid-JSON, silently. The next frame concatenated onto the stump, the host dropped one unparsable blob, and the session wedged: no `done` ever arrived and every later cell hung too.
 await check('a cell far larger than the pipe buffer round-trips', "print('X' * 300_000)", (r) => {
   assert.equal(r.ok, true)
   assert.equal(r.stdout.length, 300_001)
@@ -181,11 +181,11 @@ rs = await asyncio.gather(*(read(file_path=p) for p in paths))
 })
 
 // `uv pip install` refuses without VIRTUAL_ENV, and IPython's `!cmd` does not fail the cell on a non-zero exit — so the install looked fine and the import failed a cell later, with nothing connecting the two. Each kernel gets a throwaway venv inheriting the base one, so a cell's `!uv pip install` cannot leak into the shared PEP 723 environment that every session and every future run resolves to.
-await check('the kernel runs in a throwaway venv, not the shared one', 'import sys, os\n(sys.prefix.startswith(os.environ["TMPDIR"].rstrip("/")), "IPython" in sys.modules)', (r) => {
+await check('the kernel runs in a throwaway venv, not the shared one', 'import sys\n("dsh-py-codeact-" in sys.prefix, "IPython" in sys.modules)', (r) => {
   assert.equal(r.repr, '(True, True)')   // isolated, yet the inherited packages are there
 })
 
-await check('the kernel points uv at its own environment', 'import os, sys\n(os.environ.get("VIRTUAL_ENV") == sys.prefix, sys.prefix != sys.base_prefix)', (r) => {
+await check('the kernel points uv at its own environment', 'import os, sys\n(os.path.realpath(os.environ.get("VIRTUAL_ENV", "")) == os.path.realpath(sys.prefix), sys.prefix != sys.base_prefix)', (r) => {
   assert.equal(r.repr, '(True, True)')
 })
 
@@ -428,7 +428,7 @@ console.log('prompt:')
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])
     assert.match(rendered, /import ToolCallError, odd/, 'it is still importable — only its signature is imprecise')
-    assert.match(rendered, /async def odd\(\*\*kwargs: Any\)/, 'the signature falls back rather than emitting an unparseable one')
+    assert.match(rendered, /async def odd\(\*\*kwargs: Any\)/, 'the signature falls back rather than emitting an unparsable one')
     console.log('  ok   an unnameable parameter costs the signature, not the tool')
   } catch (error) {
     failures += 1

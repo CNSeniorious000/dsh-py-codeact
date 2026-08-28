@@ -1,0 +1,44 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions: {}
+
+jobs:
+  python:
+    name: ruff + ty
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+      - name: Check formatting and lints
+        run: |
+          uvx ruff format --check --diff py/
+          uvx ruff check --diff py/
+      # `TY_UV=scripts` is what hands ty the script's own PEP 723 environment; without it the IPython imports are unresolved and the run is meaningless rather than failing.
+      - name: Check typing
+        run: TY_UV=scripts uvx ty check py/kernel.py
+
+  smoke:
+    name: smoke (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu, macos]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The suite spawns the real kernel, which builds its own PEP 723 environment — no separate Python setup, but uv has to be there.
+      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node test/smoke.js
+
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: crate-ci/typos@v1.49.1

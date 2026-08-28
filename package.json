@@ -9,12 +9,16 @@
   },
   "keywords": [
     "dsh",
+    "dsh-plugin",
+    "deepseek",
     "deepseek-harness",
+    "cordis-plugin",
     "codeact",
+    "agent",
+    "python",
     "ipython",
     "repl",
-    "agent",
-    "cordis-plugin"
+    "mcp"
   ],
   "type": "module",
   "main": "lib/index.js",

@@ -176,11 +176,15 @@ By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `L
 
 ## Install
 
+Not on npm — install from the repository:
+
 ```sh
-dsh plugin --profile <name> add dsh-py-codeact
+dsh plugin --profile <name> add github:CNSeniorious000/dsh-py-codeact
 ```
 
 Then add the row from `example/agent.cordis.yml` to a preset you own.
+
+The kernel provisions its own Python from the PEP 723 header in `py/kernel.py`, so `uv` is the only prerequisite beyond dsh itself; the first cell pays for that resolve and later ones are warm.
 
 **For the card, also list the package in the profile's `dsh.profile.bundles`** (`~/.dsh/profiles/<name>/package.json`). The browser bundle is served only for packages named by an *enabled Loader entry*, and a preset's rows are per-session — they are not in the profile's entry list at boot, so a preset-only mount never gets its card. This package's own `cordis.patch.yml` therefore inserts one profile-level row carrying `uiOnly: true`, which makes the host half a no-op there: mounting it at profile level would register `python` globally and apply exclusive mode's guard to every preset. Never edit a shipped preset — copy it first (`ctx.agentPresets.copy('standard', 'py-codeact')`) and mount-validate the result with `standingKeyFor('py-codeact')`.
 

@@ -1,0 +1,114 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: Version increment (`none` publishes package.json as it stands)
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - patch
+          - minor
+          - major
+          - prepatch
+          - preminor
+          - premajor
+          - prerelease
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'CNSeniorious000/dsh-py-codeact'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - run: bun install --frozen-lockfile
+
+      # What ships is what CI already gates on, run again here: a release must not be the one
+      # artifact nobody checked. The suite spawns the real kernel, hence uv above.
+      - run: node test/smoke.js
+      - run: uvx ruff check py/
+      - run: TY_UV=scripts uvx ty check py/kernel.py
+
+      - name: Resolve version
+        id: version
+        env:
+          INCREMENT: ${{ inputs.increment }}
+        run: |
+          if [ "$INCREMENT" != "none" ]; then bun pm version "$INCREMENT" --no-git-tag-version; fi
+          version="$(bun -e 'console.log((await Bun.file("package.json").json()).version)')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - run: bun pm pack --dry-run
+
+      - name: Commit and tag release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          # `none` leaves package.json untouched, so there is nothing to commit — only the tag.
+          if ! git diff --quiet package.json; then
+            git add package.json
+            git commit -m "release v${VERSION}"
+          fi
+          git tag "$TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "$TAG"
+
+      - name: Pack package
+        id: pack
+        run: |
+          tarball_dir="$(mktemp -d)"
+          tarball="$(bun pm pack --destination "$tarball_dir" --quiet | awk 'NF { last = $0 } END { print last }')"
+          case "$tarball" in /*) tarball_path="$tarball" ;; *) tarball_path="$tarball_dir/$tarball" ;; esac
+          echo "tarball=$tarball_path" >> "$GITHUB_OUTPUT"
+
+      # Trusted publishing (OIDC): no NPM_TOKEN anywhere. The npm CLI detects the OIDC environment
+      # and exchanges this workflow's short-lived id-token for a registry token — but ONLY if
+      # NODE_AUTH_TOKEN is absent. An EMPTY one is not the same as an absent one: npm takes the
+      # legacy path either way and never attempts the exchange, which silently disables trusted
+      # publishing while still looking wired up. Never add it to this step.
+      #
+      # Four things have to hold, and the first is not in this file:
+      #   1. npmjs.com -> the package -> Settings -> Trusted Publisher: owner `CNSeniorious000`,
+      #      repo `dsh-py-codeact`, workflow filename `publish.yml` (filename only, with the
+      #      extension), and Environment name LEFT EMPTY — which is why no `environment:` key
+      #      appears on this job. All case-sensitive, and npm does NOT validate any of it when
+      #      saved; a mismatch only surfaces as ENEEDAUTH at publish time, after the release
+      #      commit and tag have already been pushed.
+      #   2. `id-token: write` (declared above) on a GitHub-hosted runner. Self-hosted is unsupported.
+      #   3. npm >= 11.5.1, which node 24 satisfies.
+      #   4. `repository.url` in package.json matching this repo — provenance requires it too.
+      #
+      # A trusted publisher can only be attached to a package that already EXISTS, so the first
+      # publish of a new name cannot use OIDC (npm/cli#8544 — left out of the MVP on purpose,
+      # where PyPI and JSR both allow a pending publisher). `0.0.0` was pushed by hand to hold the
+      # name; from here every release is tokenless and carries provenance.
+      #
+      # --provenance is not passed: with trusted publishing the CLI attaches it by default.
+      # --access public is still required while the package has never had a non-placeholder release.
+      - name: Publish package
+        run: npm publish --access public "${{ steps.pack.outputs.tarball }}"

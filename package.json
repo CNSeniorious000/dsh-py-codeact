@@ -13,7 +13,8 @@
     "lib",
     "py",
     "example",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "!**/__pycache__"
   ],
   "license": "MIT",
   "dsh": {

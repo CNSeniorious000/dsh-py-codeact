@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 
 const calls = []
@@ -360,6 +360,21 @@ try {
   console.log(`  FAIL history stays in memory and Out[n] retention is bounded\n       ${error.message}`)
 }
 
+// The host skips a rebind whenever this key is unchanged, so anything the kernel would render differently has to move it. The shell-level tests below cannot cover this: they drive `kernel.exec` directly, past the layer that makes the decision.
+console.log('rebind identity:')
+try {
+  const base = [{ name: 'read', doc: 'original', params: [{ name: 'p', type: 'str', required: true }] }]
+  const sameNames = (specs) => specsKey(base) === specsKey(specs)
+  assert.ok(sameNames(structuredClone(base)), 'an identical catalogue must not force a rebind')
+  assert.ok(!sameNames([{ ...base[0], doc: 'revised' }]), 'a changed description must force one — it is the docstring `read?` prints')
+  assert.ok(!sameNames([{ ...base[0], params: [...base[0].params, { name: 'limit', type: 'int', required: false }] }]), 'a new parameter must force one')
+  assert.ok(!sameNames([{ ...base[0], params: [{ name: 'p', type: 'str', required: false }] }]), 'a parameter that stops being required must force one')
+  console.log('  ok   the key moves for anything the kernel would render differently')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL the key moves for anything the kernel would render differently\n       ${error.message}`)
+}
+
 // The prompt block is Python the model copies from. One tool it cannot render used to invalidate the WHOLE block, so no line in it could be used.
 console.log('prompt:')
 {
@@ -465,6 +480,14 @@ console.log('shells:')
     const [a, b] = await Promise.all([parent, child])
     assert.equal(a.repr, `'P-inner'`, 'the parent must not lose its value to the shell that happened to be running')
     assert.equal(b.repr, `'C-outer'`)
+  })
+
+  // A tool can keep its name and change everything else — an MCP server reconnecting with a revised schema is the ordinary case. Keying the rebind-skip on names alone left the kernel serving the old signature while the prompt showed the new one.
+  await checkShell('a same-named tool with a changed schema is rebound', async () => {
+    const v2 = [{ name: 'read', doc: 'REVISED', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }]
+    await shells.exec('1', undefined, v2, 'parent')
+    assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__', 'parent')).repr, `'REVISED'`)
+    assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)', 'parent')).repr, `['kwargs', 'limit']`)
   })
 
   await checkShell('closing one shell leaves the others running', async () => {

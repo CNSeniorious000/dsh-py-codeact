@@ -490,6 +490,16 @@ console.log('shells:')
     assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)', 'parent')).repr, `['kwargs', 'limit']`)
   })
 
+  // The host skips a rebind it believes already landed, and a busy kernel answers with an ordinary `ok: false` frame — so `exec` RESOLVES and the outcome has to be read. This pins the exact wording that decision keys on: change it here and the host silently starts trusting a rebind that never happened.
+  await checkShell('a busy shell is refused with the wording the host keys on', async () => {
+    const running = cell('import asyncio\nawait asyncio.sleep(0.5)', 'parent')
+    await new Promise((resume) => setTimeout(resume, 80).unref())
+    const refused = await cell('1', 'parent')
+    assert.equal(refused.ok, false)
+    assert.equal(refused.error, 'kernel busy: a previous cell is still running')
+    await running
+  })
+
   await checkShell('closing one shell leaves the others running', async () => {
     shells.closeShell('child')
     assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)

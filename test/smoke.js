@@ -621,8 +621,10 @@ console.log('mcp namespace:')
     assert.match(r.error, /ModuleNotFoundError.*__dsh__\.tools\.mcp\.dropbox/)
   })
   // Same liveness rule as the `mcp` object: `sys.modules` is process-global, the catalogue is not.
-  await t('a kept server module follows the catalogue', 'kept_cal = calendar\nsorted(dir(kept_cal))', (r) => {
-    assert.equal(r.repr, "[]", 'calendar is gone from this catalogue, and the module says so rather than serving stale tools')
+  await t('a kept server module follows the catalogue', 'kept_cal = calendar\n(sorted(dir(kept_cal)), hasattr(kept_cal, "create_event"))', (r) => {
+    // Both halves: an empty `dir()` only proves the LISTING moved. Reaching for a tool the old
+    // catalogue had is the thing that must also stop working.
+    assert.equal(r.repr, "([], False)", 'calendar is gone from this catalogue, and the module neither lists nor serves its tools')
   }, MOVED)
   // The raw name is the server's to choose, and a leading underscore is legal in it. The block
   // renders `mcp.cal._private()` for one — which the namespace has to be able to answer.
@@ -630,6 +632,14 @@ console.log('mcp namespace:')
   await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__cal___private'", r.error)
   }, UNDERSCORED)
+  // `sys.modules` is process-global and only ever gains entries, so a server ANOTHER shell mounted
+  // stays importable here. Pinned rather than left to chance: what leaks is the module's existence,
+  // not a tool — it resolves empty, and the grouping still lists only this shell's servers.
+  await ns.start([{ name: 'mcp__vault__unlock', doc: 'Only this shell has it.', params: [] }], 'other')
+  await ns.exec('from __dsh__.tools.mcp.vault import unlock', undefined, [{ name: 'mcp__vault__unlock', doc: 'x', params: [] }], 'other')
+  await t('a server only another shell mounted imports here, but is empty', 'import __dsh__.tools.mcp.vault as v\n(dir(v), hasattr(v, "unlock"), "vault" in dir(mcp))', (r) => {
+    assert.equal(r.repr, "([], False, False)", r.error)
+  })
   ns.dispose()
 }
 

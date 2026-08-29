@@ -60,15 +60,11 @@ That is why the prompt block carries signatures only — the descriptions are on
 
 The **return** type comes from the tool's own `output` schema, by way of `ctx.tools.sdkSchemas(scope)` — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders `Any`; claiming a type nobody declared would be worse than admitting ignorance.
 
-Each object in that schema whose keys — and whose own generated class name — Python can take is declared as a named `TypedDict` above the signatures, because the flat form is not merely vague — it is the whole message. dsh's MCP client resolves a call to the **envelope** `{ content, structuredContent }` and declares exactly that as the tool's output, so a model told only `dict[str, Any]` is not told the envelope exists: it reaches for the payload directly, gets nothing, and spends the turn printing the result to find the wrapper — the exact cost this annotation is here to remove.
+Each object in that schema whose keys — and whose own generated class name — Python can take is declared as a named `TypedDict` above the signatures. For a bridged MCP tool the schema described here is the payload, not the transport wrapper — see below; `dict[str, Any]` would say a dict arrives without saying which keys, which is the one thing a return annotation exists to say.
 
 ```python
-class McpCalendarListEventsOutputStructuredContent(TypedDict):
-    result: str
-
 class McpCalendarListEventsOutput(TypedDict):
-    content: list[Any]
-    structuredContent: McpCalendarListEventsOutputStructuredContent
+    result: str
 
 async def mcp__calendar__list_events(*, calendar_id: str) -> McpCalendarListEventsOutput: ...
 ```
@@ -88,7 +84,7 @@ async def mcp__email__ping() -> str: ...                                 # no de
 
 A server that declares no output schema is the common case in the wild, and its result really is just text — one text block, in every one of the 4142 MCP results measured across six trials, which is why this is a `str` and not a `list[str]` that would cost an `r[0]` at every call site to preserve a boundary that never appears. A result carrying no text block at all resolves to the empty string: an image there is re-attached to the conversation and read on the next step, so there was never anything for the cell to receive. One divergence is possible and belongs to the server: a tool that declares an output schema but omits `structuredContent` on some call resolves to that call's text, where the signature promised the payload type.
 
-Unwrapping keys off the value's own shape — `content` plus at most `structuredContent`, nothing else — so a tool that merely returns something similar keeps its value intact. This deliberately differs from Code Mode, which hands the whole envelope to `tools.name(args)`.
+Unwrapping keys off the tool's declared output schema, not off the value that comes back: a tool whose own payload happens to be `{content: [...]}` is not wrapping anything, and replacing its value with joined text would change what that tool returns with nothing to say so. This deliberately differs from Code Mode, which hands the whole envelope to `tools.name(args)`.
 
 ### MCP tools work, with nothing special
 

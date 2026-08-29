@@ -430,9 +430,12 @@ console.log('prompt:')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
     // import line named `mcp` twice and a signature promised a call the kernel never binds.
-    const collide = renderToolsSection([{ name: 'mcp__srv__thing', parameters: {} }, { name: 'mcp', parameters: {} }])
+    const collide = renderToolsSection([{ name: 'mcp__srv__thing', parameters: {} }, { name: 'mcp', parameters: {}, output: { type: 'object', properties: { token: { type: 'string' } }, required: ['token'] } }])
     assert.match(collide, /import ToolCallError, mcp\n/, 'the reserved name is imported once, as the namespace')
     assert.ok(!collide.includes('async def mcp('), 'and no signature offers it as a tool')
+    // Dropped where the specs are normalised, not at the render: downstream of the declarations,
+    // its output schema still became a `TypedDict` that nothing referenced.
+    assert.ok(!collide.includes('McpOutput'), 'and its output schema declares nothing')
     console.log('  ok   points at getattr for names that are not identifiers')
   } catch (error) {
     failures += 1

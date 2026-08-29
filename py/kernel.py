@@ -318,8 +318,9 @@ class Namespace:
         self._path = "mcp" if server is None else f"mcp.{server}"
 
     def _current(self) -> dict:
+        """This level's members: the servers, or one server's tools."""
         servers = mcp_servers(bound_tools())
-        return servers.get(self._server, {}) if self._server is not None else {server: Namespace(server) for server in servers}
+        return servers if self._server is None else servers.get(self._server, {})
 
     def __getattr__(self, name):
         # Dunders only, as in `ToolsModule`. An MCP tool may legally be named `_private` — the raw
@@ -329,11 +330,12 @@ class Namespace:
         if name.startswith("__"):
             raise AttributeError(name)
         members = self._current()
-        try:
-            return members[name]
-        except KeyError:
+        if name not in members:
             available = ", ".join(sorted(members)) or "(none)"
-            raise AttributeError(f"no such tool: {self._path}.{name}. Available: {available}") from None
+            raise AttributeError(f"no such tool: {self._path}.{name}. Available: {available}")
+        # A server's child is built on the way through, so reaching one tool does not allocate a
+        # namespace for every OTHER mounted server.
+        return Namespace(name) if self._server is None else members[name]
 
     def __dir__(self):
         return sorted(self._current())

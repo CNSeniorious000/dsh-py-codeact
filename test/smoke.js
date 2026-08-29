@@ -598,7 +598,7 @@ console.log('mcp namespace:')
   // so a reference kept from an earlier cell has to resolve against the catalogue in force NOW.
   const MOVED = [{ name: 'mcp__drive__list_files', doc: 'A server that arrived later.', params: [] }, MCP[2]]
   await t('a kept reference survives the catalogue moving under it', 'from __dsh__.tools import mcp\nkept = mcp\nsorted(dir(kept))', (r) => {
-    assert.equal(r.repr, "['calendar', 'notion']")
+    assert.equal(r.repr, "['calendar', 'notion']", r.error ?? 'unexpected result')
   })
   await t('and follows it rather than freezing the cell it came from', '(sorted(dir(kept)), (await kept.drive.list_files())["from"])', (r) => {
     assert.equal(r.repr, `(['drive', 'notion'], 'mcp__drive__list_files')`, 'a snapshot would still hold calendar and know nothing of drive')
@@ -624,7 +624,7 @@ console.log('mcp namespace:')
   await t('a kept server module follows the catalogue', 'kept_cal = calendar\n(sorted(dir(kept_cal)), hasattr(kept_cal, "create_event"))', (r) => {
     // Both halves: an empty `dir()` only proves the LISTING moved. Reaching for a tool the old
     // catalogue had is the thing that must also stop working.
-    assert.equal(r.repr, "([], False)", 'calendar is gone from this catalogue, and the module neither lists nor serves its tools')
+    assert.equal(r.repr, "([], False)", r.error ?? 'calendar is gone from this catalogue, and the module neither lists nor serves its tools')
   }, MOVED)
   // The raw name is the server's to choose, and a leading underscore is legal in it. The block
   // renders `mcp.cal._private()` for one — which the namespace has to be able to answer.
@@ -632,6 +632,23 @@ console.log('mcp namespace:')
   await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__cal___private'", r.error)
   }, UNDERSCORED)
+  // Every one of these is a way the process-global registry can be corrupted from a cell, and
+  // each was a live defect: the modules are shared by every agent in the process, so a mistake in
+  // one shell used to be permanent and invisible to `dir()`.
+  await t('a tool whose raw name starts with `__` is reachable, not just listed', 'from __dsh__.tools.mcp.und import __odd\n(await __odd())["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__und____odd'", r.error ?? 'a leading-`__` raw name survives dsh\'s normalisation verbatim')
+  }, [{ name: 'mcp__und____odd', doc: 'Leading dunder, no trailing.', params: [] }])
+  await t('a star-import binds the tools', 'from __dsh__.tools.mcp.calendar import *\nsorted(n for n in dir() if n.startswith(("list_", "create_")))', (r) => {
+    assert.equal(r.repr, "['create_event', 'list_events']", r.error ?? 'star-import reads __all__, never __getattr__')
+  })
+  await t('writing to the namespace is refused instead of poisoning every other agent', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
+    assert.equal(r.ok, false)
+    assert.match(r.error, /shared by every agent in this process/)
+  })
+  await t('deleting a server module out of sys.modules does not wedge the session', 'import sys\ndel sys.modules["__dsh__.tools.mcp.calendar"]\nfrom __dsh__.tools import mcp\n(sorted(dir(mcp)), (await mcp.calendar.list_events(calendar_id="c"))["from"])', (r) => {
+    assert.equal(r.repr, "(['calendar', 'notion'], 'mcp__calendar__list_events')", r.error ?? 'the module is rebuilt on the next ask')
+  })
+
   // The root exists for the whole process, so it survives a shell that mounted no MCP server at
   // all — `mcp` means the namespace or nothing, never a half-installed package. The tool LISTING
   // is still honest: `dir(__dsh__.tools)` does not offer `mcp` when there is nothing under it.

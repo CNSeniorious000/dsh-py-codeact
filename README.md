@@ -86,7 +86,7 @@ async def mcp__review__search(*, q: str) -> McpReviewSearchOutput: ...   # the p
 async def mcp__email__ping() -> str: ...                                 # no declared payload: the text blocks, joined
 ```
 
-A server that declares no output schema is the common case in the wild, and its result really is just text. One divergence is possible and belongs to the server: a tool that declares an output schema but omits `structuredContent` on some call resolves to that call's text, where the signature promised the payload type.
+A server that declares no output schema is the common case in the wild, and its result really is just text — one text block, in every one of the 4142 MCP results measured across six trials, which is why this is a `str` and not a `list[str]` that would cost an `r[0]` at every call site to preserve a boundary that never appears. A result carrying no text block at all resolves to the empty string: an image there is re-attached to the conversation and read on the next step, so there was never anything for the cell to receive. One divergence is possible and belongs to the server: a tool that declares an output schema but omits `structuredContent` on some call resolves to that call's text, where the signature promised the payload type.
 
 Unwrapping keys off the value's own shape — `content` plus at most `structuredContent`, nothing else — so a tool that merely returns something similar keeps its value intact. This deliberately differs from Code Mode, which hands the whole envelope to `tools.name(args)`.
 

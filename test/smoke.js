@@ -495,6 +495,20 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
   }
+  // The import line has to name what the render USED. A tool can otherwise spell a typing symbol
+  // into existence — `any_report` renders `AnyReportOutput` — and import it with no `Any` in sight.
+  try {
+    const object = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
+    const named = renderToolsSection([{ name: 'any_report', parameters: { properties: {} }, output: object }])
+    assert.ok(!/from typing import[^\n]*Any/.test(named), 'a class named after the symbol is not a use of it')
+    assert.match(named, /from typing import TypedDict\n/, 'the symbols it does use are still there')
+    const degraded = renderToolsSection([{ name: 'odd', parameters: { properties: {} }, output: { type: 'object', properties: { 'not-a-name': { type: 'string' } }, required: ['not-a-name'] } }])
+    assert.match(degraded, /from typing import Any\n/, 'and a real `dict[str, Any]` still imports it')
+    console.log('  ok   the typing import names what the render used')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
+  }
   // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])

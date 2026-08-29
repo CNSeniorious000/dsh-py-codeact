@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "ipython~=9.16.0",
+#     "ipython~=9.17.0",
 #     "objprint~=0.3.0",
 # ]
 # # Checked with `TY_UV=scripts ty check py/kernel.py` — that prefix is what hands ty this script's venv. A `ty.toml` would be found and then silently ignored for PEP 723 scripts (astral-sh/ty#4083), so any ty config has to live here.

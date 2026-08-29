@@ -416,9 +416,14 @@ console.log('prompt:')
     }
   }
   try {
+    // An MCP tool is reached through `mcp.<server>`, so its `getattr` route is one level deeper —
+    // `mcp__notion__API-patch-block-children` is a real name from a real server, hyphens and all.
     const rendered = renderToolsSection([{ name: 'mcp__srv__do-thing', parameters: {} }])
-    assert.match(rendered, /getattr\(__dsh__\.tools, "mcp__srv__do-thing"\)/, 'an unimportable tool must still be reachable')
-    assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named tool must be reachable too')
+    assert.match(rendered, /getattr\(mcp\.srv, "do-thing"\)/, 'an unimportable MCP tool is reachable under its server')
+    assert.ok(!rendered.includes('mcp__srv__do-thing'), 'and is not also offered under the flat name the block no longer shows')
+    // A server whose OWN name Python refuses needs both levels spelled out.
+    assert.match(renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }]), /getattr\(getattr\(mcp, "odd-srv"\), "thing"\)/, 'so does a server Python cannot name')
+    assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     console.log('  ok   points at getattr for names that are not identifiers')
   } catch (error) {
     failures += 1
@@ -456,12 +461,12 @@ console.log('prompt:')
       { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: envelope(payload) },
       { name: 'mcp__email__ping', parameters: { properties: {} }, output: envelope(undefined) },
     ])
-    assert.match(rendered, /async def mcp__review__search\(\*, q: str\) -> McpReviewSearchOutput: \.\.\./, 'a declared payload names its own type')
+    assert.match(rendered, /class _McpReview\(Protocol\):\n {4}async def search\(self, \*, q: str\) -> McpReviewSearchOutput: \.\.\./, 'a declared payload names its own type')
     assert.match(rendered, /class McpReviewSearchOutput\(TypedDict\):\n {4}merchants: list\[str\]\n {4}total: NotRequired\[int\]/, 'and that type is the payload, not the wrapper')
     assert.ok(!rendered.includes('structuredContent'), 'the wrapper is never named — the cell does not receive it')
     // No declared payload means the client has only the text blocks to hand over, so `str` is the
     // whole truth. Not every server declares an output schema; this is the common case in the wild.
-    assert.match(rendered, /async def mcp__email__ping\(\) -> str: \.\.\./, 'an envelope with no payload resolves to its text')
+    assert.match(rendered, /async def ping\(self\) -> str: \.\.\./, 'an envelope with no payload resolves to its text')
     console.log('  ok   an MCP envelope is unwrapped, in the annotation and at run time')
   } catch (error) {
     failures += 1
@@ -527,6 +532,51 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL an unnameable parameter costs the signature, not the tool\n       ${error.message}`)
   }
+}
+
+// `mcp.<server>.<tool>` is a PRESENTATION of the same flat bindings — the host still dispatches on
+// `mcp__server__tool`, so the grouping must not change what reaches it, and the flat name has to
+// keep working for a cell written before the catalogue was re-rendered.
+console.log('mcp namespace:')
+{
+  const seen = []
+  const ns = new PythonKernel({ cwd: process.cwd(), onCall: async (name, args) => { seen.push(name); return { ok: true, value: { from: name, args } } } })
+  const MCP = [
+    { name: 'mcp__calendar__list_events', doc: 'List events.', params: [{ name: 'calendar_id', type: 'str', required: true }] },
+    { name: 'mcp__calendar__create_event', doc: 'Create one.', params: [{ name: 'title', type: 'str', required: true }] },
+    { name: 'mcp__notion__API-patch-block-children', doc: 'Hyphens are real.', params: [{ name: 'block_id', type: 'str', required: true }] },
+    { name: 'read', doc: 'A native tool.', params: [{ name: 'file_path', type: 'str', required: true }] },
+  ]
+  await ns.start(MCP)
+  const cell = (code) => ns.exec(code, undefined, MCP)
+  const t = async (label, code, assertion) => {
+    try { assertion(await cell(code)); console.log(`  ok   ${label}`) }
+    catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
+  }
+  await t('one import reaches every server', 'from __dsh__.tools import mcp\nawait mcp.calendar.list_events(calendar_id="c")', (r) => {
+    assert.equal(r.ok, true, r.error)
+    assert.equal(seen.at(-1), 'mcp__calendar__list_events', 'the host still sees the flat name it dispatches on')
+  })
+  await t('a name Python refuses is reachable under its server', 'from __dsh__.tools import mcp\nawait getattr(mcp.notion, "API-patch-block-children")(block_id="b")', (r) => {
+    assert.equal(r.ok, true, r.error)
+    assert.equal(seen.at(-1), 'mcp__notion__API-patch-block-children')
+  })
+  await t('the flat name still works', 'from __dsh__.tools import mcp__calendar__create_event as f\nawait f(title="x")', (r) => {
+    assert.equal(r.ok, true, r.error)
+    assert.equal(seen.at(-1), 'mcp__calendar__create_event')
+  })
+  await t('dir() walks the grouping', 'from __dsh__.tools import mcp\n(sorted(dir(mcp)), sorted(dir(mcp.calendar)))', (r) => {
+    assert.equal(r.repr, "(['calendar', 'notion'], ['create_event', 'list_events'])")
+  })
+  await t('a missing tool names what is there', 'from __dsh__.tools import mcp\nmcp.calendar.nope', (r) => {
+    assert.equal(r.ok, false)
+    assert.match(r.error, /no such tool: mcp\.calendar\.nope/)
+    assert.match(r.error, /create_event, list_events/, 'and lists the ones that are')
+  })
+  await t('a native tool is not swept under it', 'from __dsh__.tools import mcp\nhasattr(mcp, "read")', (r) => {
+    assert.equal(r.repr, 'False')
+  })
+  ns.dispose()
 }
 
 // One process per conversation tree, one shell per agent. This is what makes a fan-out of subagents cheap — and what keeps their globals apart.

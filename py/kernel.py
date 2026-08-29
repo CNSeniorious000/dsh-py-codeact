@@ -272,11 +272,71 @@ class ToolsModule(types.ModuleType):
         return f"<module '__dsh__.tools': {', '.join(sorted(ToolsModule._bindings())) or 'no tools bound'}>"
 
 
+MCP_PREFIX = "mcp__"
+
+
+def split_mcp(name: str) -> tuple[str, str] | None:
+    """`mcp__calendar__list_events` -> `("calendar", "list_events")`.
+
+    dsh names every MCP tool `mcp__<serverName>__<rawName>`, and a raw name may itself contain
+    `__` — `split("__")` would tear such a tool apart and file it under a server that does not
+    exist, so only the first two separators are ever consumed.
+    """
+    if not name.startswith(MCP_PREFIX):
+        return None
+    server, sep, raw = name[len(MCP_PREFIX):].partition("__")
+    return (server, raw) if sep and server and raw else None
+
+
+class Namespace:
+    """`mcp`, and one of these per server under it.
+
+    Attribute access rather than a module: these are rebuilt for every cell, because a restriction
+    or a reconnecting server moves tools in and out between calls, and rebinding a `sys.modules`
+    entry that often would leave stale imports pointing at the old one.
+    """
+
+    def __init__(self, path: str, members: dict) -> None:
+        self._path = path
+        self._members = members
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._members[name]
+        except KeyError:
+            available = ", ".join(sorted(self._members)) or "(none)"
+            raise AttributeError(f"no such tool: {self._path}.{name}. Available: {available}") from None
+
+    def __dir__(self):
+        return sorted(self._members)
+
+    def __repr__(self) -> str:
+        return f"<{self._path}: {', '.join(sorted(self._members)) or 'empty'}>"
+
+
+def mcp_namespace(flat: dict) -> Namespace:
+    """Group the flat `mcp__server__tool` bindings into `mcp.server.tool`.
+
+    The flat names stay bound too. They are what dsh dispatches on and what an older session may
+    already have imported; dropping them to tidy the surface would break a cell mid-conversation.
+    """
+    servers: dict[str, dict] = {}
+    for name, call in flat.items():
+        if (parts := split_mcp(name)) is not None:
+            servers.setdefault(parts[0], {})[parts[1]] = call
+    return Namespace("mcp", {server: Namespace(f"mcp.{server}", tools) for server, tools in servers.items()})
+
+
 def build_bindings(bridge: Bridge, specs) -> dict:
     """Project one agent's visible tools into awaitables for its shell."""
     # A tool named `ToolCallError` or `_bindings` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
     reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError"}
-    return {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
+    flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
+    # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
+    namespace = mcp_namespace(flat)
+    return flat if not dir(namespace) else {**flat, "mcp": namespace}
 
 
 def install_bridge_modules() -> ToolsModule:

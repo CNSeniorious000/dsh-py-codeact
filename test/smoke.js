@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 
 const calls = []
@@ -439,45 +439,50 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
   }
-  // An MCP call resolves to the ENVELOPE dsh's client builds — `{ content, structuredContent }` —
-  // and that is what the tool declares as its output. Collapsed to `dict[str, Any]` the model is
-  // not told the wrapper is there, so it reaches for the payload directly and burns a turn
-  // discovering the shape. The declaration is the whole point: it has to name the envelope AND
-  // the server's own payload inside it.
+  // dsh's MCP client wraps every result as `{ content, structuredContent? }`. That wrapper is
+  // transport, not API: `content`'s text duplicates the payload and an image in it is re-attached
+  // to the conversation separately, so a cell that receives the wrapper can only hand-write
+  // `r["structuredContent"]["result"]` — and spend a call learning it has to. The bridge unwraps,
+  // and the annotation describes what the cell actually receives.
   try {
-    const structuredContent = { type: 'object', properties: { result: { type: 'string' } }, required: ['result'] }
-    const rendered = renderToolsSection([{
-      name: 'mcp__calendar__list_events',
-      parameters: { properties: { calendar_id: { type: 'string' } }, required: ['calendar_id'] },
-      output: { type: 'object', properties: { content: { type: 'array', items: {} }, structuredContent }, required: ['content', 'structuredContent'] },
-    }])
-    assert.match(rendered, /async def mcp__calendar__list_events\(\*, calendar_id: str\) -> McpCalendarListEventsOutput: \.\.\./, 'the signature names the declared type, not `dict[str, Any]`')
-    assert.match(rendered, /class McpCalendarListEventsOutput\(TypedDict\):\n {4}content: list\[Any\]\n {4}structuredContent: McpCalendarListEventsOutputStructuredContent/, 'the envelope is spelled out')
-    assert.match(rendered, /class McpCalendarListEventsOutputStructuredContent\(TypedDict\):\n {4}result: str/, "and so is the server's own payload")
-    assert.ok(
-      rendered.indexOf('class McpCalendarListEventsOutputStructuredContent') < rendered.indexOf('class McpCalendarListEventsOutput('),
-      'a nested class is declared before the class that references it',
-    )
-    assert.match(rendered, /from typing import Any, TypedDict\n/, 'the import lists what the render used and nothing else — every field here is required, so no `NotRequired`')
-    console.log('  ok   an MCP envelope is declared, not flattened')
-  } catch (error) {
-    failures += 1
-    console.log(`  FAIL an MCP envelope is declared, not flattened\n       ${error.message}`)
-  }
-  // A class body Python cannot parse is worse than a vague annotation, and `oneOf` branches that
-  // degrade to the same text are a choice the model does not actually have.
-  try {
+    const envelope = (inner) => ({
+      type: 'object',
+      properties: { content: { type: 'array', items: {} }, structuredContent: inner ?? {} },
+      required: inner === undefined ? ['content'] : ['content', 'structuredContent'],
+      additionalProperties: false,
+    })
+    const payload = { type: 'object', properties: { merchants: { type: 'array', items: { type: 'string' } }, total: { type: 'integer' } }, required: ['merchants'] }
     const rendered = renderToolsSection([
-      { name: 'odd_keys', parameters: { properties: {} }, output: { type: 'object', properties: { 'not-a-name': { type: 'string' } }, required: ['not-a-name'] } },
-      { name: 'optional_keys', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } }, required: ['a'] } },
+      { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: envelope(payload) },
+      { name: 'mcp__email__ping', parameters: { properties: {} }, output: envelope(undefined) },
     ])
-    assert.match(rendered, /async def odd_keys\(\) -> dict\[str, Any\]: \.\.\./, 'a field Python cannot name degrades that one class, and only it')
-    assert.ok(!rendered.includes('not-a-name'), 'no unparsable class body is emitted')
-    assert.match(rendered, /class OptionalKeysOutput\(TypedDict\):\n {4}a: str\n {4}b: NotRequired\[str\]/, 'an optional key is NotRequired')
-    console.log('  ok   an unnameable field degrades its class, not the block')
+    assert.match(rendered, /async def mcp__review__search\(\*, q: str\) -> McpReviewSearchOutput: \.\.\./, 'a declared payload names its own type')
+    assert.match(rendered, /class McpReviewSearchOutput\(TypedDict\):\n {4}merchants: list\[str\]\n {4}total: NotRequired\[int\]/, 'and that type is the payload, not the wrapper')
+    assert.ok(!rendered.includes('structuredContent'), 'the wrapper is never named — the cell does not receive it')
+    // No declared payload means the client has only the text blocks to hand over, so `str` is the
+    // whole truth. Not every server declares an output schema; this is the common case in the wild.
+    assert.match(rendered, /async def mcp__email__ping\(\) -> str: \.\.\./, 'an envelope with no payload resolves to its text')
+    console.log('  ok   an MCP envelope is unwrapped, in the annotation and at run time')
   } catch (error) {
     failures += 1
-    console.log(`  FAIL an unnameable field degrades its class, not the block\n       ${error.message}`)
+    console.log(`  FAIL an MCP envelope is unwrapped, in the annotation and at run time\n       ${error.message}`)
+  }
+  // The run-time half of the same rule. It keys off the value's own shape, so a tool that merely
+  // returns something similar keeps its value: unwrapping a payload nobody wrapped would be a
+  // silent, unannounced change to what that tool returns.
+  try {
+    assert.deepEqual(mcpPayload({ content: [{ type: 'text', text: '{"a":1}' }], structuredContent: { a: 1 } }), { value: { a: 1 } }, 'a declared payload is handed over bare')
+    assert.deepEqual(mcpPayload({ content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] }), { value: 'one\ntwo' }, 'no payload means the text blocks, joined')
+    assert.deepEqual(mcpPayload({ content: [] }), { value: '' }, 'an empty envelope is an empty string, not a crash')
+    assert.equal(mcpPayload({ content: [], structuredContent: {}, extra: 1 }), undefined, 'an extra key means this is not the wrapper')
+    assert.equal(mcpPayload({ paths: ['a'], root: '.' }), undefined, "a plain tool's value is untouched")
+    assert.equal(mcpPayload({ content: 'not-an-array' }), undefined, 'so is a value whose `content` is not the block array')
+    assert.equal(mcpPayload('a string'), undefined, 'and a scalar')
+    assert.equal(mcpPayload(null), undefined, 'and null')
+    console.log('  ok   only the wrapper is unwrapped, and only when it is one')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL only the wrapper is unwrapped, and only when it is one\n       ${error.message}`)
   }
   // The class NAME can be unusable too, and that one is not local damage: `class 123toolOutput`
   // is a SyntaxError that takes the whole block with it, including every tool that was fine —

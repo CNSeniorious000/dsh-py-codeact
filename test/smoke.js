@@ -603,6 +603,27 @@ console.log('mcp namespace:')
   await t('and follows it rather than freezing the cell it came from', '(sorted(dir(kept)), (await kept.drive.list_files())["from"])', (r) => {
     assert.equal(r.repr, `(['drive', 'notion'], 'mcp__drive__list_files')`, 'a snapshot would still hold calendar and know nothing of drive')
   }, MOVED)
+  // `mcp` is a package, not just an object: every import form has to resolve, and the deep one is
+  // the reason `sys.modules` carries a module per server — `__getattr__` alone cannot serve it.
+  await t('the deep import form binds a tool directly', 'from __dsh__.tools.mcp.calendar import list_events\n(await list_events(calendar_id="c"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__list_events'", r.error)
+  })
+  await t('the server module can be imported from the grouping', 'from __dsh__.tools.mcp import calendar\n(await calendar.create_event(title="x"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__create_event'", r.error)
+  })
+  await t('and as a dotted module', 'import __dsh__.tools.mcp.notion as N\nsorted(dir(N))', (r) => {
+    assert.equal(r.repr, "['API-patch-block-children']", r.error)
+  })
+  // NOT `drive`: the catalogue above mounted one, and `sys.modules` only ever gains entries — a
+  // name any earlier cell saw would make this assertion pass for the wrong reason.
+  await t('a server nobody mounted fails as a missing module, not as a tool', 'import __dsh__.tools.mcp.dropbox', (r) => {
+    assert.equal(r.ok, false)
+    assert.match(r.error, /ModuleNotFoundError.*__dsh__\.tools\.mcp\.dropbox/)
+  })
+  // Same liveness rule as the `mcp` object: `sys.modules` is process-global, the catalogue is not.
+  await t('a kept server module follows the catalogue', 'kept_cal = calendar\nsorted(dir(kept_cal))', (r) => {
+    assert.equal(r.repr, "[]", 'calendar is gone from this catalogue, and the module says so rather than serving stale tools')
+  }, MOVED)
   // The raw name is the server's to choose, and a leading underscore is legal in it. The block
   // renders `mcp.cal._private()` for one — which the namespace has to be able to answer.
   const UNDERSCORED = [{ name: 'mcp__cal___private', doc: 'A leading underscore is legal.', params: [] }]

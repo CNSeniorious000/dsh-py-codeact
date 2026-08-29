@@ -424,6 +424,11 @@ console.log('prompt:')
     // A server whose OWN name Python refuses needs both levels spelled out.
     assert.match(renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }]), /getattr\(getattr\(mcp, "odd-srv"\), "thing"\)/, 'so does a server Python cannot name')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
+    // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
+    // import line named `mcp` twice and a signature promised a call the kernel never binds.
+    const collide = renderToolsSection([{ name: 'mcp__srv__thing', parameters: {} }, { name: 'mcp', parameters: {} }])
+    assert.match(collide, /import ToolCallError, mcp\n/, 'the reserved name is imported once, as the namespace')
+    assert.ok(!collide.includes('async def mcp('), 'and no signature offers it as a tool')
     console.log('  ok   points at getattr for names that are not identifiers')
   } catch (error) {
     failures += 1
@@ -548,9 +553,9 @@ console.log('mcp namespace:')
     { name: 'read', doc: 'A native tool.', params: [{ name: 'file_path', type: 'str', required: true }] },
   ]
   await ns.start(MCP)
-  const cell = (code) => ns.exec(code, undefined, MCP)
-  const t = async (label, code, assertion) => {
-    try { assertion(await cell(code)); console.log(`  ok   ${label}`) }
+  const cell = (code, specs = MCP) => ns.exec(code, undefined, specs)
+  const t = async (label, code, assertion, specs) => {
+    try { assertion(await cell(code, specs)); console.log(`  ok   ${label}`) }
     catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
   }
   await t('one import reaches every server', 'from __dsh__.tools import mcp\nawait mcp.calendar.list_events(calendar_id="c")', (r) => {
@@ -576,6 +581,16 @@ console.log('mcp namespace:')
   await t('a native tool is not swept under it', 'from __dsh__.tools import mcp\nhasattr(mcp, "read")', (r) => {
     assert.equal(r.repr, 'False')
   })
+  // Every other binding is re-imported the moment the model wants a different tool. `mcp` is the
+  // one it has no reason to import twice — it reads as a namespace, not as this cell's tool list —
+  // so a reference kept from an earlier cell has to resolve against the catalogue in force NOW.
+  const MOVED = [{ name: 'mcp__drive__list_files', doc: 'A server that arrived later.', params: [] }, MCP[2]]
+  await t('a kept reference survives the catalogue moving under it', 'from __dsh__.tools import mcp\nkept = mcp\nsorted(dir(kept))', (r) => {
+    assert.equal(r.repr, "['calendar', 'notion']")
+  })
+  await t('and follows it rather than freezing the cell it came from', '(sorted(dir(kept)), (await kept.drive.list_files())["from"])', (r) => {
+    assert.equal(r.repr, `(['drive', 'notion'], 'mcp__drive__list_files')`, 'a snapshot would still hold calendar and know nothing of drive')
+  }, MOVED)
   ns.dispose()
 }
 

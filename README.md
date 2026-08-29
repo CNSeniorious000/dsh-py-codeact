@@ -66,7 +66,8 @@ Each object in that schema whose keys — and whose own generated class name —
 class McpCalendarListEventsOutput(TypedDict):
     result: str
 
-async def mcp__calendar__list_events(*, calendar_id: str) -> McpCalendarListEventsOutput: ...
+class _McpCalendar(Protocol):
+    async def list_events(self, *, calendar_id: str) -> McpCalendarListEventsOutput: ...
 ```
 
 `jsonSchemaToPy` cannot do this and says so — it is context-free, and naming a `TypedDict` needs the render context `renderToolsSdkPy` supplies. That renderer is not reusable here: it emits a whole document in Code Mode's own `tools.name(args)` contract. So only the object and array branches are handled locally, every leaf still going through `jsonSchemaToPy` — a place to hang the names, not a second JSON-Schema mapper. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.
@@ -88,19 +89,23 @@ Unwrapping keys off the tool's declared output schema, not off the value that co
 
 ### MCP tools work, with nothing special
 
-MCP servers register into the same `ctx.tools` registry as everything else, so they arrive in `__dsh__.tools` like any other binding and dispatch through the same pipeline:
+MCP servers register into the same `ctx.tools` registry as everything else, so they arrive in `__dsh__.tools` like any other binding and dispatch through the same pipeline. They are *presented* grouped, under one `mcp`:
 
 ```python
-from __dsh__.tools import mcp__gh__github_graphql as gh
+from __dsh__.tools import mcp
 
-data = await gh(query="{ viewer { login } }")
+data = await mcp.gh.github_graphql(query="{ viewer { login } }")
 ```
+
+dsh names them `mcp__<server>__<rawName>`, and with a hundred mounted that import line was most of the prompt block while every call site respelled its server. The flat names stay bound — `mcp` is how they are shown, not what they are — so a cell written before this still runs. The block declares the grouping as `Protocol` stubs, one per server, which is the shape dsh's own SDK renderer uses for the same problem.
+
+`mcp` is a live view of the catalogue, not a snapshot of the cell it was imported in: a restriction or a reconnecting server moves tools in and out between calls, and unlike a single tool the model has no reason to ever import it twice. The name is reserved for it — a native tool called `mcp` is not bound.
 
 dsh's MCP client is explicitly aware of this route — its canonical value "retains the complete JSON MCP blocks and optional structured content for programmatic and Code Mode callers" — and the sub-call logs a `SUBTOOL` row like any other.
 
 Worth contrasting: Anthropic's server-side [programmatic tool calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) is *not* compatible with MCP tools. Owning the bridge host-side is what buys this.
 
-(A tool whose name is not a valid Python identifier cannot be `import`ed, but is still reachable as `getattr(__dsh__.tools, "odd-name")`. dsh's MCP naming — `mcp__<server>__<tool>` — always is one.)
+(A tool whose name is not a valid Python identifier cannot be `import`ed, but is still reachable with `getattr` — `getattr(__dsh__.tools, "odd-name")`, or one level deeper for an MCP tool, `getattr(mcp.notion, "API-patch-block-children")`. A raw MCP name is a routine place to find a hyphen.)
 
 ## Exclusive mode
 

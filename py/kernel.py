@@ -238,6 +238,12 @@ def _make_binding(bridge: Bridge, spec):
     return call
 
 
+def bound_tools() -> dict:
+    """The calling shell's catalogue, or nothing outside a cell."""
+    session = _current_session.get()
+    return {} if session is None else session.bindings
+
+
 class ToolsModule(types.ModuleType):
     """`__dsh__.tools` — the bridged tool surface of the CALLING shell.
 
@@ -247,36 +253,105 @@ class ToolsModule(types.ModuleType):
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
         self.ToolCallError = ToolCallError
 
-    @staticmethod
-    def _bindings():
-        session = _current_session.get()
-        return {} if session is None else session.bindings
-
     def __getattr__(self, name):  # only reached when the attribute is absent
         if name.startswith("__"):
             raise AttributeError(name)  # import/introspection probing — never answer with a tool
-        bindings = ToolsModule._bindings()
+        bindings = bound_tools()
         if name in bindings:
             return bindings[name]
         available = ", ".join(sorted(bindings)) or "(none)"
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
 
     def __dir__(self):
-        return sorted(ToolsModule._bindings())
+        return sorted(bound_tools())
 
     @property
     def __all__(self):
-        return sorted(ToolsModule._bindings())
+        return sorted(bound_tools())
 
     def __repr__(self) -> str:
-        return f"<module '__dsh__.tools': {', '.join(sorted(ToolsModule._bindings())) or 'no tools bound'}>"
+        return f"<module '__dsh__.tools': {', '.join(sorted(bound_tools())) or 'no tools bound'}>"
+
+
+MCP_PREFIX = "mcp__"
+
+
+def split_mcp(name: str) -> tuple[str, str] | None:
+    """`mcp__calendar__list_events` -> `("calendar", "list_events")`.
+
+    dsh names every MCP tool `mcp__<serverName>__<rawName>`, and a raw name may itself contain
+    `__` — `split("__")` would tear such a tool apart and file it under a server that does not
+    exist, so only the first two separators are ever consumed.
+    """
+    if not name.startswith(MCP_PREFIX):
+        return None
+    server, sep, raw = name[len(MCP_PREFIX) :].partition("__")
+    return (server, raw) if sep and server and raw else None
+
+
+def mcp_servers(bindings: dict) -> dict[str, dict]:
+    """Group the flat `mcp__server__tool` bindings into `{server: {tool: call}}`.
+
+    The flat names stay bound too. They are what dsh dispatches on and what an older session may
+    already have imported; dropping them to tidy the surface would break a cell mid-conversation.
+    """
+    servers: dict[str, dict] = {}
+    for name, call in bindings.items():
+        if (parts := split_mcp(name)) is not None:
+            servers.setdefault(parts[0], {})[parts[1]] = call
+    return servers
+
+
+class Namespace:
+    """`mcp`, and one of these per server under it.
+
+    A live view of the CURRENT catalogue, never a snapshot of the cell that made it. Every other
+    binding gets re-imported the moment the model reaches for a different tool, but `mcp` reads as
+    a stable namespace rather than as this cell's tool list — nothing would prompt a second
+    `from __dsh__.tools import mcp` — so a reference kept across cells has to keep resolving
+    against the bindings in force now. A restriction or a reconnecting server moves tools in and
+    out between calls.
+    """
+
+    def __init__(self, server: str | None = None) -> None:
+        self._server = server
+        self._path = "mcp" if server is None else f"mcp.{server}"
+
+    def _current(self) -> dict:
+        """This level's members: the servers, or one server's tools."""
+        servers = mcp_servers(bound_tools())
+        return servers if self._server is None else servers.get(self._server, {})
+
+    def __getattr__(self, name):
+        # Dunders only, as in `ToolsModule`. An MCP tool may legally be named `_private` — the raw
+        # name is the server's to choose — and the block offers it as `mcp.<server>._private`, so a
+        # blanket `_` guard refused the one call it had just advertised. `_server` and `_path` are
+        # set in `__init__` and never reach here.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        members = self._current()
+        if name not in members:
+            available = ", ".join(sorted(members)) or "(none)"
+            raise AttributeError(f"no such tool: {self._path}.{name}. Available: {available}")
+        # A server's child is built on the way through, so reaching one tool does not allocate a
+        # namespace for every OTHER mounted server.
+        return Namespace(name) if self._server is None else members[name]
+
+    def __dir__(self):
+        return sorted(self._current())
+
+    def __repr__(self) -> str:
+        return f"<{self._path}: {', '.join(sorted(self._current())) or 'empty'}>"
 
 
 def build_bindings(bridge: Bridge, specs) -> dict:
     """Project one agent's visible tools into awaitables for its shell."""
-    # A tool named `ToolCallError` or `_bindings` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
-    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError"}
-    return {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
+    # A tool named `ToolCallError` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
+    # `mcp` joins them, and unconditionally: it used to be bound and then overwritten by the namespace, so the tool was uncallable anyway — but only when an MCP server happened to be mounted. A name that means the namespace in one catalogue and a tool in the next is worse than one that always means the same thing.
+    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
+    flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
+    # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
+    return {**flat, "mcp": Namespace()} if mcp_servers(flat) else flat
 
 
 def install_bridge_modules() -> ToolsModule:

@@ -439,6 +439,76 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
   }
+  // An MCP call resolves to the ENVELOPE dsh's client builds — `{ content, structuredContent }` —
+  // and that is what the tool declares as its output. Collapsed to `dict[str, Any]` the model is
+  // not told the wrapper is there, so it reaches for the payload directly and burns a turn
+  // discovering the shape. The declaration is the whole point: it has to name the envelope AND
+  // the server's own payload inside it.
+  try {
+    const structuredContent = { type: 'object', properties: { result: { type: 'string' } }, required: ['result'] }
+    const rendered = renderToolsSection([{
+      name: 'mcp__calendar__list_events',
+      parameters: { properties: { calendar_id: { type: 'string' } }, required: ['calendar_id'] },
+      output: { type: 'object', properties: { content: { type: 'array', items: {} }, structuredContent }, required: ['content', 'structuredContent'] },
+    }])
+    assert.match(rendered, /async def mcp__calendar__list_events\(\*, calendar_id: str\) -> McpCalendarListEventsOutput: \.\.\./, 'the signature names the declared type, not `dict[str, Any]`')
+    assert.match(rendered, /class McpCalendarListEventsOutput\(TypedDict\):\n {4}content: list\[Any\]\n {4}structuredContent: McpCalendarListEventsOutputStructuredContent/, 'the envelope is spelled out')
+    assert.match(rendered, /class McpCalendarListEventsOutputStructuredContent\(TypedDict\):\n {4}result: str/, "and so is the server's own payload")
+    assert.ok(
+      rendered.indexOf('class McpCalendarListEventsOutputStructuredContent') < rendered.indexOf('class McpCalendarListEventsOutput('),
+      'a nested class is declared before the class that references it',
+    )
+    assert.match(rendered, /from typing import Any, TypedDict\n/, 'the import lists what the render used and nothing else — every field here is required, so no `NotRequired`')
+    console.log('  ok   an MCP envelope is declared, not flattened')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL an MCP envelope is declared, not flattened\n       ${error.message}`)
+  }
+  // A class body Python cannot parse is worse than a vague annotation, and `oneOf` branches that
+  // degrade to the same text are a choice the model does not actually have.
+  try {
+    const rendered = renderToolsSection([
+      { name: 'odd_keys', parameters: { properties: {} }, output: { type: 'object', properties: { 'not-a-name': { type: 'string' } }, required: ['not-a-name'] } },
+      { name: 'optional_keys', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } }, required: ['a'] } },
+    ])
+    assert.match(rendered, /async def odd_keys\(\) -> dict\[str, Any\]: \.\.\./, 'a field Python cannot name degrades that one class, and only it')
+    assert.ok(!rendered.includes('not-a-name'), 'no unparsable class body is emitted')
+    assert.match(rendered, /class OptionalKeysOutput\(TypedDict\):\n {4}a: str\n {4}b: NotRequired\[str\]/, 'an optional key is NotRequired')
+    console.log('  ok   an unnameable field degrades its class, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL an unnameable field degrades its class, not the block\n       ${error.message}`)
+  }
+  // The class NAME can be unusable too, and that one is not local damage: `class 123toolOutput`
+  // is a SyntaxError that takes the whole block with it, including every tool that was fine —
+  // and it happens for a tool that is not even importable, whose class nothing would reference.
+  try {
+    const output = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
+    const rendered = renderToolsSection([{ name: '123tool', parameters: { properties: {} }, output }, { name: 'ok', parameters: { properties: {} }, output }])
+    // The name itself SHOULD still appear — in the `getattr` line, which is how such a tool is reached.
+    assert.ok(!/class 123tool/.test(rendered), 'no class is declared under a name Python cannot take')
+    assert.match(rendered, /getattr\(__dsh__\.tools, "123tool"\)/, 'the tool is still reachable, only its annotation goes vague')
+    assert.match(rendered, /class OkOutput\(TypedDict\):\n {4}a: str/, 'the tools that were fine still get theirs')
+    assert.match(rendered, /async def ok\(\) -> OkOutput: \.\.\./, 'and still reference it')
+    console.log('  ok   a tool name Python cannot take costs its class, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
+  }
+  // The import line has to name what the render USED. A tool can otherwise spell a typing symbol
+  // into existence — `any_report` renders `AnyReportOutput` — and import it with no `Any` in sight.
+  try {
+    const object = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
+    const named = renderToolsSection([{ name: 'any_report', parameters: { properties: {} }, output: object }])
+    assert.ok(!/from typing import[^\n]*Any/.test(named), 'a class named after the symbol is not a use of it')
+    assert.match(named, /from typing import TypedDict\n/, 'the symbols it does use are still there')
+    const degraded = renderToolsSection([{ name: 'odd', parameters: { properties: {} }, output: { type: 'object', properties: { 'not-a-name': { type: 'string' } }, required: ['not-a-name'] } }])
+    assert.match(degraded, /from typing import Any\n/, 'and a real `dict[str, Any]` still imports it')
+    console.log('  ok   the typing import names what the render used')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
+  }
   // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])

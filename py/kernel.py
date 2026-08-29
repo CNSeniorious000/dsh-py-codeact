@@ -284,7 +284,7 @@ def split_mcp(name: str) -> tuple[str, str] | None:
     """
     if not name.startswith(MCP_PREFIX):
         return None
-    server, sep, raw = name[len(MCP_PREFIX):].partition("__")
+    server, sep, raw = name[len(MCP_PREFIX) :].partition("__")
     return (server, raw) if sep and server and raw else None
 
 

@@ -479,6 +479,22 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL an unnameable field degrades its class, not the block\n       ${error.message}`)
   }
+  // The class NAME can be unusable too, and that one is not local damage: `class 123toolOutput`
+  // is a SyntaxError that takes the whole block with it, including every tool that was fine —
+  // and it happens for a tool that is not even importable, whose class nothing would reference.
+  try {
+    const output = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
+    const rendered = renderToolsSection([{ name: '123tool', parameters: { properties: {} }, output }, { name: 'ok', parameters: { properties: {} }, output }])
+    // The name itself SHOULD still appear — in the `getattr` line, which is how such a tool is reached.
+    assert.ok(!/class 123tool/.test(rendered), 'no class is declared under a name Python cannot take')
+    assert.match(rendered, /getattr\(__dsh__\.tools, "123tool"\)/, 'the tool is still reachable, only its annotation goes vague')
+    assert.match(rendered, /class OkOutput\(TypedDict\):\n {4}a: str/, 'the tools that were fine still get theirs')
+    assert.match(rendered, /async def ok\(\) -> OkOutput: \.\.\./, 'and still reference it')
+    console.log('  ok   a tool name Python cannot take costs its class, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
+  }
   // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
   try {
     const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])

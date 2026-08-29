@@ -422,7 +422,11 @@ console.log('prompt:')
     assert.match(rendered, /getattr\(mcp\.srv, "do-thing"\)/, 'an unimportable MCP tool is reachable under its server')
     assert.ok(!rendered.includes('mcp__srv__do-thing'), 'and is not also offered under the flat name the block no longer shows')
     // A server whose OWN name Python refuses needs both levels spelled out.
-    assert.match(renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }]), /getattr\(getattr\(mcp, "odd-srv"\), "thing"\)/, 'so does a server Python cannot name')
+    const oddOnly = renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }])
+    assert.match(oddOnly, /getattr\(getattr\(mcp, "odd-srv"\), "thing"\)/, 'so does a server Python cannot name')
+    // Such a server gets no Protocol stub, but that line still reaches its tools through `mcp` — a
+    // catalogue of nothing else used to name `mcp` there without importing it.
+    assert.match(oddOnly, /import ToolCallError, mcp\n/, 'and `mcp` is imported even when no server has a nameable name')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
     // import line named `mcp` twice and a signature promised a call the kernel never binds.
@@ -444,6 +448,11 @@ console.log('prompt:')
     assert.match(rendered, /async def glob\(\*, pattern: str\) -> list\[str\]: \.\.\./, 'including container types')
     // `schemas()` has no `output`; only `sdkSchemas()` carries it. Rendering `Any` there is right — asserting a wrong type would be worse than admitting ignorance.
     assert.match(renderToolsSection([{ name: 'read', parameters: {} }]), /async def read\(\) -> Any: \.\.\./, 'a schema with no output falls back to Any')
+    // The Protocol stubs are rendered Python too, and reach `Any` by the same routes a top-level
+    // signature does — the import used to be derived from the signatures alone.
+    const stubAny = renderToolsSection([{ name: 'mcp__cal__list', parameters: {} }])
+    assert.match(stubAny, /async def list\(self\) -> Any: \.\.\./, 'including inside a server stub')
+    assert.match(stubAny, /from typing import Any, Protocol\n/, 'which has to import `Any` like any other use of it')
     console.log('  ok   renders each tool\'s real return type')
   } catch (error) {
     failures += 1
@@ -591,6 +600,12 @@ console.log('mcp namespace:')
   await t('and follows it rather than freezing the cell it came from', '(sorted(dir(kept)), (await kept.drive.list_files())["from"])', (r) => {
     assert.equal(r.repr, `(['drive', 'notion'], 'mcp__drive__list_files')`, 'a snapshot would still hold calendar and know nothing of drive')
   }, MOVED)
+  // The raw name is the server's to choose, and a leading underscore is legal in it. The block
+  // renders `mcp.cal._private()` for one — which the namespace has to be able to answer.
+  const UNDERSCORED = [{ name: 'mcp__cal___private', doc: 'A leading underscore is legal.', params: [] }]
+  await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__cal___private'", r.error)
+  }, UNDERSCORED)
   ns.dispose()
 }
 

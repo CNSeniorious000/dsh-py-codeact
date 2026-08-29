@@ -322,7 +322,11 @@ class Namespace:
         return servers.get(self._server, {}) if self._server is not None else {server: Namespace(server) for server in servers}
 
     def __getattr__(self, name):
-        if name.startswith("_"):
+        # Dunders only, as in `ToolsModule`. An MCP tool may legally be named `_private` — the raw
+        # name is the server's to choose — and the block offers it as `mcp.<server>._private`, so a
+        # blanket `_` guard refused the one call it had just advertised. `_server` and `_path` are
+        # set in `__init__` and never reach here.
+        if name.startswith("__"):
             raise AttributeError(name)
         members = self._current()
         try:

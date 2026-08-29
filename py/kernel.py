@@ -251,7 +251,7 @@ class ToolsModule(types.ModuleType):
 
     def __init__(self) -> None:
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
-        self.__path__ = []  # marks it a package so `__dsh__.tools.mcp` resolves
+        self.__path__ = []  # a package, so `__dsh__.tools.mcp` resolves under it
         self.ToolCallError = ToolCallError
 
     def __getattr__(self, name):  # only reached when the attribute is absent
@@ -350,21 +350,19 @@ class McpModule(types.ModuleType):
         return f"<module {self.__name__!r}: {', '.join(sorted(members)) or 'empty'}>"
 
 
+MCP_ROOT = McpModule(MCP_MODULE, "MCP tools, one module per server.")
+MCP_ROOT.__path__ = []  # a package, like `__dsh__` and `__dsh__.tools`, so its server modules resolve
+sys.modules[MCP_MODULE] = MCP_ROOT
+
+
 def install_mcp_modules(bindings: dict) -> list[str]:
-    """Register `__dsh__.tools.mcp` and one module per visible server; return the server names.
+    """Register a module per visible MCP server; return the server names.
 
     `sys.modules` is where the import machinery looks for `__dsh__.tools.mcp.<server>`, and it
     only ever gains entries: a server another shell can see costs this one an unused module, while
     removing it would break an import that shell is mid-conversation with. What a shell can
     actually reach is decided by `mcp_members`, not by what is registered.
-
-    Idempotent, and it does not assume `install_bridge_modules` has run: a Session builds its
-    bindings before installing the seam.
     """
-    if MCP_MODULE not in sys.modules:
-        root = McpModule(MCP_MODULE, "MCP tools, one module per server.")
-        root.__path__ = []  # marks it a package so its server modules resolve
-        sys.modules[MCP_MODULE] = root
     servers = list(mcp_servers(bindings))
     for server in servers:
         name = f"{MCP_MODULE}.{server}"
@@ -380,7 +378,7 @@ def build_bindings(bridge: Bridge, specs) -> dict:
     reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
     flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
     # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
-    return {**flat, "mcp": sys.modules[MCP_MODULE]} if install_mcp_modules(flat) else flat
+    return {**flat, "mcp": MCP_ROOT} if mcp_servers(flat) else flat
 
 
 def install_bridge_modules() -> ToolsModule:
@@ -398,9 +396,6 @@ def install_bridge_modules() -> ToolsModule:
     sys.modules["__dsh__.shared"] = package.shared
     sys.modules["__dsh__"] = package
     sys.modules["__dsh__.tools"] = tools
-    # `__dsh__.tools` is a package now, so `__dsh__.tools.mcp` resolves under it even in a shell
-    # whose catalogue has no MCP server — `dir()` on it is then simply empty.
-    install_mcp_modules({})
     return tools
 
 
@@ -493,7 +488,7 @@ class Session:
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
         self.shell = InteractiveShell(user_ns=namespace, config=history)
-        self.bindings = build_bindings(bridge, specs)
+        self.rebind(bridge, specs)
         self.sinks: list = [None, None]  # the Capped buffers of the cell in flight
         install_bridge_modules()
 
@@ -541,7 +536,14 @@ class Session:
             self.sinks[:] = previous
 
     def rebind(self, bridge: Bridge, specs) -> None:
+        """Swap in a catalogue — a restriction or a reconnecting server moves tools between cells.
+
+        The one place the `sys.modules` registration lives, so `build_bindings` stays the pure
+        projection its name promises and no caller can produce bindings the import machinery
+        cannot follow.
+        """
         self.bindings = build_bindings(bridge, specs)
+        install_mcp_modules(self.bindings)
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""

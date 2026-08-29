@@ -632,6 +632,17 @@ console.log('mcp namespace:')
   await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__cal___private'", r.error)
   }, UNDERSCORED)
+  // The root exists for the whole process, so it survives a shell that mounted no MCP server at
+  // all — `mcp` means the namespace or nothing, never a half-installed package. The tool LISTING
+  // is still honest: `dir(__dsh__.tools)` does not offer `mcp` when there is nothing under it.
+  const NO_MCP = [{ name: 'read', doc: 'A native tool, and the only one.', params: [] }]
+  await ns.start(NO_MCP, 'plain')
+  try {
+    const r = await ns.exec('import __dsh__.tools as T\nfrom __dsh__.tools import mcp\n(type(mcp).__name__, dir(mcp), "mcp" in dir(T), sorted(dir(T)))', undefined, NO_MCP, 'plain')
+    assert.equal(r.repr, `('McpModule', [], False, ['read'])`, r.error ?? 'unexpected result')
+    console.log('  ok   a shell with no MCP server still has the package, and is not offered it')
+  } catch (error) { failures += 1; console.log(`  FAIL a shell with no MCP server still has the package, and is not offered it\n       ${error.message}`) }
+
   // `sys.modules` is process-global and only ever gains entries, so a server ANOTHER shell mounted
   // stays importable here. Pinned rather than left to chance: what leaks is the module's existence,
   // not a tool — it resolves empty, and the grouping still lists only this shell's servers.

@@ -607,12 +607,28 @@ console.log('mcp namespace:')
   await t('a name the grouping cannot reach stays listed', 'import __dsh__.tools as T\nsorted(dir(T))', (r) => {
     assert.equal(r.repr, "['mcp', 'mcp__trunc_9f8e7d6c5b4a']", r.error ?? 'a hashed name has no server to hide under')
   }, [{ name: 'mcp__trunc_9f8e7d6c5b4a', doc: 'Normalised past recovery.', params: [] }, MCP[0]])
-  // `inspect.signature` renders a default with `repr`, and `repr(...)` is `Ellipsis` — so `read?`
-  // disagreed with the block above it, which writes `= ...` as source text.
-  await t('an optional parameter reads the way the prompt block writes it', 'import inspect\nfrom __dsh__.tools import mcp\nstr(inspect.signature(mcp.calendar.list_events))', (r) => {
-    assert.ok(!r.repr.includes('Ellipsis'), `signature still shows Ellipsis: ${r.repr}`)
-    assert.match(r.repr, /calendar_id: 'str' = \.\.\./, r.error ?? 'the default should render as `...`')
-  }, [{ name: 'mcp__calendar__list_events', doc: 'x', params: [{ name: 'calendar_id', type: 'str', required: false }] }])
+  // `__all__` is the star-import BINDING contract, not a listing. Narrowing it alongside `__dir__`
+  // left a flat name undefined in a cell that used to work — a regression, not a quieter surface.
+  await t('`import *` still binds every flat name the listing dropped', 'from __dsh__.tools import *\n(await mcp__calendar__list_events(calendar_id="c"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__list_events'", r.error ?? 'dir() hides them; `import *` must still bind them')
+  })
+  // The three places the model is SHOWN a listing have to agree. `repr` is the trailing-expression
+  // echo — the block's own return channel — and the `Available:` list is what a typo earns.
+  await t('every shown listing tells the same story', 'import __dsh__.tools as T\nsorted(dir(T)) == sorted(repr(T).split(": ", 1)[1].rstrip(">").split(", "))', (r) => {
+    assert.equal(r.repr, 'True', r.error ?? '`repr` still enumerated the flat names `dir` had dropped')
+  })
+  // Hidden must mean reachable-elsewhere. A raw name that is a true dunder splits cleanly, so the
+  // old `split_mcp is None` test hid it — while `McpModule.__getattr__` refuses exactly that shape,
+  // leaving it in no listing at all.
+  await t('a name the grouping cannot serve keeps its flat name', 'import __dsh__.tools as T\nfrom __dsh__.tools import mcp\n("mcp__und____odd__" in dir(T), "und" in dir(mcp), (await getattr(T, "mcp__und____odd__")())["from"])', (r) => {
+    // The server drops out of the grouping entirely rather than appearing empty: every tool it has
+    // is one `mcp.<server>.<tool>` cannot answer, so `mcp.und` would be a mount that never works.
+    assert.equal(r.repr, "(True, False, 'mcp__und____odd__')", r.error ?? 'shown where it works, not where it does not')
+  }, [{ name: 'mcp__und____odd__', doc: 'A true dunder raw name.', params: [] }, MCP[0]])
+  // The ternary's required arm: making every parameter optional used to leave the suite green.
+  await t('a required parameter carries no default', 'import inspect\nfrom __dsh__.tools import mcp\nstr(inspect.signature(mcp.calendar.list_events))', (r) => {
+    assert.equal(r.repr, `'(*, calendar_id: 'str', limit: 'int' = Ellipsis) -> 'Any''`, r.error ?? 'required must not render a default')
+  }, [{ name: 'mcp__calendar__list_events', doc: 'x', params: [{ name: 'calendar_id', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }])
   // Every other binding is re-imported the moment the model wants a different tool. `mcp` is the
   // one it has no reason to import twice — it reads as a namespace, not as this cell's tool list —
   // so a reference kept from an earlier cell has to resolve against the catalogue in force NOW.

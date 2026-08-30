@@ -206,25 +206,6 @@ class Bridge:
             future.set_exception(ToolCallError(tool or "?", message or "tool call failed"))
 
 
-class _Optional:
-    """The default rendered for a parameter dsh does not require.
-
-    `...` itself is the obvious choice — it is what the prompt block writes — but `inspect.signature`
-    renders a default with `repr`, and `repr(...)` is `Ellipsis`. So `read?` said `offset = Ellipsis`
-    under a block that said `offset = ...`, and a model introspecting its own tools wrote
-    `str(sig).replace("Ellipsis", "...")` to paper over the difference. The signature is decorative —
-    the binding is `async def call(**kwargs)` and nothing binds against it — so this is display only.
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "..."
-
-
-OPTIONAL = _Optional()
-
-
 def _make_binding(bridge: Bridge, spec):
     """One tool as a real `async def`: dsh's description becomes its docstring and its parameters become a keyword-only signature, so `read?`, `help(read)`, and tab-completion all work inside the REPL. The annotations arrive pre-rendered from the host, which projects them with dsh's own `jsonSchemaToPy` — no second mapper to drift out of sync."""
     name = spec["name"]
@@ -244,7 +225,7 @@ def _make_binding(bridge: Bridge, spec):
                     p["name"],
                     inspect.Parameter.KEYWORD_ONLY,
                     annotation=p.get("type") or "Any",
-                    default=inspect.Parameter.empty if p.get("required") else OPTIONAL,
+                    default=inspect.Parameter.empty if p.get("required") else ...,
                 )
             )
         except (ValueError, TypeError):
@@ -279,18 +260,24 @@ class ToolsModule(types.ModuleType):
         bindings = bound_tools()
         if name in bindings:
             return bindings[name]
-        available = ", ".join(sorted(bindings)) or "(none)"
+        # The shown listing, not the bound one: a typo used to push the whole flat catalogue into
+        # the trajectory at the one moment the model is guaranteed to be reading it.
+        available = ", ".join(sorted(listed_tools())) or "(none)"
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
 
     def __dir__(self):
         return sorted(listed_tools())
 
+    # NOT `listed_tools()`: `__all__` is what `from __dsh__.tools import *` BINDS, and narrowing it
+    # left `mcp__gh__ok` undefined in a cell that used to work. Display is `__dir__`'s job.
     @property
     def __all__(self):
-        return sorted(listed_tools())
+        return sorted(bound_tools())
 
     def __repr__(self) -> str:
-        return f"<module '__dsh__.tools': {', '.join(sorted(bound_tools())) or 'no tools bound'}>"
+        # The cell's trailing expression is echoed back, so ending on `__dsh__.tools` is the
+        # cheapest "what do I have" move there is — and it used to re-emit the whole flat catalogue.
+        return f"<module '__dsh__.tools': {', '.join(sorted(listed_tools())) or 'no tools bound'}>"
 
 
 MCP_PREFIX = "mcp__"
@@ -315,19 +302,37 @@ def split_mcp(name: str) -> tuple[str, str] | None:
     return (server, raw) if sep and server and raw else None
 
 
-def listed_tools() -> dict:
-    """What `dir(__dsh__.tools)` and `from __dsh__.tools import *` show.
+def servable(name: str) -> tuple[str, str] | None:
+    """`(server, tool)` when `mcp.<server>.<tool>` can actually ANSWER, else `None`.
 
-    Every flat `mcp__server__tool` name stays BOUND — it is what dispatch uses, and a cell written
-    before the grouping still runs — but listing them contradicted the prompt block, which stopped
-    showing them. Of 103 entries 86 were flat MCP names, and a model asked to introspect its own
-    tools filtered them out by hand, calling them "the same functions" as `mcp.*`.
+    Not `split_mcp` alone. Two ways a name splits cleanly and the grouping still cannot serve it:
+    `McpModule.__getattr__` refuses a true dunder — import and introspection probing (`__path__`,
+    `__all__`, `__spec__`) all wear that shape — and dsh hashes a public name that needed
+    normalising, where the cut can land before the second `__` and `split_mcp` returns `None`.
 
-    A name the grouping cannot reach stays listed: dsh hashes a public name that needed normalising
-    and the cut can land before the second `__`, so `split_mcp` returns `None`, the tool is under no
-    server, and `mcp` is not another way to say it.
+    The one predicate for the whole file, because the listing and the lookup have to agree: hiding
+    a flat name on the strength of the split alone left `mcp__gh____weird__` in no listing the
+    model ever reads, while `mcp.gh.__weird__` raised `AttributeError`.
     """
-    return {name: call for name, call in bound_tools().items() if split_mcp(name) is None}
+    parts = split_mcp(name)
+    if parts is None or (parts[1].startswith("__") and parts[1].endswith("__")):
+        return None
+    return parts
+
+
+def listed_tools() -> dict:
+    """What the model is SHOWN: `dir()`, `repr()`, and the `Available:` list of a failed lookup.
+
+    Not `__all__` — that is the star-import BINDING contract, and narrowing it unbound every flat
+    name from `from __dsh__.tools import *`, which is a regression on running code rather than a
+    quieter listing.
+
+    Every flat `mcp__server__tool` name stays bound; showing them contradicted the prompt block,
+    which stopped printing them. Of 103 entries 86 were flat MCP names, and a model asked to
+    introspect its own tools filtered them out by hand. A name the grouping cannot serve stays
+    shown — it is then the only name that works.
+    """
+    return {name: call for name, call in bound_tools().items() if servable(name) is None}
 
 
 def mcp_servers(bindings: dict) -> dict[str, dict]:
@@ -352,7 +357,7 @@ def mcp_members(module_name: str) -> dict:
     Deliberately not a method: a non-dunder attribute on the class would shadow a tool or a server
     of that name, and a raw MCP name is the server's to choose — `_private` is a legal one.
     """
-    servers = mcp_servers(bound_tools())
+    servers = mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
     if module_name == MCP_MODULE:
         return {server: mcp_server_module(server) for server in servers}
     # `removeprefix`, not `rpartition`: a raw server name is not guaranteed dot-free, and taking

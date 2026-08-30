@@ -574,6 +574,22 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL narrowing only removes a reason to reject, never rewrites an accepted schema\n       ${error.message}`)
   }
+  // Two shapes a name-only rule gets wrong, both raised in review. `additionalProperties` IS in the
+  // subset, but dsh takes it only as a boolean — so the schema-valued form Pydantic emits for
+  // `dict[str, str]` is rejected however clean its child is, and narrowing that child repairs nothing
+  // while dropping it renders. And where a `oneOf` is already declared, substituting `anyOf`'s branches
+  // for it would be deciding a type rather than removing a reason to reject, so the rewrite stands down.
+  try {
+    const shapes = renderToolsSection([{ name: 'store', parameters: { properties: {
+      bag: { type: 'object', additionalProperties: { type: 'string', minLength: 1 } },
+      pick: { anyOf: [{ type: 'string' }, { type: 'null' }], oneOf: [{ type: 'string' }, { type: 'number' }] },
+    }, required: ['bag'] } }])
+    assert.match(shapes, /async def store\(\*, bag: dict\[str, Any\], pick: str \| float = \.\.\.\) -> Any: \.\.\./, 'the subset rejects by form as well as by name')
+    console.log('  ok   a schema-valued `additionalProperties` is dropped, and a declared `oneOf` wins')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a schema-valued \`additionalProperties\` is dropped, and a declared \`oneOf\` wins\n       ${error.message}`)
+  }
   // Only `mcp` is bound at the top level, so a server's tools are shown the way the call site spells
   // them — as comments. Rendered as bare `async def`s they claimed a top-level name they do not have
   // AND took it: a native `read` plus two servers exposing a raw `read` left the last stub shadowing

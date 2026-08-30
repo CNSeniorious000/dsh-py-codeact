@@ -593,6 +593,26 @@ console.log('mcp namespace:')
   await t('a native tool is not swept under it', 'from __dsh__.tools import mcp\nhasattr(mcp, "read")', (r) => {
     assert.equal(r.repr, 'False')
   })
+  // What the model READS and what it INTROSPECTS have to agree. The block stopped listing the flat
+  // names; `dir()` did not, so 86 of 103 entries were the thing the block had just dropped, and a
+  // model asked to enumerate its own tools filtered them out by hand.
+  await t('the listing shows the grouping, not a hundred flat names', 'import __dsh__.tools as T\nsorted(dir(T))', (r) => {
+    assert.equal(r.repr, "['mcp', 'read']", r.error ?? 'unexpected listing')
+  })
+  await t('…while the flat name is still bound, and still dispatches', 'from __dsh__.tools import mcp__calendar__list_events as f\n(await f(calendar_id="c"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__list_events'", r.error ?? 'hidden from dir(), never unbound')
+  })
+  // dsh hashes a public name that needed normalising, and the cut can land before the second `__`.
+  // Such a tool is under no server, so hiding it from the listing would leave it with no name at all.
+  await t('a name the grouping cannot reach stays listed', 'import __dsh__.tools as T\nsorted(dir(T))', (r) => {
+    assert.equal(r.repr, "['mcp', 'mcp__trunc_9f8e7d6c5b4a']", r.error ?? 'a hashed name has no server to hide under')
+  }, [{ name: 'mcp__trunc_9f8e7d6c5b4a', doc: 'Normalised past recovery.', params: [] }, MCP[0]])
+  // `inspect.signature` renders a default with `repr`, and `repr(...)` is `Ellipsis` — so `read?`
+  // disagreed with the block above it, which writes `= ...` as source text.
+  await t('an optional parameter reads the way the prompt block writes it', 'import inspect\nfrom __dsh__.tools import mcp\nstr(inspect.signature(mcp.calendar.list_events))', (r) => {
+    assert.ok(!r.repr.includes('Ellipsis'), `signature still shows Ellipsis: ${r.repr}`)
+    assert.match(r.repr, /calendar_id: 'str' = \.\.\./, r.error ?? 'the default should render as `...`')
+  }, [{ name: 'mcp__calendar__list_events', doc: 'x', params: [{ name: 'calendar_id', type: 'str', required: false }] }])
   // Every other binding is re-imported the moment the model wants a different tool. `mcp` is the
   // one it has no reason to import twice — it reads as a namespace, not as this cell's tool list —
   // so a reference kept from an earlier cell has to resolve against the catalogue in force NOW.

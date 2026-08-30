@@ -206,6 +206,25 @@ class Bridge:
             future.set_exception(ToolCallError(tool or "?", message or "tool call failed"))
 
 
+class _Optional:
+    """The default rendered for a parameter dsh does not require.
+
+    `...` itself is the obvious choice — it is what the prompt block writes — but `inspect.signature`
+    renders a default with `repr`, and `repr(...)` is `Ellipsis`. So `read?` said `offset = Ellipsis`
+    under a block that said `offset = ...`, and a model introspecting its own tools wrote
+    `str(sig).replace("Ellipsis", "...")` to paper over the difference. The signature is decorative —
+    the binding is `async def call(**kwargs)` and nothing binds against it — so this is display only.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "..."
+
+
+OPTIONAL = _Optional()
+
+
 def _make_binding(bridge: Bridge, spec):
     """One tool as a real `async def`: dsh's description becomes its docstring and its parameters become a keyword-only signature, so `read?`, `help(read)`, and tab-completion all work inside the REPL. The annotations arrive pre-rendered from the host, which projects them with dsh's own `jsonSchemaToPy` — no second mapper to drift out of sync."""
     name = spec["name"]
@@ -225,7 +244,7 @@ def _make_binding(bridge: Bridge, spec):
                     p["name"],
                     inspect.Parameter.KEYWORD_ONLY,
                     annotation=p.get("type") or "Any",
-                    default=inspect.Parameter.empty if p.get("required") else ...,
+                    default=inspect.Parameter.empty if p.get("required") else OPTIONAL,
                 )
             )
         except (ValueError, TypeError):
@@ -264,11 +283,11 @@ class ToolsModule(types.ModuleType):
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
 
     def __dir__(self):
-        return sorted(bound_tools())
+        return sorted(listed_tools())
 
     @property
     def __all__(self):
-        return sorted(bound_tools())
+        return sorted(listed_tools())
 
     def __repr__(self) -> str:
         return f"<module '__dsh__.tools': {', '.join(sorted(bound_tools())) or 'no tools bound'}>"
@@ -294,6 +313,21 @@ def split_mcp(name: str) -> tuple[str, str] | None:
         return None
     server, sep, raw = name[len(MCP_PREFIX) :].partition("__")
     return (server, raw) if sep and server and raw else None
+
+
+def listed_tools() -> dict:
+    """What `dir(__dsh__.tools)` and `from __dsh__.tools import *` show.
+
+    Every flat `mcp__server__tool` name stays BOUND — it is what dispatch uses, and a cell written
+    before the grouping still runs — but listing them contradicted the prompt block, which stopped
+    showing them. Of 103 entries 86 were flat MCP names, and a model asked to introspect its own
+    tools filtered them out by hand, calling them "the same functions" as `mcp.*`.
+
+    A name the grouping cannot reach stays listed: dsh hashes a public name that needed normalising
+    and the cut can land before the second `__`, so `split_mcp` returns `None`, the tool is under no
+    server, and `mcp` is not another way to say it.
+    """
+    return {name: call for name, call in bound_tools().items() if split_mcp(name) is None}
 
 
 def mcp_servers(bindings: dict) -> dict[str, dict]:

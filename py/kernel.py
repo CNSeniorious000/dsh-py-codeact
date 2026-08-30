@@ -217,6 +217,13 @@ def _make_binding(bridge: Bridge, spec):
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
     call.__doc__ = spec.get("doc") or None
+    # The same prose the block renders beside each parameter, repeated here so `read?` is not the poorer view: the block is read once a turn, while `?` is what a model reaches for to re-check ONE tool without scrolling back. Same source, so the two cannot drift.
+    documented = [p for p in spec.get("params") or [] if p.get("doc")]
+    if documented:
+        # Continuation lines indented, or a description carrying its own newlines reads as the next parameter's.
+        section = "Parameters:\n" + "\n".join(f"    {p['name']}: {p['doc'].replace(chr(10), chr(10) + '        ')}" for p in documented)
+        call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
+        # A rebind builds NEW callables, so a name already pulled out with `from __dsh__.tools import read` keeps the docstring it was imported with. `__dsh__.tools.read?` is the authoritative view after a schema revision. True of the signature and return annotation too, and deliberate: the shell's namespace is the model's, and a rebind that reached into it could swap a binding under a cell mid-await.
     # Per-parameter, not one suppress around the whole thing: a single exotic name (`class`, `file-path` — hyphens are routine for MCP tools) used to discard the ENTIRE signature, so `read?` showed `(**kwargs)` while the prompt showed the full parameter list, with no error either way. Anything unrenderable is folded into `**kwargs` so the picture stays honest.
     params, dropped = [], False
     for p in spec.get("params") or []:

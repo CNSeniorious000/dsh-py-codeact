@@ -525,6 +525,55 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL the import line follows the render, not a list of expected symbols\n       ${error.message}`)
   }
+  // dsh validates a schema whole-tree and rejects totally, so ONE keyword outside its subset costs the
+  // whole annotation — and `minLength`/`format`/`minimum`/`anyOf` are exactly what Pydantic and FastMCP
+  // emit. On the live catalogue that was five parameters, including a REQUIRED search query, arriving as
+  // `Any`: worse than no annotation, because it looks like one. The keywords carry nothing a Python
+  // annotation could say, so dropping them loses nothing; `anyOf` is the one that does, and is a union.
+  try {
+    const constrained = renderToolsSection([{ name: 'search', parameters: { properties: {
+      query: { type: 'string', minLength: 1 },
+      budget: { type: 'number', minimum: 1, maximum: 9, format: 'double' },
+      session: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      window: { anyOf: [{ maximum: 100, type: 'number' }, { type: 'null' }] },
+    }, required: ['query'] } }])
+    assert.match(constrained, /async def search\(\*, query: str, budget: float = \.\.\., session: str \| None = \.\.\., window: float \| None = \.\.\.\) -> Any: \.\.\./, 'a validation keyword no longer eats the type beside it')
+    console.log('  ok   a constraint keyword costs a parameter nothing, and `anyOf` is a union')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a constraint keyword costs a parameter nothing, and \`anyOf\` is a union\n       ${error.message}`)
+  }
+  // Rejection is whole-TREE, so an unrecognised keyword on a leaf takes the root down with it, and a
+  // root `$schema` — which most generated schemas carry — takes down everything below. Both halves go
+  // through the same gate: an output degraded this way loses its named class, not just one field.
+  try {
+    const nested = renderToolsSection([{ name: 'fetch', output: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', properties: {
+      pages: { type: 'array', items: { type: 'object', properties: { url: { type: 'string', format: 'uri' } }, required: ['url'] } },
+    }, required: ['pages'] } }])
+    assert.match(nested, /class FetchOutput\(TypedDict\):\n {4}pages: list\[FetchOutputPages\]/, 'a deep constraint no longer collapses the root')
+    assert.match(nested, /async def fetch\(\) -> FetchOutput: \.\.\./, 'so the return is the class, not `Any`')
+    console.log('  ok   one leaf keyword no longer collapses the whole tree, on either half')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL one leaf keyword no longer collapses the whole tree, on either half\n       ${error.message}`)
+  }
+  // The narrowing may only ever REMOVE a reason to reject. Anything it changed about a schema dsh
+  // already accepts would be this plugin quietly growing the second JSON-Schema mapper it has twice
+  // declined to grow — so the shapes that render today must render identically.
+  try {
+    const accepted = { name: 'keep', parameters: { properties: {
+      mode: { type: 'string', enum: ['a', 'b'], description: 'd', title: 't', default: 'a' },
+      pick: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+      rows: { type: 'array', items: { type: 'object', properties: { n: { type: 'integer' } }, additionalProperties: false } },
+      tag: { type: 'string', const: 'x' },
+    }, required: ['mode'] } }
+    assert.deepEqual(toolSpecs([accepted]).specs[0].params, toolSpecs([structuredClone(accepted)]).specs[0].params, 'stable')
+    assert.match(renderToolsSection([accepted]), /async def keep\(\*, mode: Literal\["a", "b"\], pick: int \| None = \.\.\., rows: list\[dict\[str, Any\]\] = \.\.\., tag: Literal\["x"\] = \.\.\.\) -> Any: \.\.\./, 'an accepted schema renders exactly as before')
+    console.log('  ok   narrowing only removes a reason to reject, never rewrites an accepted schema')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL narrowing only removes a reason to reject, never rewrites an accepted schema\n       ${error.message}`)
+  }
   // Only `mcp` is bound at the top level, so a server's tools are shown the way the call site spells
   // them — as comments. Rendered as bare `async def`s they claimed a top-level name they do not have
   // AND took it: a native `read` plus two servers exposing a raw `read` left the last stub shadowing

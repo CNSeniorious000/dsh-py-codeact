@@ -123,7 +123,11 @@ dsh's MCP client is explicitly aware of this route — its canonical value "reta
 
 Worth contrasting: Anthropic's server-side [programmatic tool calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) is *not* compatible with MCP tools. Owning the bridge host-side is what buys this.
 
-(A tool whose name is not a valid Python identifier cannot be `import`ed, but is still reachable with `getattr` — `getattr(__dsh__.tools, "odd-name")`, or one level deeper for an MCP tool, `getattr(mcp.notion, "API-patch-block-children")`. A raw MCP name is a routine place to find a hyphen.)
+A raw MCP name is a routine place to find a hyphen — dsh normalises over `[A-Za-z0-9_-]`, so `-` survives, and `-` is legal in no Python identifier. Such a tool is bound under BOTH spellings: its own, and the `-`→`_` fold that the listings show and the block spells. `mcp.notion.API_patch_block_children(...)` dispatches to `mcp__notion__API-patch-block-children`, and an existing `getattr(mcp.notion, "API-patch-block-children")` keeps working. The fold never displaces a real tool: a server exposing both `a-b` and `a_b` keeps `a_b` meaning `a_b`, and both stay listed.
+
+Measured before adding it: on a 20-task benchmark run, 676 of 17030 dispatches (4.0%) went to twelve hyphenated tools, all from one server, and `API-patch-block-children` was the single most-dispatched tool of the whole catalogue — each call site paying for a `getattr`, with no signature in the block to go with it, because an unspellable name was excluded from the listing entirely. Across the 208 distinct tool names those runs dispatched, no fold collided with another fold or shadowed an existing name.
+
+(Folding fixes only what a substitution can reach. A keyword (`class`) or a digit-leading name (`123tool`) is unspellable for reasons no rewrite fixes, and those keep the `getattr` route — `getattr(__dsh__.tools, "class")` — which the block still points at when there is one.)
 
 ## Exclusive mode
 

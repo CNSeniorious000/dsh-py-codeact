@@ -48,6 +48,7 @@ import contextlib
 import inspect
 import io
 import json
+import keyword
 import select
 import sys
 import traceback
@@ -340,17 +341,83 @@ def listed_tools() -> dict:
     return {name: call for name, call in bound_tools().items() if servable(name) is None}
 
 
+def spellable(raw: str) -> str | None:
+    """The name Python can take for `raw`, or `None` when `raw` already is one.
+
+    dsh normalises a tool name over `[A-Za-z0-9_-]`, so `-` survives — and `-` is legal in no Python
+    identifier. `API-patch-block-children` was therefore reachable only as
+    `getattr(mcp.notion, "API-patch-block-children")`, at every call site, with no signature in the
+    prompt block to go with it; it was the single most-dispatched tool of a 20-task benchmark run,
+    and 4.0% of all dispatches went to twelve tools shaped like it.
+
+    Only `-` is folded. A keyword (`class`) or a digit-leading name (`123tool`) is unspellable for
+    reasons no substitution fixes, and inventing a spelling for those would mean inventing a name.
+    """
+    folded = raw.replace("-", "_")
+    # `isidentifier()` alone is not the host's rule: it accepts keywords, and the block's
+    # `isUsableName` refuses them. A raw `-` folds to `_`, a SOFT keyword — the kernel would have
+    # bound and listed `mcp.srv._` while the block routed the same tool to `getattr(mcp.srv, "-")`.
+    # The two halves have to agree on what is spellable; the suite checks that they do.
+    if folded == raw or not folded.isidentifier() or keyword.iskeyword(folded) or keyword.issoftkeyword(folded):
+        return None
+    return folded
+
+
 def mcp_servers(bindings: dict) -> dict[str, dict]:
     """Group the flat `mcp__server__tool` bindings into `{server: {tool: call}}`.
 
     The flat names stay bound too. They are what dsh dispatches on and what an older session may
     already have imported; dropping them to tidy the surface would break a cell mid-conversation.
+
+    A hyphenated raw name is reachable under BOTH spellings: its own, so an existing
+    `getattr(mcp.srv, "a-b")` keeps working, and its folded alias, which is what the listings show.
+    The alias never displaces a real tool — a server exposing both `a-b` and `a_b` keeps `a_b`
+    meaning `a_b`, and `a-b` stays getattr-only rather than quietly answering for its neighbour.
     """
     servers: dict[str, dict] = {}
     for name, call in bindings.items():
         if (parts := split_mcp(name)) is not None:
             servers.setdefault(parts[0], {})[parts[1]] = call
+    for tools in servers.values():
+        alias(tools)
+    alias(servers)
     return servers
+
+
+def alias(members: dict) -> None:
+    """Add each hyphenated key's folded spelling, in place, without displacing a real one.
+
+    `setdefault`, so a name that already exists keeps its own value: a server exposing `a-b` beside
+    `a_b` gets no alias for `a-b`, and both stay reachable under their own spellings.
+    """
+    for raw in [name for name in members if spellable(name) is not None]:
+        members.setdefault(spellable(raw), members[raw])
+
+
+def canonical(server: str, servers: dict) -> str:
+    """The module name for `server`: its fold, unless another server already owns that spelling.
+
+    Folding unconditionally made `a-b` and `a_b` ONE module — `mcp_server_module` is keyed by name,
+    so both root entries resolved to the fold's module and the hyphenated server's tools became
+    unreachable, through either spelling. This is the same rule the tool level applies by identity,
+    stated directly because a server's value here is a module built on demand, not a shared callable.
+    """
+    folded = spellable(server)
+    return server if folded is None or servers.get(folded) is not servers.get(server) else folded
+
+
+def listed(members: dict) -> dict:
+    """What a listing SHOWS: the folded spelling stands in for the name it was folded from.
+
+    The same split as `bound_tools` / `listed_tools` one level up, for the same reason — showing
+    both spellings would report twice as many tools as the server has, and showing only the raw one
+    would name something the model cannot type.
+    """
+    # Identity, not membership: `alias` maps a fold to the SAME callable, so `members[fold] is value`
+    # is what distinguishes a name's own alias from a DIFFERENT tool that happens to own that
+    # spelling. A server exposing both `a-b` and `a_b` keeps both listed — dropping the hyphenated
+    # one there would hide a real tool behind its neighbour.
+    return {name: value for name, value in members.items() if (fold := spellable(name)) is None or members.get(fold) is not value}
 
 
 MCP_MODULE = "__dsh__.tools.mcp"
@@ -364,7 +431,11 @@ def mcp_members(module_name: str) -> dict:
     """
     servers = mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
     if module_name == MCP_MODULE:
-        return {server: mcp_server_module(server) for server in servers}
+        # Keyed by the FOLDED name so a hyphenated server and its fold resolve to one module object,
+        # not two: `listed` tells an alias from a real neighbour by identity, and two objects would
+        # leave both spellings in `dir(mcp)`. Only the fold reaches `sys.modules`, which is the only
+        # spelling `from __dsh__.tools.mcp.<server> import …` could have used anyway.
+        return {server: mcp_server_module(canonical(server, servers)) for server in servers}
     # `removeprefix`, not `rpartition`: a raw server name is not guaranteed dot-free, and taking
     # the last segment of one would look up a server that does not exist and resolve it empty.
     return servers.get(module_name.removeprefix(f"{MCP_MODULE}."), {})
@@ -393,7 +464,7 @@ class McpModule(types.ModuleType):
             raise AttributeError(name)
         members = mcp_members(self.__name__)
         if name not in members:
-            available = ", ".join(sorted(members)) or "(none)"
+            available = ", ".join(sorted(listed(members))) or "(none)"
             raise AttributeError(f"no such tool: {self.__name__.removeprefix('__dsh__.tools.')}.{name}. Available: {available}")
         return members[name]
 
@@ -406,17 +477,17 @@ class McpModule(types.ModuleType):
         super().__setattr__(name, value)
 
     def __dir__(self):
-        return sorted(mcp_members(self.__name__))
+        return sorted(listed(mcp_members(self.__name__)))
 
     # Star-import reads `__all__` (or `vars()`), never `__getattr__` or `__dir__`, and nothing ever
     # lands in these modules' `__dict__` — so without this `from __dsh__.tools.mcp.x import *`
     # succeeded and bound nothing. `ToolsModule` carries the same property for the same reason.
     @property
     def __all__(self):
-        return sorted(mcp_members(self.__name__))
+        return sorted(listed(mcp_members(self.__name__)))
 
     def __repr__(self) -> str:
-        members = mcp_members(self.__name__)
+        members = listed(mcp_members(self.__name__))
         return f"<module {self.__name__!r}: {', '.join(sorted(members)) or 'empty'}>"
 
 

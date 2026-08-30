@@ -52,7 +52,7 @@ A dunder-named package reads as harness-owned, survives `%reset`, and leaves the
 
 ```
 In [1]: read?
-Signature: read(*, file_path: 'str', offset: 'int' = Ellipsis, limit: 'int' = Ellipsis) -> 'str'
+Signature: read(*, file_path: 'str', offset: 'int' = ..., limit: 'int' = ...) -> 'str'
 Docstring: Read a file from the workspace. Results include line numbers…
 ```
 
@@ -97,7 +97,7 @@ from __dsh__.tools import mcp
 data = await mcp.gh.github_graphql(query="{ viewer { login } }")
 ```
 
-dsh names them `mcp__<server>__<rawName>`, and with a hundred mounted that import line was most of the prompt block while every call site respelled its server. The flat names stay bound — `mcp` is how they are shown, not what they are — so a cell written before this still runs. The block declares the grouping as `Protocol` stubs, one per server, which is the shape dsh's own SDK renderer uses for the same problem.
+dsh names them `mcp__<server>__<rawName>`, and with a hundred mounted that import line was most of the prompt block while every call site respelled its server. The flat names stay bound — `mcp` is how they are shown, not what they are — so a cell written before this still runs, `import *` still binds them, and only the listings drop them. A name the grouping cannot serve is still shown: dsh hashes a public name that needed normalising and the cut can land before the second `__`, and a raw name that is a true dunder is refused by `__getattr__`; either way the flat name is the only one that works. They are kept out of `dir(__dsh__.tools)` for the same reason the block stopped printing them; a name the grouping cannot reach (dsh hashes a public name that needed normalising, and the cut can land before the second `__`) stays listed, because `mcp` is not another way to say it. The block declares the grouping as `Protocol` stubs, one per server, which is the shape dsh's own SDK renderer uses for the same problem.
 
 It is a real package, so a server can be imported as a module — which reads better than `mcp.` at every call site when a cell leans on one server:
 
@@ -188,7 +188,7 @@ Sub-dispatches carry the outer execution's `parent` token, so they re-enter the 
 - **Redundant-import hints.** When an `import` rebinds a name to the object it already held, the result carries `` `json` is already imported in this session — no need to re-import it. `` A model driving a persistent REPL re-imports constantly; telling it is cheaper than letting it burn a line every cell. (Implemented with a `dict` subclass that watches top-level `STORE_NAME` and checks the preceding opcode was `IMPORT_NAME`/`IMPORT_FROM`, so `x = x` does not trip it.)
 - **Readable reprs.** `objprint` + IPython's `pretty` for objects whose own `__repr__` is `object.__repr__` — an agent reading values needs structure, not `<Foo object at 0x…>`.
 - **Tagged observations.** `<stdout>`, `<stderr>`, `<return>`, `<traceback>`, `<note>` — with four things possibly present at once, the model needs to know which is which. A plain successful value stays bare.
-- **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the whole list, `%whos` for its own bindings.
+- **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the list — `mcp` rather than the hundred flat names under it, matching what the block printed — then `dir(mcp)` and `dir(mcp.<server>)` for those, and `%whos` for its own bindings. `__all__` is left alone: it is what `import *` binds, not what the model is shown. What it introspects matches what the block showed it: the listing carries `mcp` rather than the hundred flat names under it, and an optional parameter renders `= ...` there as it does here — `inspect.signature` uses `repr`, and `repr(...)` is `Ellipsis`, which is what `read?` used to say.
 
 ## Cancellation
 

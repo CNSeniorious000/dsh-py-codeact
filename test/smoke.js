@@ -712,6 +712,11 @@ console.log('prompt:')
     assert.match(rendered, /\n {4}from_: str = \.\.\.,\n/, 'a hard keyword takes the trailing underscore Python programmers already write')
     assert.match(rendered, /\n {4}type: str = \.\.\.,\n/, 'a SOFT keyword needs nothing — `def f(*, type: str)` compiles')
     assert.match(rendered, /\n {4}\*\*kwargs: Any {2}# spell as dict keys: "a b"\n/, 'and only what is left over goes to `**kwargs`, named')
+    // Only reachable once the overflow SHARES a signature with named parameters, which is new here: the old
+    // fallback replaced them all, so nothing could collide with it. A duplicate argument is a `SyntaxError`
+    // that takes the whole fenced block down, for every tool in it.
+    const own = renderToolsSection([{ name: 'edit', parameters: { properties: { kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' } }, required: [] } }])
+    assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b"\n/, 'a tool that owns the overflow name makes it step aside')
     console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1

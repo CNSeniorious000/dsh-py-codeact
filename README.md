@@ -52,11 +52,17 @@ A dunder-named package reads as harness-owned, survives `%reset`, and leaves the
 
 ```
 In [1]: read?
-Signature: read(*, file_path: 'str', offset: 'int' = ..., limit: 'int' = ...) -> 'str'
-Docstring: Read a file from the workspace. Results include line numbers…
+Signature: read(*, file_path: 'str', offset: 'int' = ..., limit: 'int' = ...) -> 'ReadOutput'
+Docstring:
+Read a file from the workspace. Results include line numbers…
+
+Parameters:
+    file_path: Path to read, resolved by the filesystem backend.
+    offset: 1-based first line to return. Defaults to 1.
+    limit: Maximum number of lines to return. Defaults to 2000.
 ```
 
-That is why the prompt block carries signatures only — the descriptions are one `?` away instead of resident in every request. Annotations are rendered host-side by dsh's own exported renderers, so there is no second JSON-Schema mapper to drift.
+The block renders the same picture: one parameter per line, its description as a trailing comment, the tool's own as a docstring — so what a model reads in the prompt and what it gets from `?` are the same text, from the same source. Annotations are rendered host-side by dsh's own exported renderers, so there is no second JSON-Schema mapper to drift.
 
 The **return** type comes from the tool's own `output` schema, by way of `ctx.tools.sdkSchemas(scope)` — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders `Any`; claiming a type nobody declared would be worse than admitting ignorance.
 
@@ -88,8 +94,14 @@ dsh's MCP client resolves a call to `{ content, structuredContent? }` — the pr
 So the bridge unwraps, and the signature describes what the cell actually receives:
 
 ```python
-async def mcp__review__search(*, q: str) -> McpReviewSearchOutput: ...   # the payload, not the wrapper
-async def mcp__email__ping() -> str: ...                                 # no declared payload: the text blocks, joined
+# mcp.review.search(
+#     *,
+#     q: str,  # what to search for
+# ) -> McpReviewSearchOutput:            <- the payload, not the wrapper
+#     """Search the archive."""
+
+# mcp.email.ping() -> str:               <- no declared payload: the text blocks, joined
+#     """Check the mailbox is reachable."""
 ```
 
 A server that declares no output schema is the common case in the wild, and its result really is just text — one text block, in every one of the 4142 MCP results measured across six trials, which is why this is a `str` and not a `list[str]` that would cost an `r[0]` at every call site to preserve a boundary that never appears. A result carrying no text block at all resolves to the empty string: an image there is re-attached to the conversation and read on the next step, so there was never anything for the cell to receive. One divergence is possible and belongs to the server: a tool that declares an output schema but omits `structuredContent` on some call resolves to that call's text, where the signature promised the payload type.

@@ -448,10 +448,10 @@ console.log('prompt:')
       { name: 'read', parameters: { properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } },
       { name: 'glob', parameters: { properties: { pattern: { type: 'string' } }, required: ['pattern'] }, output: { type: 'array', items: { type: 'string' } } },
     ])
-    assert.match(rendered, /async def read\(\*, file_path: str\) -> str: \.\.\./, "a tool's declared output type must reach the signature")
-    assert.match(rendered, /async def glob\(\*, pattern: str\) -> list\[str\]: \.\.\./, 'including container types')
+    assert.match(rendered, /async def read\(\n {4}\*,\n {4}file_path: str,\n\) -> str:\n {4}\.\.\./, "a tool's declared output type must reach the signature")
+    assert.match(rendered, /async def glob\(\n {4}\*,\n {4}pattern: str,\n\) -> list\[str\]:/, 'including container types')
     // `schemas()` has no `output`; only `sdkSchemas()` carries it. Rendering `Any` there is right — asserting a wrong type would be worse than admitting ignorance.
-    assert.match(renderToolsSection([{ name: 'read', parameters: {} }]), /async def read\(\) -> Any: \.\.\./, 'a schema with no output falls back to Any')
+    assert.match(renderToolsSection([{ name: 'read', parameters: {} }]), /async def read\(\) -> Any:\n {4}\.\.\./, 'a schema with no output falls back to Any')
     // The Protocol stubs are rendered Python too, and reach `Any` by the same routes a top-level
     // signature does — the import used to be derived from the signatures alone.
     const stubAny = renderToolsSection([{ name: 'mcp__cal__list', parameters: {} }])
@@ -473,9 +473,9 @@ console.log('prompt:')
     ])
     // Nothing spends the name any more: every tool is a module-level function, so `self` is an
     // ordinary keyword parameter everywhere and the collision this once guarded cannot occur.
-    assert.match(rendered, /# mcp\.srv\.list\(\*, self: str\) -> Any/, 'a `self` parameter renders as itself')
-    assert.match(rendered, /# mcp\.srv\.other\(\*, q: str\) -> Any/, 'and its siblings are unaffected')
-    assert.match(rendered, /async def read\(\*, self: str\) -> Any: \.\.\./, 'at the top level too')
+    assert.match(rendered, /# mcp\.srv\.list\(\n# {5}\*,\n# {5}self: str,\n# \) -> Any/, 'a `self` parameter renders as itself')
+    assert.match(rendered, /# mcp\.srv\.other\(\n# {5}\*,\n# {5}q: str,\n# \) -> Any/, 'and its siblings are unaffected')
+    assert.match(rendered, /async def read\(\n {4}\*,\n {4}self: str,\n\) -> Any:/, 'at the top level too')
     console.log('  ok   a parameter named `self` is just a parameter now')
   } catch (error) {
     failures += 1
@@ -502,7 +502,7 @@ console.log('prompt:')
       { type: 'object', properties: { kind: { type: 'string', const: 'foreground' }, exitCode: { type: 'integer' }, stdout: { type: 'object', properties: { text: { type: 'string' }, truncated: { type: 'boolean' } }, required: ['text', 'truncated'] } }, required: ['kind', 'exitCode', 'stdout'] },
     ] }
     const rendered = renderToolsSection([{ name: 'bash', parameters: { properties: { command: { type: 'string' } }, required: ['command'] }, output }])
-    assert.match(rendered, /async def bash\(\*, command: str\) -> BashOutput1 \| BashOutput2: \.\.\./, 'a choice of shapes is a union of NAMED branches, not two identical dicts')
+    assert.match(rendered, /async def bash\(\n {4}\*,\n {4}command: str,\n\) -> BashOutput1 \| BashOutput2:/, 'a choice of shapes is a union of NAMED branches, not two identical dicts')
     assert.match(rendered, /class BashOutput1\(TypedDict\):\n {4}kind: Literal\["background"\]\n {4}jobId: str/, 'each branch declares its own fields')
     // The discriminator is the whole point of the union: without the literal the model cannot tell
     // which branch it is holding, and a named union is no better than a dict.
@@ -519,7 +519,7 @@ console.log('prompt:')
   // anything that copied it. The import is derived from the lines instead of enumerated alongside them.
   try {
     const rendered = renderToolsSection([{ name: 'edit', parameters: { properties: { mode: { type: 'string', enum: ['a', 'b'] } }, required: ['mode'] } }])
-    assert.match(rendered, /async def edit\(\*, mode: Literal\["a", "b"\]\) -> Any: \.\.\./, 'an enum parameter renders a literal')
+    assert.match(rendered, /async def edit\(\n {4}\*,\n {4}mode: Literal\["a", "b"\],\n\) -> Any:/, 'an enum parameter renders a literal')
     assert.match(rendered, /from typing import Any, Literal\n/, 'which the import line has to name')
     console.log('  ok   the import line follows the render, not a list of expected symbols')
   } catch (error) {
@@ -536,9 +536,9 @@ console.log('prompt:')
       { name: 'mcp__alpha__read', parameters: { properties: { a: { type: 'string' } }, required: ['a'] }, output: { type: 'string' } },
       { name: 'mcp__beta__read', parameters: { properties: { b: { type: 'integer' } }, required: ['b'] }, output: { type: 'string' } },
     ])
-    assert.match(rendered, /^async def read\(\*, file_path: str\) -> str: \.\.\.$/m, 'the one name that IS bound is the only definition')
-    assert.match(rendered, /^# mcp\.alpha\.read\(\*, a: str\) -> str$/m, 'a server tool is spelled the way it is called')
-    assert.match(rendered, /^# mcp\.beta\.read\(\*, b: int\) -> str$/m, 'and a second server sharing the raw name keeps its own')
+    assert.match(rendered, /^async def read\(\n {4}\*,\n {4}file_path: str,\n\) -> str:$/m, 'the one name that IS bound is the only definition')
+    assert.match(rendered, /^# mcp\.alpha\.read\(\n# {5}\*,\n# {5}a: str,\n# \) -> str:$/m, 'a server tool is spelled the way it is called')
+    assert.match(rendered, /^# mcp\.beta\.read\(\n# {5}\*,\n# {5}b: int,\n# \) -> str:$/m, 'and a second server sharing the raw name keeps its own')
     assert.equal(rendered.split('\n').filter((l) => /^async def read\(/.test(l)).length, 1, 'exactly one definition binds that name')
     console.log('  ok   a raw MCP name never shadows the tool it collides with')
   } catch (error) {
@@ -562,7 +562,7 @@ console.log('prompt:')
       { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: envelope(payload) },
       { name: 'mcp__email__ping', parameters: { properties: {} }, output: envelope(undefined) },
     ])
-    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\n# mcp\.review\.search\(\*, q: str\) -> McpReviewSearchOutput/, 'a declared payload names its own type')
+    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\n# mcp\.review\.search\(\n# {5}\*,\n# {5}q: str,\n# \) -> McpReviewSearchOutput/, 'a declared payload names its own type')
     assert.match(rendered, /class McpReviewSearchOutput\(TypedDict\):\n {4}merchants: list\[str\]\n {4}total: NotRequired\[int\]/, 'and that type is the payload, not the wrapper')
     assert.ok(!rendered.includes('structuredContent'), 'the wrapper is never named — the cell does not receive it')
     // No declared payload means the client has only the text blocks to hand over, so `str` is the
@@ -605,7 +605,7 @@ console.log('prompt:')
     assert.match(rendered, /class Tool123toolOutput\(TypedDict\):/, 'it is carried under one Python can, rather than dropped')
     assert.match(rendered, /getattr\(__dsh__\.tools, "123tool"\)/, 'the tool is still reachable, only its annotation goes vague')
     assert.match(rendered, /class OkOutput\(TypedDict\):\n {4}a: str/, 'the tools that were fine still get theirs')
-    assert.match(rendered, /async def ok\(\) -> OkOutput: \.\.\./, 'and still reference it')
+    assert.match(rendered, /async def ok\(\) -> OkOutput:/, 'and still reference it')
     console.log('  ok   a tool name Python cannot take costs its class, not the block')
   } catch (error) {
     failures += 1
@@ -679,12 +679,35 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
   await checkDoc('a tool with no parameter prose gets no section at all', async () => {
     assert.equal((await doc('bare')).trim(), 'No parameter prose anywhere.')
   })
-  await checkDoc('and none of it reaches the block the model reads every turn', async () => {
-    const block = renderToolsSection([{ name: 'read', description: 'Read a file.', parameters: { properties: { file_path: { type: 'string', description: 'Path to read, resolved by the filesystem backend.' } }, required: ['file_path'] } }])
-    assert.ok(!block.includes('resolved by the filesystem backend'), 'the prose must stay off the prompt')
-    assert.match(block, /async def read\(\*, file_path: str\) -> Any: \.\.\./, 'the type is what the block owes it')
+  await checkDoc('and the block carries it too, beside the parameter and as the docstring', async () => {
+    const block = renderToolsSection([{ name: 'read', description: 'Read a file.\nSecond line.', parameters: { properties: {
+      file_path: { type: 'string', description: 'Path to read, resolved by the filesystem backend.' },
+      // A `#` comment cannot span lines: emitted as-is, the second line parses as code and the block stops being a program.
+      offset: { type: 'integer', description: 'Line to start at.\nOne-based.' },
+    }, required: ['file_path'] } }])
+    assert.match(block, /async def read\(\n {4}\*,\n {4}file_path: str,  # Path to read, resolved by the filesystem backend\.\n {4}offset: int = \.\.\.,  # Line to start at\. One-based\.\n\) -> Any:\n {4}"""\n {4}Read a file\.\n {4}Second line\.\n {4}"""/, 'both halves, in the shape a Python reader expects')
   })
   docs.dispose()
+}
+
+// The block is Python the model copies from, and now it carries PROSE — so a description is no longer
+// only content, it is syntax. One carrying a `"""` or ending in a backslash would close its own
+// docstring and take every tool below it down, which is the failure class #12 was: one tool invalidating
+// the whole block. Neither shape appears in a live catalogue, and a future MCP server is not bound by that.
+console.log('a description cannot break the block it is embedded in:')
+try {
+  const hostile = renderToolsSection([
+    { name: 'quoted', description: 'Ends a docstring early: """ and continues.', parameters: {} },
+    { name: 'slashed', description: 'Ends with a backslash \\\\', parameters: {} },
+    { name: 'after', description: 'Must still be here.', parameters: {} },
+  ])
+  const fence = hostile.slice(hostile.indexOf('```python') + 10, hostile.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  assert.match(fence, /async def after\(\) -> Any:/, 'the tool after the hostile ones still renders')
+  console.log('  ok   a triple quote or trailing backslash costs fidelity, never the block')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a triple quote or trailing backslash costs fidelity, never the block\n       ${error.message}`)
 }
 
 console.log('mcp namespace:')

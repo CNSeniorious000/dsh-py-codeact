@@ -216,7 +216,7 @@ def _make_binding(bridge: Bridge, spec):
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
     call.__doc__ = spec.get("doc") or None
-    # The block renders each parameter's TYPE but not its prose — the host keeps the description off the prompt because a real catalogue carries ~6.8 KB of it, re-sent every turn for the one parameter a cell touches. It lands here instead, where `read?` reaches it and where the block already sends the model for a tool's own description.
+    # The same prose the block renders beside each parameter, repeated here so `read?` is not the poorer view: the block is read once a turn, while `?` is what a model reaches for to re-check ONE tool without scrolling back. Same source, so the two cannot drift.
     documented = [p for p in spec.get("params") or [] if p.get("doc")]
     if documented:
         # Continuation lines indented, or a description carrying its own newlines reads as the next parameter's.

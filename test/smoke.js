@@ -461,6 +461,37 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
   }
+  // `self` is a legal identifier, so every "is this nameable" guard passes it — and then
+  // `async def list(self, *, self: str)` is a SyntaxError that takes the whole fenced block with it,
+  // every sibling stub and every native signature below included. The guard has to be positional.
+  try {
+    const rendered = renderToolsSection([
+      { name: 'mcp__srv__list', parameters: { properties: { self: { type: 'string' } }, required: ['self'] } },
+      { name: 'mcp__srv__other', parameters: { properties: { q: { type: 'string' } }, required: ['q'] } },
+      { name: 'read', parameters: { properties: { self: { type: 'string' } }, required: ['self'] } },
+    ])
+    assert.match(rendered, /async def list\(self, \*\*kwargs: Any\) -> Any: \.\.\./, 'the colliding stub falls back rather than emitting a duplicate argument')
+    assert.match(rendered, /async def other\(self, \*, q: str\) -> Any: \.\.\./, 'and its siblings keep their real signatures')
+    // Only a Protocol method spends the name. A top-level `def` never has a `self`, so the same
+    // parameter is perfectly renderable there — degrading it too would lose a type for nothing.
+    assert.match(rendered, /async def read\(\*, self: str\) -> Any: \.\.\./, 'while at the top level `self` is just a parameter')
+    console.log('  ok   a parameter named `self` costs one signature, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a parameter named \`self\` costs one signature, not the block\n       ${error.message}`)
+  }
+  // The kernel refuses to bind four families of name; this side used to mirror one. The block then
+  // wrote an import line for names nothing binds — an `ImportError` on `_private`, and a duplicate
+  // `ToolCallError` resolving to the exception class the instructions tell the model to catch.
+  try {
+    const rendered = renderToolsSection([{ name: 'ToolCallError', parameters: {} }, { name: '_private', parameters: {} }, { name: 'mcp', parameters: {} }, { name: 'read', parameters: {} }])
+    assert.match(rendered, /from __dsh__\.tools import ToolCallError, read\n/, 'only what the kernel actually binds reaches the import line')
+    assert.ok(!/async def (ToolCallError|_private|mcp)\(/.test(rendered), 'and no signature is offered for a name that is never bound')
+    console.log('  ok   the block advertises exactly what the kernel binds')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL the block advertises exactly what the kernel binds\n       ${error.message}`)
+  }
   // An object output is the case the annotation exists FOR, and the one a context-free render cannot
   // carry: `dict[str, Any]` says a dict comes back and nothing else, so the model calls once and
   // prints the result to learn the keys. On a stock catalogue that was every tool but one.
@@ -712,6 +743,20 @@ console.log('mcp namespace:')
   await t('a star-import binds the tools', 'from __dsh__.tools.mcp.calendar import *\nsorted(n for n in dir() if n.startswith(("list_", "create_")))', (r) => {
     assert.equal(r.repr, "['create_event', 'list_events']", r.error ?? 'star-import reads __all__, never __getattr__')
   })
+  // The block leads its import line with `ToolCallError` so the natural `except ToolCallError`
+  // resolves. A cell that reaches for `import *` instead used to lose that name — and find out
+  // inside the `except` clause, as a NameError raised while handling the failure it was meant to
+  // explain. Not in `dir()`/`repr()`, which answer "what tools do I have"; it is not a tool.
+  await t('a star-import binds the failure path, not only the tools', 'from __dsh__.tools import *\n(ToolCallError.__name__, "ToolCallError" in dir(__import__("__dsh__.tools", fromlist=["x"])))', (r) => {
+    assert.equal(r.repr, "('ToolCallError', False)", r.error ?? '`import *` must bind it; the listing must not show it')
+  })
+  // The host mirrors the kernel's reservations as a two-name literal, which is only correct while
+  // every other reserved name starts with `_` and is dropped by the prefix rule. Checked from the
+  // Python side so adding a plain attribute to `ToolsModule` fails here instead of silently
+  // advertising a tool that will never bind.
+  await t('the reservation the host mirrors is the whole reservation', 'import types\nimport __dsh__.tools as T\nsorted(n for n in set(vars(type(T))) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"} if not n.startswith("_"))', (r) => {
+    assert.equal(r.repr, "['ToolCallError', 'mcp']", r.error ?? 'a new plain attribute here needs mirroring in RESERVED_NAMES')
+  })
   await t('writing to the namespace is refused instead of poisoning every other agent', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
     assert.equal(r.ok, false)
     assert.match(r.error, /shared by every agent in this process/)
@@ -871,6 +916,10 @@ console.log('the rendered block is a program:')
     { name: '123tool', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } },
     { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: { type: 'object', additionalProperties: false, required: ['content', 'structuredContent'], properties: { content: { type: 'array', items: {} }, structuredContent: { type: 'object', properties: { hits: { type: 'integer' } }, required: ['hits'] } } } },
     { name: 'mcp__review__odd-name', parameters: { properties: {} }, output: { type: 'string' } },
+    // A parameter the enclosing stub already spent, and a name the kernel will not bind: both used
+    // to reach the fence, one as a SyntaxError and one as an ImportError.
+    { name: 'mcp__review__by_self', parameters: { properties: { self: { type: 'string' } }, required: ['self'] }, output: { type: 'string' } },
+    { name: '_private', parameters: { properties: {} }, output: { type: 'string' } },
   ]
   const { specs } = toolSpecs(schemas)
   const runner = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })

@@ -94,14 +94,8 @@ dsh's MCP client resolves a call to `{ content, structuredContent? }` — the pr
 So the bridge unwraps, and the signature describes what the cell actually receives:
 
 ```python
-# mcp.review.search(
-#     *,
-#     q: str,  # what to search for
-# ) -> McpReviewSearchOutput:            <- the payload, not the wrapper
-#     """Search the archive."""
-
-# mcp.email.ping() -> str:               <- no declared payload: the text blocks, joined
-#     """Check the mailbox is reachable."""
+mcp.review.search(*, q: str) -> McpReviewSearchOutput   # the payload, not the wrapper
+mcp.email.ping() -> str                                 # no declared payload: the text blocks, joined
 ```
 
 A server that declares no output schema is the common case in the wild, and its result really is just text — one text block, in every one of the 4142 MCP results measured across six trials, which is why this is a `str` and not a `list[str]` that would cost an `r[0]` at every call site to preserve a boundary that never appears. A result carrying no text block at all resolves to the empty string: an image there is re-attached to the conversation and read on the next step, so there was never anything for the cell to receive. One divergence is possible and belongs to the server: a tool that declares an output schema but omits `structuredContent` on some call resolves to that call's text, where the signature promised the payload type.

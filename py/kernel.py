@@ -251,6 +251,7 @@ class ToolsModule(types.ModuleType):
 
     def __init__(self) -> None:
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
+        self.__path__ = []  # a package, so `__dsh__.tools.mcp` resolves under it
         self.ToolCallError = ToolCallError
 
     def __getattr__(self, name):  # only reached when the attribute is absent
@@ -282,6 +283,12 @@ def split_mcp(name: str) -> tuple[str, str] | None:
     dsh names every MCP tool `mcp__<serverName>__<rawName>`, and a raw name may itself contain
     `__` — `split("__")` would tear such a tool apart and file it under a server that does not
     exist, so only the first two separators are ever consumed.
+
+    PRESENTATION ONLY. dsh's own naming contract says the public name "is never parsed to recover"
+    the raw one, and it is right: a name that needed normalizing, or that ran past 64 characters,
+    becomes `<truncated>_<12 hex of sha256>`, and the cut can land anywhere — including before the
+    second `__`. That case returns `None` here and the tool simply stays flat, reachable under its
+    full public name, which is the only name dispatch ever uses.
     """
     if not name.startswith(MCP_PREFIX):
         return None
@@ -302,46 +309,104 @@ def mcp_servers(bindings: dict) -> dict[str, dict]:
     return servers
 
 
-class Namespace:
-    """`mcp`, and one of these per server under it.
+MCP_MODULE = "__dsh__.tools.mcp"
 
-    A live view of the CURRENT catalogue, never a snapshot of the cell that made it. Every other
-    binding gets re-imported the moment the model reaches for a different tool, but `mcp` reads as
-    a stable namespace rather than as this cell's tool list — nothing would prompt a second
-    `from __dsh__.tools import mcp` — so a reference kept across cells has to keep resolving
-    against the bindings in force now. A restriction or a reconnecting server moves tools in and
-    out between calls.
+
+def mcp_members(module_name: str) -> dict:
+    """One level of the `mcp` tree, resolved against the catalogue in force NOW.
+
+    Deliberately not a method: a non-dunder attribute on the class would shadow a tool or a server
+    of that name, and a raw MCP name is the server's to choose — `_private` is a legal one.
+    """
+    servers = mcp_servers(bound_tools())
+    if module_name == MCP_MODULE:
+        return {server: mcp_server_module(server) for server in servers}
+    # `removeprefix`, not `rpartition`: a raw server name is not guaranteed dot-free, and taking
+    # the last segment of one would look up a server that does not exist and resolve it empty.
+    return servers.get(module_name.removeprefix(f"{MCP_MODULE}."), {})
+
+
+class McpModule(types.ModuleType):
+    """`__dsh__.tools.mcp`, and one of these per server under it.
+
+    Real modules, so every import form the model might reach for resolves the way it does for
+    `__dsh__.tools` itself — including `from __dsh__.tools.mcp.calendar import list_events`, which
+    needs a `sys.modules` entry of its own (the shallower forms can be served by `__getattr__`,
+    that one cannot).
+
+    Their CONTENTS still come from the ContextVar, because `sys.modules` is process-global while
+    the catalogue is per shell — and because a restriction or a reconnecting server moves tools in
+    and out between cells. A name pulled OUT with `from ... import` is a snapshot, as it is for any
+    Python import; the module itself stays live.
     """
 
-    def __init__(self, server: str | None = None) -> None:
-        self._server = server
-        self._path = "mcp" if server is None else f"mcp.{server}"
-
-    def _current(self) -> dict:
-        """This level's members: the servers, or one server's tools."""
-        servers = mcp_servers(bound_tools())
-        return servers if self._server is None else servers.get(self._server, {})
-
     def __getattr__(self, name):
-        # Dunders only, as in `ToolsModule`. An MCP tool may legally be named `_private` — the raw
-        # name is the server's to choose — and the block offers it as `mcp.<server>._private`, so a
-        # blanket `_` guard refused the one call it had just advertised. `_server` and `_path` are
-        # set in `__init__` and never reach here.
-        if name.startswith("__"):
+        # True dunders only. The guard is here to refuse import and introspection probing
+        # (`__path__`, `__all__`, `__spec__`, `__deepcopy__`), which always ends in `__` too —
+        # and a leading-`__` raw tool name is the server's to choose, so `startswith` alone
+        # advertised `mcp.<server>.__weird` in `dir()` and then refused the call.
+        if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
-        members = self._current()
+        members = mcp_members(self.__name__)
         if name not in members:
             available = ", ".join(sorted(members)) or "(none)"
-            raise AttributeError(f"no such tool: {self._path}.{name}. Available: {available}")
-        # A server's child is built on the way through, so reaching one tool does not allocate a
-        # namespace for every OTHER mounted server.
-        return Namespace(name) if self._server is None else members[name]
+            raise AttributeError(f"no such tool: {self.__name__.removeprefix('__dsh__.tools.')}.{name}. Available: {available}")
+        return members[name]
+
+    def __setattr__(self, name, value):
+        # One module per server for the whole PROCESS, so a write here would shadow that name for
+        # every other agent in it — permanently, and invisibly to `dir()`, which keeps reporting
+        # the tool it no longer reaches. The old per-call `Namespace` made this a local mistake.
+        if not (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(f"{self.__name__.removeprefix('__dsh__.tools.')} belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+        super().__setattr__(name, value)
 
     def __dir__(self):
-        return sorted(self._current())
+        return sorted(mcp_members(self.__name__))
+
+    # Star-import reads `__all__` (or `vars()`), never `__getattr__` or `__dir__`, and nothing ever
+    # lands in these modules' `__dict__` — so without this `from __dsh__.tools.mcp.x import *`
+    # succeeded and bound nothing. `ToolsModule` carries the same property for the same reason.
+    @property
+    def __all__(self):
+        return sorted(mcp_members(self.__name__))
 
     def __repr__(self) -> str:
-        return f"<{self._path}: {', '.join(sorted(self._current())) or 'empty'}>"
+        members = mcp_members(self.__name__)
+        return f"<module {self.__name__!r}: {', '.join(sorted(members)) or 'empty'}>"
+
+
+MCP_ROOT = McpModule(MCP_MODULE, "MCP tools, one module per server.")
+MCP_ROOT.__path__ = []  # a package, like `__dsh__` and `__dsh__.tools`, so its server modules resolve
+sys.modules[MCP_MODULE] = MCP_ROOT
+
+
+def mcp_server_module(server: str) -> McpModule:
+    """The one module for `server`, made on first ask.
+
+    The single construction site, so a module that went missing — a cell can `del sys.modules[…]`
+    — comes back instead of leaving `dir(mcp)` raising `KeyError` for the rest of the session.
+    """
+    name = f"{MCP_MODULE}.{server}"
+    if not isinstance(module := sys.modules.get(name), McpModule):
+        module = McpModule(name, f"Tools bridged from the `{server}` MCP server.")
+        sys.modules[name] = module
+    return module
+
+
+def install_mcp_modules(bindings: dict) -> None:
+    """Register a module per visible MCP server.
+
+    Eager, because the deep import form never reaches `mcp_members`: `from __dsh__.tools.mcp.x
+    import y` is resolved by the import machinery against `sys.modules`, before any attribute
+    lookup happens.
+
+    `sys.modules` only ever gains entries: a server another shell can see costs this one an unused
+    module, while removing it would break an import that shell is mid-conversation with. What a
+    shell can actually reach is decided by `mcp_members`, not by what is registered.
+    """
+    for server in mcp_servers(bindings):
+        mcp_server_module(server)
 
 
 def build_bindings(bridge: Bridge, specs) -> dict:
@@ -351,7 +416,7 @@ def build_bindings(bridge: Bridge, specs) -> dict:
     reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
     flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
     # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
-    return {**flat, "mcp": Namespace()} if mcp_servers(flat) else flat
+    return {**flat, "mcp": MCP_ROOT} if mcp_servers(flat) else flat
 
 
 def install_bridge_modules() -> ToolsModule:
@@ -461,7 +526,7 @@ class Session:
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
         self.shell = InteractiveShell(user_ns=namespace, config=history)
-        self.bindings = build_bindings(bridge, specs)
+        self.rebind(bridge, specs)
         self.sinks: list = [None, None]  # the Capped buffers of the cell in flight
         install_bridge_modules()
 
@@ -509,7 +574,14 @@ class Session:
             self.sinks[:] = previous
 
     def rebind(self, bridge: Bridge, specs) -> None:
+        """Swap in a catalogue — a restriction or a reconnecting server moves tools between cells.
+
+        The one place the `sys.modules` registration lives, so `build_bindings` stays the pure
+        projection its name promises and no caller can produce bindings the import machinery
+        cannot follow.
+        """
         self.bindings = build_bindings(bridge, specs)
+        install_mcp_modules(self.bindings)
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""

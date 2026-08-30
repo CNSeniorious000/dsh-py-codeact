@@ -598,10 +598,33 @@ console.log('mcp namespace:')
   // so a reference kept from an earlier cell has to resolve against the catalogue in force NOW.
   const MOVED = [{ name: 'mcp__drive__list_files', doc: 'A server that arrived later.', params: [] }, MCP[2]]
   await t('a kept reference survives the catalogue moving under it', 'from __dsh__.tools import mcp\nkept = mcp\nsorted(dir(kept))', (r) => {
-    assert.equal(r.repr, "['calendar', 'notion']")
+    assert.equal(r.repr, "['calendar', 'notion']", r.error ?? 'unexpected result')
   })
   await t('and follows it rather than freezing the cell it came from', '(sorted(dir(kept)), (await kept.drive.list_files())["from"])', (r) => {
     assert.equal(r.repr, `(['drive', 'notion'], 'mcp__drive__list_files')`, 'a snapshot would still hold calendar and know nothing of drive')
+  }, MOVED)
+  // `mcp` is a package, not just an object: every import form has to resolve, and the deep one is
+  // the reason `sys.modules` carries a module per server — `__getattr__` alone cannot serve it.
+  await t('the deep import form binds a tool directly', 'from __dsh__.tools.mcp.calendar import list_events\n(await list_events(calendar_id="c"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__list_events'", r.error)
+  })
+  await t('the server module can be imported from the grouping', 'from __dsh__.tools.mcp import calendar\n(await calendar.create_event(title="x"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__calendar__create_event'", r.error)
+  })
+  await t('and as a dotted module', 'import __dsh__.tools.mcp.notion as N\nsorted(dir(N))', (r) => {
+    assert.equal(r.repr, "['API-patch-block-children']", r.error)
+  })
+  // NOT `drive`: the catalogue above mounted one, and `sys.modules` only ever gains entries — a
+  // name any earlier cell saw would make this assertion pass for the wrong reason.
+  await t('a server nobody mounted fails as a missing module, not as a tool', 'import __dsh__.tools.mcp.dropbox', (r) => {
+    assert.equal(r.ok, false)
+    assert.match(r.error, /ModuleNotFoundError.*__dsh__\.tools\.mcp\.dropbox/)
+  })
+  // Same liveness rule as the `mcp` object: `sys.modules` is process-global, the catalogue is not.
+  await t('a kept server module follows the catalogue', 'kept_cal = calendar\n(sorted(dir(kept_cal)), hasattr(kept_cal, "create_event"))', (r) => {
+    // Both halves: an empty `dir()` only proves the LISTING moved. Reaching for a tool the old
+    // catalogue had is the thing that must also stop working.
+    assert.equal(r.repr, "([], False)", r.error ?? 'calendar is gone from this catalogue, and the module neither lists nor serves its tools')
   }, MOVED)
   // The raw name is the server's to choose, and a leading underscore is legal in it. The block
   // renders `mcp.cal._private()` for one — which the namespace has to be able to answer.
@@ -609,6 +632,42 @@ console.log('mcp namespace:')
   await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__cal___private'", r.error)
   }, UNDERSCORED)
+  // Every one of these is a way the process-global registry can be corrupted from a cell, and
+  // each was a live defect: the modules are shared by every agent in the process, so a mistake in
+  // one shell used to be permanent and invisible to `dir()`.
+  await t('a tool whose raw name starts with `__` is reachable, not just listed', 'from __dsh__.tools.mcp.und import __odd\n(await __odd())["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__und____odd'", r.error ?? 'a leading-`__` raw name survives dsh\'s normalisation verbatim')
+  }, [{ name: 'mcp__und____odd', doc: 'Leading dunder, no trailing.', params: [] }])
+  await t('a star-import binds the tools', 'from __dsh__.tools.mcp.calendar import *\nsorted(n for n in dir() if n.startswith(("list_", "create_")))', (r) => {
+    assert.equal(r.repr, "['create_event', 'list_events']", r.error ?? 'star-import reads __all__, never __getattr__')
+  })
+  await t('writing to the namespace is refused instead of poisoning every other agent', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
+    assert.equal(r.ok, false)
+    assert.match(r.error, /shared by every agent in this process/)
+  })
+  await t('deleting a server module out of sys.modules does not wedge the session', 'import sys\ndel sys.modules["__dsh__.tools.mcp.calendar"]\nfrom __dsh__.tools import mcp\n(sorted(dir(mcp)), (await mcp.calendar.list_events(calendar_id="c"))["from"])', (r) => {
+    assert.equal(r.repr, "(['calendar', 'notion'], 'mcp__calendar__list_events')", r.error ?? 'the module is rebuilt on the next ask')
+  })
+
+  // The root exists for the whole process, so it survives a shell that mounted no MCP server at
+  // all — `mcp` means the namespace or nothing, never a half-installed package. The tool LISTING
+  // is still honest: `dir(__dsh__.tools)` does not offer `mcp` when there is nothing under it.
+  const NO_MCP = [{ name: 'read', doc: 'A native tool, and the only one.', params: [] }]
+  await ns.start(NO_MCP, 'plain')
+  try {
+    const r = await ns.exec('import __dsh__.tools as T\nfrom __dsh__.tools import mcp\n(type(mcp).__name__, dir(mcp), "mcp" in dir(T), sorted(dir(T)))', undefined, NO_MCP, 'plain')
+    assert.equal(r.repr, `('McpModule', [], False, ['read'])`, r.error ?? 'unexpected result')
+    console.log('  ok   a shell with no MCP server still has the package, and is not offered it')
+  } catch (error) { failures += 1; console.log(`  FAIL a shell with no MCP server still has the package, and is not offered it\n       ${error.message}`) }
+
+  // `sys.modules` is process-global and only ever gains entries, so a server ANOTHER shell mounted
+  // stays importable here. Pinned rather than left to chance: what leaks is the module's existence,
+  // not a tool — it resolves empty, and the grouping still lists only this shell's servers.
+  await ns.start([{ name: 'mcp__vault__unlock', doc: 'Only this shell has it.', params: [] }], 'other')
+  await ns.exec('from __dsh__.tools.mcp.vault import unlock', undefined, [{ name: 'mcp__vault__unlock', doc: 'x', params: [] }], 'other')
+  await t('a server only another shell mounted imports here, but is empty', 'import __dsh__.tools.mcp.vault as v\n(dir(v), hasattr(v, "unlock"), "vault" in dir(mcp))', (r) => {
+    assert.equal(r.repr, "([], False, False)", r.error)
+  })
   ns.dispose()
 }
 

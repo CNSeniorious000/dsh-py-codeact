@@ -99,7 +99,16 @@ data = await mcp.gh.github_graphql(query="{ viewer { login } }")
 
 dsh names them `mcp__<server>__<rawName>`, and with a hundred mounted that import line was most of the prompt block while every call site respelled its server. The flat names stay bound — `mcp` is how they are shown, not what they are — so a cell written before this still runs. The block declares the grouping as `Protocol` stubs, one per server, which is the shape dsh's own SDK renderer uses for the same problem.
 
-`mcp` is a live view of the catalogue, not a snapshot of the cell it was imported in: a restriction or a reconnecting server moves tools in and out between calls, and unlike a single tool the model has no reason to ever import it twice. The name is reserved for it — a native tool called `mcp` is not bound.
+It is a real package, so a server can be imported as a module — which reads better than `mcp.` at every call site when a cell leans on one server:
+
+```python
+from __dsh__.tools.mcp.calendar import list_events, create_event
+from __dsh__.tools.mcp import calendar          # or the server itself
+```
+
+The deep form is why each server gets a `sys.modules` entry of its own: `__getattr__` can serve `from __dsh__.tools.mcp import calendar`, but not `from __dsh__.tools.mcp.calendar import list_events` — the import machinery looks that one up as a module. No meta path finder is needed; registration is enough.
+
+`mcp` and its server modules are live views of the catalogue, not snapshots of the cell they were imported in: a restriction or a reconnecting server moves tools in and out between calls, and unlike a single tool the model has no reason to ever import the namespace twice. (A name pulled OUT with `from ... import` is a snapshot, as it is for any Python import.) The name is reserved — a native tool called `mcp` is not bound.
 
 dsh's MCP client is explicitly aware of this route — its canonical value "retains the complete JSON MCP blocks and optional structured content for programmatic and Code Mode callers" — and the sub-call logs a `SUBTOOL` row like any other.
 

@@ -418,15 +418,20 @@ console.log('prompt:')
   try {
     // An MCP tool is reached through `mcp.<server>`, so its `getattr` route is one level deeper —
     // `mcp__notion__API-patch-block-children` is a real name from a real server, hyphens and all.
+    // A hyphen is the ONE unspellable shape with a spelling: the kernel binds the fold alongside the
+    // raw name, so the block shows a callable signature instead of pointing at `getattr`.
     const rendered = renderToolsSection([{ name: 'mcp__srv__do-thing', parameters: {} }])
-    assert.match(rendered, /getattr\(mcp\.srv, "do-thing"\)/, 'an unimportable MCP tool is reachable under its server')
+    assert.match(rendered, /# mcp\.srv\.do_thing\(\) -> Any/, 'a hyphenated tool is shown under a spelling Python takes')
+    assert.ok(!rendered.includes('getattr'), 'and needs no getattr route at all')
     assert.ok(!rendered.includes('mcp__srv__do-thing'), 'and is not also offered under the flat name the block no longer shows')
-    // A server whose OWN name Python refuses needs both levels spelled out.
+    // ...unless another server already owns the folded spelling, in which case neither is renamed.
+    const collided = renderToolsSection([{ name: 'mcp__a-b__from_hyphen', parameters: {} }, { name: 'mcp__a_b__from_underscore', parameters: {} }])
+    assert.equal(collided.split('# __dsh__.tools.mcp.a_b').length - 1, 1, 'the fold does not emit two sections under one name')
+    assert.match(collided, /getattr\(getattr\(mcp, "a-b"\), "from_hyphen"\)/, 'and the server it could not rename keeps the two-level getattr route')
+    // A server whose own name carries one folds the same way, at both levels.
     const oddOnly = renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }])
-    assert.match(oddOnly, /getattr\(getattr\(mcp, "odd-srv"\), "thing"\)/, 'so does a server Python cannot name')
-    // Such a server gets no Protocol stub, but that line still reaches its tools through `mcp` — a
-    // catalogue of nothing else used to name `mcp` there without importing it.
-    assert.match(oddOnly, /import ToolCallError, mcp\n/, 'and `mcp` is imported even when no server has a nameable name')
+    assert.match(oddOnly, /# __dsh__\.tools\.mcp\.odd_srv\n# mcp\.odd_srv\.thing\(\) -> Any/, 'so does a server whose own name has one')
+    assert.match(oddOnly, /import ToolCallError, mcp\n/, 'and `mcp` is imported even when every server name had to be folded')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
     // import line named `mcp` twice and a signature promised a call the kernel never binds.
@@ -733,8 +738,24 @@ console.log('mcp namespace:')
     assert.equal(r.repr, "'mcp__calendar__create_event'", r.error)
   })
   await t('and as a dotted module', 'import __dsh__.tools.mcp.notion as N\nsorted(dir(N))', (r) => {
-    assert.equal(r.repr, "['API-patch-block-children']", r.error)
+    // The listing shows the spelling Python accepts, not the one dsh happens to register: `-` is
+    // legal in a raw MCP name and in no identifier, so this tool was reachable only through
+    // `getattr` — at every call site, and with no signature in the prompt block to go with it.
+    assert.equal(r.repr, "['API_patch_block_children']", r.error)
   })
+  await t('a folded name calls the tool it was folded from', 'from __dsh__.tools import mcp\n(await mcp.notion.API_patch_block_children(block_id="b"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__notion__API-patch-block-children'", r.error ?? 'dispatch still uses the raw name')
+  })
+  await t('and the raw spelling keeps working for a cell that already used it', 'from __dsh__.tools import mcp\n(await getattr(mcp.notion, "API-patch-block-children")(block_id="b"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__notion__API-patch-block-children'", r.error ?? 'the alias adds a name, it does not move one')
+  })
+  await t('the deep import form takes the folded name too', 'from __dsh__.tools.mcp.notion import API_patch_block_children\n(await API_patch_block_children(block_id="b"))["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__notion__API-patch-block-children'", r.error)
+  })
+  // An alias must never answer for a tool that already owns that spelling.
+  await t('a real name is never displaced by a fold', 'from __dsh__.tools import mcp\n[(await getattr(mcp.srv, "a-b")())["from"], (await mcp.srv.a_b())["from"], sorted(dir(mcp.srv))]', (r) => {
+    assert.equal(r.repr, `['mcp__srv__a-b', 'mcp__srv__a_b', ['a-b', 'a_b']]`, r.error ?? 'the collision keeps both, and shows both')
+  }, [{ name: 'mcp__srv__a-b', doc: 'hyphen', params: [] }, { name: 'mcp__srv__a_b', doc: 'underscore', params: [] }])
   // NOT `drive`: the catalogue above mounted one, and `sys.modules` only ever gains entries — a
   // name any earlier cell saw would make this assertion pass for the wrong reason.
   await t('a server nobody mounted fails as a missing module, not as a tool', 'import __dsh__.tools.mcp.dropbox', (r) => {
@@ -762,6 +783,25 @@ console.log('mcp namespace:')
   await t('a star-import binds the tools', 'from __dsh__.tools.mcp.calendar import *\nsorted(n for n in dir() if n.startswith(("list_", "create_")))', (r) => {
     assert.equal(r.repr, "['create_event', 'list_events']", r.error ?? 'star-import reads __all__, never __getattr__')
   })
+  // A server may own the spelling another server's name folds to. Folding unconditionally made them
+  // ONE module — `mcp_server_module` is keyed by name — so the hyphenated server's tools vanished
+  // through both spellings. Caught by @sourcery-ai; the tool level already had this rule by identity.
+  await t('a server name never folds onto another server', 'from __dsh__.tools import mcp\n[sorted(dir(mcp)), sorted(dir(mcp.a_b)), sorted(dir(getattr(mcp, "a-b")))]', (r) => {
+    assert.equal(r.repr, `[['a-b', 'a_b'], ['from_underscore'], ['from_hyphen']]`, r.error ?? 'each server keeps its own module')
+  }, [{ name: 'mcp__a-b__from_hyphen', doc: 'x', params: [] }, { name: 'mcp__a_b__from_underscore', doc: 'x', params: [] }])
+  await t('and the collided server still dispatches under its raw name', 'from __dsh__.tools import mcp\n(await getattr(mcp, "a-b").from_hyphen())["from"]', (r) => {
+    assert.equal(r.repr, "'mcp__a-b__from_hyphen'", r.error)
+  }, [{ name: 'mcp__a-b__from_hyphen', doc: 'x', params: [] }, { name: 'mcp__a_b__from_underscore', doc: 'x', params: [] }])
+  // The fold is spelled twice — `spellable` in the kernel, `fold` + `isUsableName` in the block —
+  // and the two must agree on every input, or a tool is listed under a name the other half routes
+  // through `getattr`. `str.isidentifier()` is NOT the host's rule: it accepts keywords, so a raw
+  // `-` folds to `_` (a soft keyword) and was bound and listed here while the block pointed at
+  // `getattr(mcp.srv, "-")` for the same tool.
+  await t('a fold landing on a keyword is refused, as the block refuses it', 'from __dsh__.tools import mcp\nsorted(dir(mcp.srv))', (r) => {
+    // `ok-name` folds and the raw spelling leaves the listing; `-` stays as itself, because its
+    // fold is a soft keyword the block would refuse — so both halves send it to `getattr`.
+    assert.equal(r.repr, `['-', 'ok_name']`, r.error ?? 'only the fold that is a legal identifier is taken')
+  }, [{ name: 'mcp__srv__-', doc: 'folds to a soft keyword', params: [] }, { name: 'mcp__srv__ok-name', doc: 'folds cleanly', params: [] }])
   // The block leads its import line with `ToolCallError` so the natural `except ToolCallError`
   // resolves. A cell that reaches for `import *` instead used to lose that name — and find out
   // inside the `except` clause, as a NameError raised while handling the failure it was meant to

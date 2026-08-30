@@ -56,21 +56,30 @@ Signature: read(*, file_path: 'str', offset: 'int' = ..., limit: 'int' = ...) ->
 Docstring: Read a file from the workspace. Results include line numbers…
 ```
 
-That is why the prompt block carries signatures only — the descriptions are one `?` away instead of resident in every request. Annotations are rendered host-side with dsh's own exported `jsonSchemaToPy`, so there is no second JSON-Schema mapper to drift.
+That is why the prompt block carries signatures only — the descriptions are one `?` away instead of resident in every request. Annotations are rendered host-side by dsh's own exported renderers, so there is no second JSON-Schema mapper to drift.
 
 The **return** type comes from the tool's own `output` schema, by way of `ctx.tools.sdkSchemas(scope)` — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders `Any`; claiming a type nobody declared would be worse than admitting ignorance.
 
-Each object in that schema whose keys — and whose own generated class name — Python can take is declared as a named `TypedDict` above the signatures. For a bridged MCP tool the schema described here is the payload, not the transport wrapper — see below; `dict[str, Any]` would say a dict arrives without saying which keys, which is the one thing a return annotation exists to say.
+Every object in that schema is declared as a named `TypedDict` above the signatures, and an output that is a choice of shapes becomes a union of named branches. For a bridged MCP tool the schema described here is the payload, not the transport wrapper — see below; `dict[str, Any]` would say a dict arrives without saying which keys, which is the one thing a return annotation exists to say.
 
 ```python
-class McpCalendarListEventsOutput(TypedDict):
-    result: str
+class BashOutput1(TypedDict):
+    kind: Literal["background"]
+    jobId: str
 
-class _McpCalendar(Protocol):
-    async def list_events(self, *, calendar_id: str) -> McpCalendarListEventsOutput: ...
+class BashOutput2Stdout(TypedDict):
+    text: str
+    truncated: bool
+
+class BashOutput2(TypedDict):
+    kind: Literal["foreground"]
+    exitCode: int | None
+    stdout: BashOutput2Stdout
+
+async def bash(*, command: str, run_in_background: bool = ...) -> BashOutput1 | BashOutput2: ...
 ```
 
-`jsonSchemaToPy` cannot do this and says so — it is context-free, and naming a `TypedDict` needs the render context `renderToolsSdkPy` supplies. That renderer is not reusable here: it emits a whole document in Code Mode's own `tools.name(args)` contract. So only the object and array branches are handled locally, every leaf still going through `jsonSchemaToPy` — a place to hang the names, not a second JSON-Schema mapper. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.
+`jsonSchemaToPy` cannot do this and says so — it is context-free, and naming a `TypedDict` needs the render context `renderToolsSdkPy` supplies. With nowhere to hang a declaration it degrades every object to `dict[str, Any]`, which on a stock catalogue is the return type of every tool but one. `renderType`, the context-carrying core, is not exported, so the context is borrowed instead: `renderToolsSdkPy` is called with the parameters stripped — the one input it renders without allocating a class, which makes every class it emits an output class — and the block it returns is read back for the declarations and each tool's return text. The `Literal`s, the nested classes, the collision suffixes and the Unicode identifier rules are then dsh's own rather than a second mapper drifting alongside them. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.
 
 ### The MCP wrapper does not reach the cell
 
@@ -108,7 +117,7 @@ from __dsh__.tools.mcp import calendar          # or the server itself
 
 The deep form is why each server gets a `sys.modules` entry of its own: `__getattr__` can serve `from __dsh__.tools.mcp import calendar`, but not `from __dsh__.tools.mcp.calendar import list_events` — the import machinery looks that one up as a module. No meta path finder is needed; registration is enough.
 
-`mcp` and its server modules are live views of the catalogue, not snapshots of the cell they were imported in: a restriction or a reconnecting server moves tools in and out between calls, and unlike a single tool the model has no reason to ever import the namespace twice. (A name pulled OUT with `from ... import` is a snapshot, as it is for any Python import.) The name is reserved — a native tool called `mcp` is not bound.
+`mcp` and its server modules are live views of the catalogue, not snapshots of the cell they were imported in: a restriction or a reconnecting server moves tools in and out between calls, and unlike a single tool the model has no reason to ever import the namespace twice. (A name pulled OUT with `from ... import` is a snapshot, as it is for any Python import.) The name is reserved — a native tool called `mcp` is not bound, nor is one called `ToolCallError`, nor any whose name starts with `_`. The prompt block mirrors all three, because a block that imports a name the kernel never binds is an `ImportError` on the first line the model copies.
 
 dsh's MCP client is explicitly aware of this route — its canonical value "retains the complete JSON MCP blocks and optional structured content for programmatic and Code Mode callers" — and the sub-call logs a `SUBTOOL` row like any other.
 
@@ -188,7 +197,7 @@ Sub-dispatches carry the outer execution's `parent` token, so they re-enter the 
 - **Redundant-import hints.** When an `import` rebinds a name to the object it already held, the result carries `` `json` is already imported in this session — no need to re-import it. `` A model driving a persistent REPL re-imports constantly; telling it is cheaper than letting it burn a line every cell. (Implemented with a `dict` subclass that watches top-level `STORE_NAME` and checks the preceding opcode was `IMPORT_NAME`/`IMPORT_FROM`, so `x = x` does not trip it.)
 - **Readable reprs.** `objprint` + IPython's `pretty` for objects whose own `__repr__` is `object.__repr__` — an agent reading values needs structure, not `<Foo object at 0x…>`.
 - **Tagged observations.** `<stdout>`, `<stderr>`, `<return>`, `<traceback>`, `<note>` — with four things possibly present at once, the model needs to know which is which. A plain successful value stays bare.
-- **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the list — `mcp` rather than the hundred flat names under it, matching what the block printed — then `dir(mcp)` and `dir(mcp.<server>)` for those, and `%whos` for its own bindings. `__all__` is left alone: it is what `import *` binds, not what the model is shown. What it introspects matches what the block showed it: the listing carries `mcp` rather than the hundred flat names under it, and an optional parameter renders `= ...` there as it does here — `inspect.signature` uses `repr`, and `repr(...)` is `Ellipsis`, which is what `read?` used to say.
+- **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the list — `mcp` rather than the hundred flat names under it, matching what the block printed — then `dir(mcp)` and `dir(mcp.<server>)` for those, and `%whos` for its own bindings. `__all__` is left alone: it is what `import *` binds, not what the model is shown — so it carries every flat name the listings drop, and `ToolCallError`, which no listing shows because it is not a tool but which `except ToolCallError` needs after an `import *`. What it introspects matches what the block showed it: the listing carries `mcp` rather than the hundred flat names under it, and an optional parameter renders `= ...` there as it does here — `inspect.signature` uses `repr`, and `repr(...)` is `Ellipsis`, which is what `read?` used to say.
 
 ## Cancellation
 
@@ -201,7 +210,7 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 - **Native writes are not captured.** stdout/stderr are captured at the Python level, so `print` is captured but a subprocess writing to fd 1 is not. Use `subprocess.run(..., capture_output=True)`, or `%run`. (Anything that does reach fd 1/2 — including IPython's own colored traceback, deliberately routed there — is retained only for the crash message.)
 - **Scope is not optional.** The visible tool set comes from `ctx.tools.sdkSchemas(scope)` — the scope being the agent. Omitting it yields the *global* view, which in a preset composition holds only host-registered tools; the preset's own `read`/`bash`/`edit` live in the agent scope and vanish. The prompt section reads `assembly.scope`, and the kernel's name list is resent with every cell (restrictions and mid-conversation tool changes can move a tool in or out between calls).
 - **Pick a `toolName` nothing else answers to.** With an MCP IPython server also mounted, a model told to "use the python tool" reaches for `mcp__py__ipython_execute_code` — which has no `tools` binding — and then reports that your tool does not exist.
-- **A shape Python cannot name stays vague.** A field whose key is not a valid identifier degrades its own class back to `dict[str, Any]` rather than emitting a body that will not parse — the tool stays callable and only that one annotation goes quiet. The same guard covers the class name itself, which is not local damage: a tool named `123tool` would otherwise emit `class 123toolOutput`, a SyntaxError that takes the whole block with it. A schema with no declared properties still renders `Any`; claiming a type nobody declared would be worse.
+- **A shape Python cannot name stays vague.** A field whose key is not a valid identifier degrades its own class back to `dict[str, Any]` rather than emitting a body that will not parse — the tool stays callable and only that one annotation goes quiet. A parameter is judged by position, not just by spelling: `self` is a fine identifier and a fine top-level parameter, but inside a `Protocol` stub the method already spent it, and `async def list(self, *, self: str)` is a `SyntaxError: duplicate argument` that takes the whole fenced block with it. A tool name Python refuses gets a class under one it accepts (`123tool` → `Tool123toolOutput`), rather than the `class 123toolOutput` that would be a SyntaxError taking the whole block with it; that tool has no `async def` line, but it is still bound, and `123tool?` names the same class. A schema with no declared properties still renders `Any`; claiming a type nobody declared would be worse.
 - **Cold start.** The PEP 723 environment is resolved on first use (`uv python find --script`). Warm afterwards; pass `python` to skip it.
 
   The interpreter is then spawned **directly**, never behind `uv run --script`. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an `[the interpreter was restarted]` notice nothing actually caused. `alive` is likewise tracked from the exit event rather than read off `proc.killed`, which Node sets on any `kill()` call, including a signal the process survived.

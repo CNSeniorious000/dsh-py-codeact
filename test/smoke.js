@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 
 const calls = []
@@ -461,6 +461,70 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL renders each tool's real return type\n       ${error.message}`)
   }
+  // `self` is a legal identifier, so every "is this nameable" guard passes it — and then
+  // `async def list(self, *, self: str)` is a SyntaxError that takes the whole fenced block with it,
+  // every sibling stub and every native signature below included. The guard has to be positional.
+  try {
+    const rendered = renderToolsSection([
+      { name: 'mcp__srv__list', parameters: { properties: { self: { type: 'string' } }, required: ['self'] } },
+      { name: 'mcp__srv__other', parameters: { properties: { q: { type: 'string' } }, required: ['q'] } },
+      { name: 'read', parameters: { properties: { self: { type: 'string' } }, required: ['self'] } },
+    ])
+    assert.match(rendered, /async def list\(self, \*\*kwargs: Any\) -> Any: \.\.\./, 'the colliding stub falls back rather than emitting a duplicate argument')
+    assert.match(rendered, /async def other\(self, \*, q: str\) -> Any: \.\.\./, 'and its siblings keep their real signatures')
+    // Only a Protocol method spends the name. A top-level `def` never has a `self`, so the same
+    // parameter is perfectly renderable there — degrading it too would lose a type for nothing.
+    assert.match(rendered, /async def read\(\*, self: str\) -> Any: \.\.\./, 'while at the top level `self` is just a parameter')
+    console.log('  ok   a parameter named `self` costs one signature, not the block')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a parameter named \`self\` costs one signature, not the block\n       ${error.message}`)
+  }
+  // The kernel refuses to bind four families of name; this side used to mirror one. The block then
+  // wrote an import line for names nothing binds — an `ImportError` on `_private`, and a duplicate
+  // `ToolCallError` resolving to the exception class the instructions tell the model to catch.
+  try {
+    const rendered = renderToolsSection([{ name: 'ToolCallError', parameters: {} }, { name: '_private', parameters: {} }, { name: 'mcp', parameters: {} }, { name: 'read', parameters: {} }])
+    assert.match(rendered, /from __dsh__\.tools import ToolCallError, read\n/, 'only what the kernel actually binds reaches the import line')
+    assert.ok(!/async def (ToolCallError|_private|mcp)\(/.test(rendered), 'and no signature is offered for a name that is never bound')
+    console.log('  ok   the block advertises exactly what the kernel binds')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL the block advertises exactly what the kernel binds\n       ${error.message}`)
+  }
+  // An object output is the case the annotation exists FOR, and the one a context-free render cannot
+  // carry: `dict[str, Any]` says a dict comes back and nothing else, so the model calls once and
+  // prints the result to learn the keys. On a stock catalogue that was every tool but one.
+  try {
+    const output = { oneOf: [
+      { type: 'object', properties: { kind: { type: 'string', const: 'background' }, jobId: { type: 'string' } }, required: ['kind', 'jobId'] },
+      { type: 'object', properties: { kind: { type: 'string', const: 'foreground' }, exitCode: { type: 'integer' }, stdout: { type: 'object', properties: { text: { type: 'string' }, truncated: { type: 'boolean' } }, required: ['text', 'truncated'] } }, required: ['kind', 'exitCode', 'stdout'] },
+    ] }
+    const rendered = renderToolsSection([{ name: 'bash', parameters: { properties: { command: { type: 'string' } }, required: ['command'] }, output }])
+    assert.match(rendered, /async def bash\(\*, command: str\) -> BashOutput1 \| BashOutput2: \.\.\./, 'a choice of shapes is a union of NAMED branches, not two identical dicts')
+    assert.match(rendered, /class BashOutput1\(TypedDict\):\n {4}kind: Literal\["background"\]\n {4}jobId: str/, 'each branch declares its own fields')
+    // The discriminator is the whole point of the union: without the literal the model cannot tell
+    // which branch it is holding, and a named union is no better than a dict.
+    assert.match(rendered, /kind: Literal\["foreground"\]/, 'including the literal that tells them apart')
+    assert.match(rendered, /class BashOutput2Stdout\(TypedDict\):\n {4}text: str/, 'a nested object gets a class too')
+    assert.match(rendered, /class BashOutput2\(TypedDict\):[\s\S]*\n {4}stdout: BashOutput2Stdout/, 'and the parent references it by name')
+    console.log('  ok   an object output is a named class, not an opaque dict')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL an object output is a named class, not an opaque dict\n       ${error.message}`)
+  }
+  // A `Literal` reaches the block by a route no per-symbol condition predicted — an `enum` PARAMETER,
+  // with no output class in sight — and shipped with no import, making the block a `NameError` for
+  // anything that copied it. The import is derived from the lines instead of enumerated alongside them.
+  try {
+    const rendered = renderToolsSection([{ name: 'edit', parameters: { properties: { mode: { type: 'string', enum: ['a', 'b'] } }, required: ['mode'] } }])
+    assert.match(rendered, /async def edit\(\*, mode: Literal\["a", "b"\]\) -> Any: \.\.\./, 'an enum parameter renders a literal')
+    assert.match(rendered, /from typing import Any, Literal\n/, 'which the import line has to name')
+    console.log('  ok   the import line follows the render, not a list of expected symbols')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL the import line follows the render, not a list of expected symbols\n       ${error.message}`)
+  }
   // dsh's MCP client wraps every result as `{ content, structuredContent? }`. That wrapper is
   // transport, not API: `content`'s text duplicates the payload and an image in it is re-attached
   // to the conversation separately, so a cell that receives the wrapper can only hand-write
@@ -510,13 +574,15 @@ console.log('prompt:')
     console.log(`  FAIL only the wrapper is unwrapped, and only when it is one\n       ${error.message}`)
   }
   // The class NAME can be unusable too, and that one is not local damage: `class 123toolOutput`
-  // is a SyntaxError that takes the whole block with it, including every tool that was fine —
-  // and it happens for a tool that is not even importable, whose class nothing would reference.
+  // is a SyntaxError that takes the whole block with it, including every tool that was fine.
+  // Such a tool gets no `async def` line — only a `getattr` mention — but it is still bound, and
+  // `123tool?` shows the same `returns` text this block declares, so the class is not orphaned.
   try {
     const output = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
     const rendered = renderToolsSection([{ name: '123tool', parameters: { properties: {} }, output }, { name: 'ok', parameters: { properties: {} }, output }])
     // The name itself SHOULD still appear — in the `getattr` line, which is how such a tool is reached.
     assert.ok(!/class 123tool/.test(rendered), 'no class is declared under a name Python cannot take')
+    assert.match(rendered, /class Tool123toolOutput\(TypedDict\):/, 'it is carried under one Python can, rather than dropped')
     assert.match(rendered, /getattr\(__dsh__\.tools, "123tool"\)/, 'the tool is still reachable, only its annotation goes vague')
     assert.match(rendered, /class OkOutput\(TypedDict\):\n {4}a: str/, 'the tools that were fine still get theirs')
     assert.match(rendered, /async def ok\(\) -> OkOutput: \.\.\./, 'and still reference it')
@@ -677,6 +743,20 @@ console.log('mcp namespace:')
   await t('a star-import binds the tools', 'from __dsh__.tools.mcp.calendar import *\nsorted(n for n in dir() if n.startswith(("list_", "create_")))', (r) => {
     assert.equal(r.repr, "['create_event', 'list_events']", r.error ?? 'star-import reads __all__, never __getattr__')
   })
+  // The block leads its import line with `ToolCallError` so the natural `except ToolCallError`
+  // resolves. A cell that reaches for `import *` instead used to lose that name — and find out
+  // inside the `except` clause, as a NameError raised while handling the failure it was meant to
+  // explain. Not in `dir()`/`repr()`, which answer "what tools do I have"; it is not a tool.
+  await t('a star-import binds the failure path, not only the tools', 'from __dsh__.tools import *\n(ToolCallError.__name__, "ToolCallError" in dir(__import__("__dsh__.tools", fromlist=["x"])))', (r) => {
+    assert.equal(r.repr, "('ToolCallError', False)", r.error ?? '`import *` must bind it; the listing must not show it')
+  })
+  // The host mirrors the kernel's reservations as a two-name literal, which is only correct while
+  // every other reserved name starts with `_` and is dropped by the prefix rule. Checked from the
+  // Python side so adding a plain attribute to `ToolsModule` fails here instead of silently
+  // advertising a tool that will never bind.
+  await t('the reservation the host mirrors is the whole reservation', 'import types\nimport __dsh__.tools as T\nsorted(n for n in set(vars(type(T))) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"} if not n.startswith("_"))', (r) => {
+    assert.equal(r.repr, "['ToolCallError', 'mcp']", r.error ?? 'a new plain attribute here needs mirroring in RESERVED_NAMES')
+  })
   await t('writing to the namespace is refused instead of poisoning every other agent', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
     assert.equal(r.ok, false)
     assert.match(r.error, /shared by every agent in this process/)
@@ -816,6 +896,49 @@ console.log('restart detection:')
       console.log(`  FAIL ${label}\n       ${error.message}`)
     }
   }
+}
+
+// The block is Python the model is invited to copy, and until now nothing had ever RUN it. That is
+// how a `Literal` shipped for a release with no import: every assertion above reads the text, and
+// only an interpreter says whether the text is a program. Every shape that has broken it before is
+// in this catalogue — a name Python refuses, a parameter it refuses, an enum, a union of objects.
+console.log('the rendered block is a program:')
+{
+  const nested = { type: 'object', properties: { text: { type: 'string' }, truncated: { type: 'boolean' } }, required: ['text', 'truncated'] }
+  const schemas = [
+    { name: 'bash', description: 'Run it.', parameters: { properties: { command: { type: 'string' }, mode: { type: 'string', enum: ['fg', 'bg'] } }, required: ['command'] }, output: { oneOf: [
+      { type: 'object', properties: { kind: { type: 'string', const: 'background' }, jobId: { type: 'string' } }, required: ['kind', 'jobId'] },
+      { type: 'object', properties: { kind: { type: 'string', const: 'foreground' }, stdout: nested }, required: ['kind', 'stdout'] },
+    ] } },
+    { name: 'job_list', parameters: { properties: {} }, output: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } } },
+    { name: 'read', parameters: { properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } },
+    { name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] }, output: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } },
+    { name: '123tool', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } },
+    { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: { type: 'object', additionalProperties: false, required: ['content', 'structuredContent'], properties: { content: { type: 'array', items: {} }, structuredContent: { type: 'object', properties: { hits: { type: 'integer' } }, required: ['hits'] } } } },
+    { name: 'mcp__review__odd-name', parameters: { properties: {} }, output: { type: 'string' } },
+    // A parameter the enclosing stub already spent, and a name the kernel will not bind: both used
+    // to reach the fence, one as a SyntaxError and one as an ImportError.
+    { name: 'mcp__review__by_self', parameters: { properties: { self: { type: 'string' } }, required: ['self'] }, output: { type: 'string' } },
+    { name: '_private', parameters: { properties: {} }, output: { type: 'string' } },
+  ]
+  const { specs } = toolSpecs(schemas)
+  const runner = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  await runner.start(specs)
+  // Its own shell: the fence redefines every tool it imports, so running it anywhere else would
+  // leave the stubs behind for the next assertion to call.
+  const fence = renderToolsSection(schemas).split('```python\n')[1].split('\n```')[0]
+  const ran = await runner.exec(`${fence}\n[bash.__annotations__["return"], read.__annotations__["return"], _Mcp.__annotations__["review"]]`, undefined, specs)
+  try {
+    assert.ok(ran.ok, `the block runs as written: ${ran.error?.message ?? ran.stderr}`)
+    // Not just parseable — the annotations have to EVALUATE, which is where a missing import shows up.
+    assert.match(ran.repr ?? '', /BashOutput1 \| .*BashOutput2/, 'and its union annotation is a real type, not a string')
+    assert.match(ran.repr ?? '', /_McpReview/, 'and the server stub is bound to its protocol')
+    console.log('  ok   it imports, declares and annotates without raising')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL it imports, declares and annotates without raising\n       ${error.message}`)
+  }
+  runner.dispose()
 }
 
 kernel.dispose()

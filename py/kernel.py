@@ -228,7 +228,7 @@ def _make_binding(bridge: Bridge, spec):
         call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
         # A rebind builds NEW callables, so a name already pulled out with `from __dsh__.tools import read` keeps the docstring it was imported with. `__dsh__.tools.read?` is the authoritative view after a schema revision. True of the signature and return annotation too, and deliberate: the shell's namespace is the model's, and a rebind that reached into it could swap a binding under a cell mid-await.
     # Per-parameter, not one suppress around the whole thing: a single exotic name (`class`, `file-path` — hyphens are routine for MCP tools) used to discard the ENTIRE signature, so `read?` showed `(**kwargs)` while the prompt showed the full parameter list, with no error either way. Anything unrenderable is folded into `**kwargs` so the picture stays honest.
-    params, dropped = [], False
+    params, dropped = [], []
     for p in spec.get("params") or []:
         try:
             params.append(
@@ -240,9 +240,17 @@ def _make_binding(bridge: Bridge, spec):
                 )
             )
         except (ValueError, TypeError):
-            dropped = True
+            dropped.append(p)
     if dropped:
-        params.append(inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD))
+        # The overflow parameter must not collide with a real one. A tool declaring its own `kwargs` made `inspect.Signature` raise, and the suppress below then discarded the WHOLE signature — return annotation and every renderable parameter with it — so `weird?` showed `(**kwargs)` while the prompt showed the full list: exactly the regression the comment above says was fixed.
+        overflow = "kwargs"
+        while any(p.name == overflow for p in params):
+            overflow = f"_{overflow}"
+        params.append(inspect.Parameter(overflow, inspect.Parameter.VAR_KEYWORD))
+        # Name what was folded, because the prompt block points HERE for it — it renders `# ... see <tool>?` and nothing else lists these. A required parameter appearing in neither place is one the model calls without and the host then rejects it for, with no way to find out why.
+        spelled = ", ".join(f"{p.get('name')!r}: {p.get('type') or 'Any'}{'' if p.get('required') else ' = ...'}" for p in dropped)
+        note = f"Pass via **{overflow} — these parameter names are not Python identifiers: {spelled}."
+        call.__doc__ = f"{call.__doc__}\n\n{note}" if call.__doc__ else note
     with contextlib.suppress(ValueError, TypeError):
         # The return annotation matters as much as the parameters here: it is what `read?` can tell the model that no amount of re-reading the call site can. Same source as the prompt block, so the two never disagree.
         call.__signature__ = inspect.Signature(params, return_annotation=spec.get("returns") or "Any")  # type: ignore
@@ -794,9 +802,10 @@ class Kernel:
             session.rebind(self._bridge, specs)
         return session
 
-    async def _exec(self, exec_id, shell, code: str) -> None:
-        session = self._session_for(shell)
+    async def _exec(self, exec_id, shell, code: str, specs=None) -> None:
         try:
+            # Binding happens HERE, not in `_handle`: it is the last pre-exec step that can fail, and out there it failed outside this handler — `serve()` logged it and sent nothing, so the host waited forever on a shell that was demonstrably healthy. Every pre-exec failure is an unanswerable turn unless it is raised inside this try.
+            session = self._session_for(shell, specs)
             frame = {"t": "done", "id": exec_id, "shell": shell, **await session.run_cell(code)}
         except asyncio.CancelledError:
             frame = {"t": "done", "id": exec_id, "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "KeyboardInterrupt: cell interrupted by the harness", "repr": None, "note": None}
@@ -827,8 +836,7 @@ class Kernel:
                 )
                 return
             specs = frame.get("tools")
-            self._session_for(shell, specs if isinstance(specs, list) else None)
-            self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
+            self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or "", specs if isinstance(specs, list) else None))
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
@@ -836,7 +844,11 @@ class Kernel:
             if running is not None and not running.done():
                 running.cancel()
         elif kind == "init":
-            self._session_for(shell, frame.get("tools") or [])
+            # The handshake must be answered for the same reason an exec must: `start()` awaits `ready` and nothing else resolves it, so a spec that raises here hangs the session before its first cell — and this is the MORE reachable path, since the first `start()` carries the same specs. A shell that binds nothing is recoverable; a spawn that never returns is not.
+            try:
+                self._session_for(shell, frame.get("tools") or [])
+            except Exception:  # noqa: BLE001 — see above: never at the cost of the handshake
+                print(f"[dsh-py-codeact] {shell}: tools failed to bind: {traceback.format_exc()}", file=REAL_STDERR)
             self._send(
                 {
                     "t": "ready",

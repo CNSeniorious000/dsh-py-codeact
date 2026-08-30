@@ -270,9 +270,14 @@ class ToolsModule(types.ModuleType):
 
     # NOT `listed_tools()`: `__all__` is what `from __dsh__.tools import *` BINDS, and narrowing it
     # left `mcp__gh__ok` undefined in a cell that used to work. Display is `__dir__`'s job.
+    #
+    # `ToolCallError` is here and in no listing, for the same reason: it is not a tool, so showing it
+    # among them would be noise — but the instructions tell the model to catch it, and a cell that
+    # reached for `import *` instead of the block's import line lost the failure path it was told to
+    # handle, to a `NameError` raised from inside the `except` clause meant to explain the failure.
     @property
     def __all__(self):
-        return sorted(bound_tools())
+        return sorted([*bound_tools(), "ToolCallError"])
 
     def __repr__(self) -> str:
         # The cell's trailing expression is echoed back, so ending on `__dsh__.tools` is the

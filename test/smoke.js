@@ -494,7 +494,7 @@ console.log('prompt:')
   // silent, unannounced change to what that tool returns.
   try {
     assert.deepEqual(mcpPayload({ content: [{ type: 'text', text: '{"a":1}' }], structuredContent: { a: 1 } }), { value: { a: 1 } }, 'a declared payload is handed over bare')
-    assert.deepEqual(mcpPayload({ content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] }), { value: 'one\ntwo' }, 'no payload means the text blocks, joined')
+    assert.deepEqual(mcpPayload({ content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] }), { value: 'one\n\ntwo' }, 'no payload means the text blocks, joined')
     assert.deepEqual(mcpPayload({ content: [] }), { value: '' }, 'an empty envelope is an empty string, not a crash')
     // A payload that IS `null` is the server's answer. Reported as a wrapper carrying null, so the
     // caller cannot confuse it with "not a wrapper" and fall back to handing over the wrapper itself.

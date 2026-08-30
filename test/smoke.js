@@ -538,9 +538,11 @@ console.log('prompt:')
       window: { anyOf: [{ maximum: 100, type: 'number' }, { type: 'null' }] },
     }, required: ['query'] } }])
     // Per parameter rather than as one signature line: what is asserted is the TYPE each keyword used to eat, and binding that to the layout makes this fail for a render change it does not care about.
-    for (const [name, type] of [['query', 'str'], ['budget', 'float = ...'], ['session', 'str | None = ...'], ['window', 'float | None = ...']]) {
-      assert.match(constrained, new RegExp(`\\b${name}: ${type.replace(/[.|[\]]/g, '\\$&')}`), `a validation keyword no longer eats the type beside ${name}`)
+    for (const spelling of ['query: str', 'budget: float', 'session: str | None', 'window: float | None']) {
+      assert.ok(constrained.includes(spelling), `a validation keyword no longer eats the type in \`${spelling}\``)
     }
+    // The positive spellings are prefixes, so this is what actually rules out a degraded render.
+    assert.doesNotMatch(constrained, /: Any\b/, 'and nothing in the signature fell back')
     console.log('  ok   a constraint keyword costs a parameter nothing, and `anyOf` is a union')
   } catch (error) {
     failures += 1

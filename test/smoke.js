@@ -380,6 +380,7 @@ try {
   assert.ok(!sameNames([{ ...base[0], doc: 'revised' }]), 'a changed description must force one — it is the docstring `read?` prints')
   assert.ok(!sameNames([{ ...base[0], params: [...base[0].params, { name: 'limit', type: 'int', required: false }] }]), 'a new parameter must force one')
   assert.ok(!sameNames([{ ...base[0], params: [{ name: 'p', type: 'str', required: false }] }]), 'a parameter that stops being required must force one')
+  assert.ok(!sameNames([{ ...base[0], params: [{ ...base[0].params[0], doc: 'what p means' }] }]), 'a parameter that gains a description must force one — it is prose only `read?` carries')
   console.log('  ok   the key moves for anything the kernel would render differently')
 } catch (error) {
   failures += 1
@@ -639,6 +640,53 @@ console.log('prompt:')
 // `mcp.<server>.<tool>` is a PRESENTATION of the same flat bindings — the host still dispatches on
 // `mcp__server__tool`, so the grouping must not change what reaches it, and the flat name has to
 // keep working for a cell written before the catalogue was re-rendered.
+// A parameter's TYPE is not what it means: `queries` is `list[str]` either way, and only the prose
+// says 1–4 of them. The block deliberately does not carry it — ~6.8 KB across a real catalogue, re-sent
+// every turn for the one parameter a cell touches — so `name?` is the only place it can be, and the
+// block says so. Both halves are asserted here: that it arrives, and that it stays off the prompt.
+console.log('a parameter carries its prose to `name?`, not to the prompt:')
+{
+  const documented = [
+    { name: 'read', doc: 'Read a file.', returns: 'Any', params: [
+      { name: 'file_path', type: 'str', required: true, doc: 'Path to read, resolved by the filesystem backend.' },
+      { name: 'offset', type: 'int', required: false, doc: 'Line to start at.\nOne-based.' }] },
+    { name: 'bare', doc: 'No parameter prose anywhere.', returns: 'Any', params: [{ name: 'x', type: 'str', required: true }] },
+  ]
+  const docs = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  await docs.start(documented)
+  const doc = async (name) => (await docs.exec(`from __dsh__.tools import ${name}; print(${name}.__doc__)`, undefined, undefined)).stdout
+  const checkDoc = async (label, verify) => {
+    try { await verify(); console.log(`  ok   ${label}`) }
+    catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
+  }
+
+  await checkDoc('each description lands under the parameter it belongs to', async () => {
+    const text = await doc('read')
+    assert.match(text, /^Read a file\.$/m, 'the tool docstring stays first and intact')
+    assert.match(text, /^Parameters:\n {4}file_path: Path to read, resolved by the filesystem backend\.$/m)
+    // Indented continuation, or a description carrying newlines reads as the next parameter's.
+    assert.match(text, /^ {4}offset: Line to start at\.\n {8}One-based\.$/m)
+  })
+  await checkDoc('the host is what puts it there, straight off the schema', async () => {
+    const { specs } = toolSpecs([{ name: 'read', description: 'Read a file.', parameters: { properties: {
+      file_path: { type: 'string', description: 'Path to read, resolved by the filesystem backend.' },
+      offset: { type: 'integer' },
+    }, required: ['file_path'] } }])
+    assert.equal(specs[0].params[0].doc, 'Path to read, resolved by the filesystem backend.')
+    // Absent, not empty: `JSON.stringify` drops `undefined`, so a parameter with no prose costs neither the wire nor `specsKey`.
+    assert.ok(!Object.hasOwn(JSON.parse(JSON.stringify(specs[0].params[1])), 'doc'), 'a parameter with no description must not grow a key')
+  })
+  await checkDoc('a tool with no parameter prose gets no section at all', async () => {
+    assert.equal((await doc('bare')).trim(), 'No parameter prose anywhere.')
+  })
+  await checkDoc('and none of it reaches the block the model reads every turn', async () => {
+    const block = renderToolsSection([{ name: 'read', description: 'Read a file.', parameters: { properties: { file_path: { type: 'string', description: 'Path to read, resolved by the filesystem backend.' } }, required: ['file_path'] } }])
+    assert.ok(!block.includes('resolved by the filesystem backend'), 'the prose must stay off the prompt')
+    assert.match(block, /async def read\(\*, file_path: str\) -> Any: \.\.\./, 'the type is what the block owes it')
+  })
+  docs.dispose()
+}
+
 console.log('mcp namespace:')
 {
   const seen = []

@@ -216,6 +216,12 @@ def _make_binding(bridge: Bridge, spec):
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
     call.__doc__ = spec.get("doc") or None
+    # The block renders each parameter's TYPE but not its prose — the host keeps the description off the prompt because a real catalogue carries ~6.8 KB of it, re-sent every turn for the one parameter a cell touches. It lands here instead, where `read?` reaches it and where the block already sends the model for a tool's own description.
+    documented = [p for p in spec.get("params") or [] if p.get("doc")]
+    if documented:
+        # Continuation lines indented, or a description carrying its own newlines reads as the next parameter's.
+        section = "Parameters:\n" + "\n".join(f"    {p['name']}: {p['doc'].replace(chr(10), chr(10) + '        ')}" for p in documented)
+        call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
     # Per-parameter, not one suppress around the whole thing: a single exotic name (`class`, `file-path` — hyphens are routine for MCP tools) used to discard the ENTIRE signature, so `read?` showed `(**kwargs)` while the prompt showed the full parameter list, with no error either way. Anything unrenderable is folded into `**kwargs` so the picture stays honest.
     params, dropped = [], False
     for p in spec.get("params") or []:

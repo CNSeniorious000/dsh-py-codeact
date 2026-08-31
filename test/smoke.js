@@ -837,6 +837,24 @@ try {
   console.log(`  FAIL a triple quote or trailing backslash costs fidelity, never the block\n       ${error.message}`)
 }
 
+// CPython applies universal-newline translation to source, so a lone `\r` inside a description is a
+// real line break to the tokenizer even though nothing in JS treats it as one. In a trailing `# `
+// comment that break ends the comment and the rest of the description becomes live code — the same
+// failure class as the triple quote above, reached without a single character that looks dangerous.
+console.log('a carriage return in a description is not a line break the block honours:')
+try {
+  const cr = renderToolsSection([{ name: 'read', description: 'One.\rTwo.', parameters: { properties: {
+    file_path: { type: 'string', description: 'Path.\rinjected = 1' },
+  }, required: ['file_path'] } }])
+  const fence = cr.slice(cr.indexOf('```python') + 10, cr.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
+  assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
+  console.log('  ok   a lone \\r cannot end the comment it sits in')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a lone \\r cannot end the comment it sits in\n       ${error.message}`)
+}
 console.log('mcp namespace:')
 {
   const seen = []

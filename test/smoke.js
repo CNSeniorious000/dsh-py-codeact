@@ -605,6 +605,28 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL a schema-valued \`additionalProperties\` is dropped, and a declared \`oneOf\` wins\n       ${error.message}`)
   }
+  // The mirror of #16 on the other half. `jsonSchemaToPy` is context-free — it has nowhere to hang a
+  // declaration — so left to itself it degrades every parameter OBJECT to `dict[str, Any]`: the
+  // annotation says a dict arrives and nothing about which keys, which is the whole reason to have one.
+  // The names come from dsh's own render, read back the same way the return types are. `$schema` is in
+  // the fixture because a real MCP catalogue carries one, and it makes dsh collapse the WHOLE args type
+  // to `Any` — one key, taking every sibling parameter's annotation down with it.
+  try {
+    const named = renderToolsSection([{ name: 'store', parameters: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', properties: {
+      window: { type: 'object', properties: { offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['offset'] },
+      rows: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+    }, required: [] } }])
+    assert.ok(named.includes('window: StoreArgsWindow'), `a parameter object is a named TypedDict, got: ${/window: .*/.exec(named)?.[0]}`)
+    assert.ok(named.includes('rows: list[StoreArgsRows]'), `and so is the item type of an array of them, got: ${/rows: .*/.exec(named)?.[0]}`)
+    assert.match(named, /^class StoreArgsWindow\(TypedDict\):$/m, 'the class it names is declared')
+    // `<Tool>Args` is dsh's calling convention, not this block's: parameters are spelled out here, so
+    // emitting the wrapper they were read out of would declare a class nothing references.
+    assert.doesNotMatch(named, /^class StoreArgs\(TypedDict\):$/m, 'but the wrapper it was read out of is not')
+    console.log('  ok   a parameter object is named, and the wrapper it came from is dropped')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a parameter object is named, and the wrapper it came from is dropped\n       ${error.message}`)
+  }
   // Only `mcp` is bound at the top level, so a server's tools are shown the way the call site spells
   // them — as comments. Rendered as bare `async def`s they claimed a top-level name they do not have
   // AND took it: a native `read` plus two servers exposing a raw `read` left the last stub shadowing

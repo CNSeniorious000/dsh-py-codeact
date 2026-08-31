@@ -704,16 +704,64 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL a tool name Python cannot take costs its class, not the block\n       ${error.message}`)
   }
-  // Vague beats absent: a tool whose parameters cannot be named must stay importable and callable, since the kernel folds them into `**kwargs`.
+  // A hyphen is routine one level up, so it is routine here — and it used to cost the tool its WHOLE signature. Now it is renamed the way the tool name above it is, and only a name no normalisation reaches goes to `**kwargs`, with the raw key named rather than left to be guessed.
   try {
-    const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] } }])
-    assert.match(rendered, /import ToolCallError, odd/, 'it is still importable — only its signature is imprecise')
-    assert.match(rendered, /async def odd\(\*\*kwargs: Any\)/, 'the signature falls back rather than emitting an unparsable one')
-    console.log('  ok   an unnameable parameter costs the signature, not the tool')
+    const rendered = renderToolsSection([{ name: 'odd', parameters: { properties: { 'file-path': { type: 'string' }, from: { type: 'string' }, type: { type: 'string' }, 'a b': { type: 'string' } }, required: ['file-path'] } }])
+    assert.match(rendered, /import ToolCallError, odd/, 'it is still importable')
+    assert.match(rendered, /\n {4}file_path: str,\n/, 'a hyphen folds, as it does in a tool name')
+    assert.match(rendered, /\n {4}from_: str = \.\.\.,\n/, 'a hard keyword takes the trailing underscore Python programmers already write')
+    assert.match(rendered, /\n {4}type: str = \.\.\.,\n/, 'a SOFT keyword needs nothing — `def f(*, type: str)` compiles')
+    assert.match(rendered, /\n {4}\*\*kwargs: Any {2}# spell as dict keys: "a b"\n/, 'and only what is left over goes to `**kwargs`, named')
+    // Only reachable once the overflow SHARES a signature with named parameters, which is new here: the old
+    // fallback replaced them all, so nothing could collide with it. A duplicate argument is a `SyntaxError`
+    // that takes the whole fenced block down, for every tool in it.
+    const own = renderToolsSection([{ name: 'edit', parameters: { properties: { kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' } }, required: [] } }])
+    assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b"\n/, 'a tool that owns the overflow name makes it step aside')
+    console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1
-    console.log(`  FAIL an unnameable parameter costs the signature, not the tool\n       ${error.message}`)
+    console.log(`  FAIL a parameter name is normalised, and only the rest costs the signature\n       ${error.message}`)
   }
+}
+
+// Renaming a parameter is not like renaming a tool: the name travels to the tool as a JSON key, so
+// every rename needs a way back. Get this wrong and every call silently sends a key the tool does not
+// know — the failure would look like the tool being broken, not the binding.
+console.log('a renamed parameter still dispatches under its raw key:')
+{
+  const sent = []
+  const wire = new PythonKernel({ cwd: process.cwd(), onCall: async (name, args) => { sent.push(args); return { ok: true, value: null } } })
+  const specs = toolSpecs([{ name: 'odd', parameters: { properties: {
+    'file-path': { type: 'string' }, from: { type: 'string' }, 'a b': { type: 'string' },
+  }, required: ['file-path'] } }]).specs
+  await wire.start(specs)
+  const checkWire = async (label, verify) => {
+    try { await verify(); console.log(`  ok   ${label}`) }
+    catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
+  }
+
+  await checkWire('the spelling the block shows maps back to the key the tool declared', async () => {
+    sent.length = 0
+    const ran = await wire.exec('from __dsh__.tools import odd\nawait odd(file_path="p", from_="f")', undefined, undefined)
+    assert.equal(ran.ok, true, ran.error)
+    assert.deepEqual(sent[0], { 'file-path': 'p', from: 'f' })
+  })
+  // A cell written before the rename, or one that read the raw name off the block's `**kwargs` line.
+  await checkWire('and a raw key passed straight through is left alone', async () => {
+    sent.length = 0
+    const ran = await wire.exec('await odd(**{"file-path": "p", "a b": 1})', undefined, undefined)
+    assert.equal(ran.ok, true, ran.error)
+    assert.deepEqual(sent[0], { 'file-path': 'p', 'a b': 1 })
+  })
+  wire.dispose()
+
+  // The lesson from folding MCP names one level up: an alias must never take a name something real answers to.
+  await checkWire('a fold never displaces the sibling that already owns the name', async () => {
+    const both = toolSpecs([{ name: 'clash', parameters: { properties: { 'file-path': { type: 'string' }, file_path: { type: 'integer' } }, required: [] } }]).specs[0]
+    assert.deepEqual(both.params.map((p) => [p.name, p.raw]), [['file-path', undefined], ['file_path', undefined]], 'neither is renamed, so neither can steal the other')
+    const rendered = renderToolsSection([{ name: 'clash', parameters: { properties: { 'file-path': { type: 'string' }, file_path: { type: 'integer' } }, required: [] } }])
+    assert.match(rendered, /\n {4}file_path: int = \.\.\.,\n {4}\*\*kwargs: Any {2}# spell as dict keys: "file-path"\n/, 'the real one keeps its name; the hyphenated one stays a dict key')
+  })
 }
 
 // `mcp.<server>.<tool>` is a PRESENTATION of the same flat bindings — the host still dispatches on

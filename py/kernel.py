@@ -211,8 +211,11 @@ def _make_binding(bridge: Bridge, spec):
     """One tool as a real `async def`: dsh's description becomes its docstring and its parameters become a keyword-only signature, so `read?`, `help(read)`, and tab-completion all work inside the REPL. The annotations arrive pre-rendered from the host, which projects them with dsh's own `jsonSchemaToPy` — no second mapper to drift out of sync."""
     name = spec["name"]
 
+    # A parameter name travels to the tool as a JSON key, so a renamed one has to travel back: the block spells `file_path` and `from_`, the tool still expects `file-path` and `from`. A raw key passed straight through is left alone, which is what a cell written before the rename does.
+    renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
+
     async def call(**kwargs):
-        return await bridge.call(name, kwargs)
+        return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"

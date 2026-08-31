@@ -422,7 +422,7 @@ console.log('prompt:')
     // A hyphen is the ONE unspellable shape with a spelling: the kernel binds the fold alongside the
     // raw name, so the block shows a callable signature instead of pointing at `getattr`.
     const rendered = renderToolsSection([{ name: 'mcp__srv__do-thing', parameters: {} }])
-    assert.match(rendered, /# mcp\.srv\.do_thing\(\) -> Any/, 'a hyphenated tool is shown under a spelling Python takes')
+    assert.match(rendered, /# async def do_thing\(\) -> Any/, 'a hyphenated tool is shown under a spelling Python takes')
     assert.ok(!rendered.includes('getattr'), 'and needs no getattr route at all')
     assert.ok(!rendered.includes('mcp__srv__do-thing'), 'and is not also offered under the flat name the block no longer shows')
     // ...unless another server already owns the folded spelling, in which case neither is renamed.
@@ -431,7 +431,7 @@ console.log('prompt:')
     assert.match(collided, /getattr\(getattr\(mcp, "a-b"\), "from_hyphen"\)/, 'and the server it could not rename keeps the two-level getattr route')
     // A server whose own name carries one folds the same way, at both levels.
     const oddOnly = renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }])
-    assert.match(oddOnly, /# __dsh__\.tools\.mcp\.odd_srv\n# mcp\.odd_srv\.thing\(\) -> Any/, 'so does a server whose own name has one')
+    assert.match(oddOnly, /# __dsh__\.tools\.mcp\.odd_srv\n# async def thing\(\) -> Any/, 'so does a server whose own name has one')
     assert.match(oddOnly, /import ToolCallError, mcp\n/, 'and `mcp` is imported even when every server name had to be folded')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
@@ -460,7 +460,7 @@ console.log('prompt:')
     // The Protocol stubs are rendered Python too, and reach `Any` by the same routes a top-level
     // signature does — the import used to be derived from the signatures alone.
     const stubAny = renderToolsSection([{ name: 'mcp__cal__list', parameters: {} }])
-    assert.match(stubAny, /# __dsh__\.tools\.mcp\.cal\n# mcp\.cal\.list\(\) -> Any/, 'including under a server module')
+    assert.match(stubAny, /# __dsh__\.tools\.mcp\.cal\n# async def list\(\) -> Any/, 'including under a server module')
     assert.match(stubAny, /from typing import Any\n/, 'which has to import `Any` like any other use of it')
     console.log('  ok   renders each tool\'s real return type')
   } catch (error) {
@@ -478,8 +478,8 @@ console.log('prompt:')
     ])
     // Nothing spends the name any more: every tool is a module-level function, so `self` is an
     // ordinary keyword parameter everywhere and the collision this once guarded cannot occur.
-    assert.match(rendered, /# mcp\.srv\.list\(\n# {5}\*,\n# {5}self: str,\n# \) -> Any/, 'a `self` parameter renders as itself')
-    assert.match(rendered, /# mcp\.srv\.other\(\n# {5}\*,\n# {5}q: str,\n# \) -> Any/, 'and its siblings are unaffected')
+    assert.match(rendered, /# async def list\(\n# {5}\*,\n# {5}self: str,\n# \) -> Any/, 'a `self` parameter renders as itself')
+    assert.match(rendered, /# async def other\(\n# {5}\*,\n# {5}q: str,\n# \) -> Any/, 'and its siblings are unaffected')
     assert.match(rendered, /async def read\(\n {4}\*,\n {4}self: str,\n\) -> Any:/, 'at the top level too')
     console.log('  ok   a parameter named `self` is just a parameter now')
   } catch (error) {
@@ -638,8 +638,8 @@ console.log('prompt:')
       { name: 'mcp__beta__read', parameters: { properties: { b: { type: 'integer' } }, required: ['b'] }, output: { type: 'string' } },
     ])
     assert.match(rendered, /^async def read\(\n {4}\*,\n {4}file_path: str,\n\) -> str:$/m, 'the one name that IS bound is the only definition')
-    assert.match(rendered, /^# mcp\.alpha\.read\(\n# {5}\*,\n# {5}a: str,\n# \) -> str:$/m, 'a server tool is spelled the way it is called')
-    assert.match(rendered, /^# mcp\.beta\.read\(\n# {5}\*,\n# {5}b: int,\n# \) -> str:$/m, 'and a second server sharing the raw name keeps its own')
+    assert.match(rendered, /^# __dsh__\.tools\.mcp\.alpha\n# async def read\(\n# {5}\*,\n# {5}a: str,\n# \) -> str:$/m, 'a server tool renders as a def, under the header that carries its call path')
+    assert.match(rendered, /^# __dsh__\.tools\.mcp\.beta\n# async def read\(\n# {5}\*,\n# {5}b: int,\n# \) -> str:$/m, 'and a second server sharing the raw name keeps its own')
     assert.equal(rendered.split('\n').filter((l) => /^async def read\(/.test(l)).length, 1, 'exactly one definition binds that name')
     console.log('  ok   a raw MCP name never shadows the tool it collides with')
   } catch (error) {
@@ -663,12 +663,12 @@ console.log('prompt:')
       { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: envelope(payload) },
       { name: 'mcp__email__ping', parameters: { properties: {} }, output: envelope(undefined) },
     ])
-    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\n# mcp\.review\.search\(\n# {5}\*,\n# {5}q: str,\n# \) -> McpReviewSearchOutput/, 'a declared payload names its own type')
+    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\n# async def search\(\n# {5}\*,\n# {5}q: str,\n# \) -> McpReviewSearchOutput/, 'a declared payload names its own type')
     assert.match(rendered, /class McpReviewSearchOutput\(TypedDict\):\n {4}merchants: list\[str\]\n {4}total: NotRequired\[int\]/, 'and that type is the payload, not the wrapper')
     assert.ok(!rendered.includes('structuredContent'), 'the wrapper is never named — the cell does not receive it')
     // No declared payload means the client has only the text blocks to hand over, so `str` is the
     // whole truth. Not every server declares an output schema; this is the common case in the wild.
-    assert.match(rendered, /# mcp\.email\.ping\(\) -> str/, 'an envelope with no payload resolves to its text')
+    assert.match(rendered, /# async def ping\(\) -> str/, 'an envelope with no payload resolves to its text')
     console.log('  ok   an MCP envelope is unwrapped, in the annotation and at run time')
   } catch (error) {
     failures += 1
@@ -1254,6 +1254,12 @@ console.log('the rendered block is a program:')
     // Executing the block must not bind a server's tools: only `mcp` is, and a bare definition
     // under a server header would shadow whatever native tool shares that raw name.
     assert.match(ran.repr ?? '', /\[\]/, 'and no server tool leaked into the namespace the block runs in')
+    // The `# ` is the whole reason those stubs are inert; it also means nothing above would have
+    // caught a comment body that stopped being Python. Strip it and the section must still compile.
+    const stripped = fence.split('\n').filter((line) => line.startsWith('#')).map((line) => line.replace(/^# ?/, '')).join('\n')
+    const src = Buffer.from(stripped).toString('base64')
+    const compiled = await runner.exec(`compile(__import__("base64").b64decode("${src}").decode(), "<mcp>", "exec") and "compiles"`, undefined, specs)
+    assert.ok(compiled.ok, `the commented section is Python once uncommented: ${compiled.error?.message ?? compiled.stderr}`)
     console.log('  ok   it imports, declares and annotates without raising')
   } catch (error) {
     failures += 1

@@ -887,6 +887,21 @@ try {
   failures += 1
   console.log(`  FAIL a lone \\r cannot end the comment it sits in\n       ${error.message}`)
 }
+
+// A deletion has nothing holding it down. This one came back once already: #34 was branched before
+// the sentence was removed, rewrote the same bullet, and `git merge` took the branch's whole line —
+// no conflict, every test green, and the block was quietly telling the model to end cells on the raw
+// result again. The sentence is wrong (it contradicts the rule two bullets down), so it is asserted
+// gone rather than trusted to stay gone.
+try {
+  const prose = renderToolsSection([{ name: 'read', parameters: { properties: {} }, output: { type: 'string' } }])
+  assert.doesNotMatch(prose, /needs no .print. at all/, 'the sentence that told the model to end a cell on the raw tool result stays deleted')
+  assert.match(prose, /LAST expression is echoed back to you/, 'while the rest of that bullet is still there')
+  console.log('  ok   the deleted return-channel sentence does not come back')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL the deleted return-channel sentence does not come back\n       ${error.message}`)
+}
 console.log('mcp namespace:')
 {
   const seen = []

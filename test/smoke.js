@@ -605,6 +605,28 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL a schema-valued \`additionalProperties\` is dropped, and a declared \`oneOf\` wins\n       ${error.message}`)
   }
+  // The mirror of #16 on the other half. `jsonSchemaToPy` is context-free — it has nowhere to hang a
+  // declaration — so left to itself it degrades every parameter OBJECT to `dict[str, Any]`: the
+  // annotation says a dict arrives and nothing about which keys, which is the whole reason to have one.
+  // The names come from dsh's own render, read back the same way the return types are. `$schema` is in
+  // the fixture because a real MCP catalogue carries one, and it makes dsh collapse the WHOLE args type
+  // to `Any` — one key, taking every sibling parameter's annotation down with it.
+  try {
+    const named = renderToolsSection([{ name: 'store', parameters: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', properties: {
+      window: { type: 'object', properties: { offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['offset'] },
+      rows: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+    }, required: [] } }])
+    assert.ok(named.includes('window: StoreArgsWindow'), `a parameter object is a named TypedDict, got: ${/window: .*/.exec(named)?.[0]}`)
+    assert.ok(named.includes('rows: list[StoreArgsRows]'), `and so is the item type of an array of them, got: ${/rows: .*/.exec(named)?.[0]}`)
+    assert.match(named, /^class StoreArgsWindow\(TypedDict\):$/m, 'the class it names is declared')
+    // `<Tool>Args` is dsh's calling convention, not this block's: parameters are spelled out here, so
+    // emitting the wrapper they were read out of would declare a class nothing references.
+    assert.doesNotMatch(named, /^class StoreArgs\(TypedDict\):$/m, 'but the wrapper it was read out of is not')
+    console.log('  ok   a parameter object is named, and the wrapper it came from is dropped')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a parameter object is named, and the wrapper it came from is dropped\n       ${error.message}`)
+  }
   // Only `mcp` is bound at the top level, so a server's tools are shown the way the call site spells
   // them — as comments. Rendered as bare `async def`s they claimed a top-level name they do not have
   // AND took it: a native `read` plus two servers exposing a raw `read` left the last stub shadowing
@@ -837,6 +859,34 @@ try {
   console.log(`  FAIL a triple quote or trailing backslash costs fidelity, never the block\n       ${error.message}`)
 }
 
+// CPython applies universal-newline translation to source, so a lone `\r` inside a description is a
+// real line break to the tokenizer even though nothing in JS treats it as one. In a trailing `# `
+// comment that break ends the comment and the rest of the description becomes live code — the same
+// failure class as the triple quote above, reached without a single character that looks dangerous.
+console.log('a carriage return in a description is not a line break the block honours:')
+try {
+  const cr = renderToolsSection([{ name: 'read', description: 'One.\rTwo.', parameters: { properties: {
+    file_path: { type: 'string', description: 'Path.\rinjected = 1' },
+  }, required: ['file_path'] } }])
+  const fence = cr.slice(cr.indexOf('```python') + 10, cr.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
+  assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
+  // Narrower than `str.splitlines()` on purpose. `\v`, `\f`, `\x85`, `\u2028` and `\u2029` all split a
+  // Python STRING, and PCRE's `\R` matches them too — but none of them ends a `#` comment as far as the
+  // tokenizer is concerned, checked by compiling `# comment<ch>x = 1` for each. Splitting on them would
+  // take a description apart at a character that never needed it, for no safety in return.
+  const wide = renderToolsSection([{ name: 'read', parameters: { properties: {
+    file_path: { type: 'string', description: 'Kept\u2028together\vhere' },
+  }, required: ['file_path'] } }])
+  const wideFence = wide.slice(wide.indexOf('```python') + 10, wide.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
+  assert.match(wideFence, /file_path: str,  # Kept\u2028together\vhere\n/, 'a terminator Python does not honour stays in the description')
+  console.log('  ok   a lone \\r cannot end the comment it sits in')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a lone \\r cannot end the comment it sits in\n       ${error.message}`)
+}
 console.log('mcp namespace:')
 {
   const seen = []

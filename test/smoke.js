@@ -850,6 +850,16 @@ try {
   execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
   assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
   assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
+  // Narrower than `str.splitlines()` on purpose. `\v`, `\f`, `\x85`, `\u2028` and `\u2029` all split a
+  // Python STRING, and PCRE's `\R` matches them too — but none of them ends a `#` comment as far as the
+  // tokenizer is concerned, checked by compiling `# comment<ch>x = 1` for each. Splitting on them would
+  // take a description apart at a character that never needed it, for no safety in return.
+  const wide = renderToolsSection([{ name: 'read', parameters: { properties: {
+    file_path: { type: 'string', description: 'Kept\u2028together\vhere' },
+  }, required: ['file_path'] } }])
+  const wideFence = wide.slice(wide.indexOf('```python') + 10, wide.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
+  assert.match(wideFence, /file_path: str,  # Kept\u2028together\vhere\n/, 'a terminator Python does not honour stays in the description')
   console.log('  ok   a lone \\r cannot end the comment it sits in')
 } catch (error) {
   failures += 1

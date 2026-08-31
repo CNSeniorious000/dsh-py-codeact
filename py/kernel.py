@@ -69,6 +69,9 @@ PROTOCOL_FD = 3
 # Wire default for the `shell` field. The JS host holds its own copy of this literal — the seam is the one place the two languages must agree by hand.
 DEFAULT_SHELL = "main"
 
+#: Answered, but the tool catalogue was NOT taken. Matched by the host, which must not memoise a rebind that never happened.
+UNBOUND = "kernel bindings failed: the tool catalogue was not taken"
+
 # Bound BEFORE any `redirect_stderr` can swap `sys.stderr`. IPython writes its traceback out itself; sending that copy here (the process's real stderr, which the host keeps only for crash diagnostics) keeps ANSI escapes and a duplicate traceback out of the cell's captured stderr. The model-facing copy is re-rendered without color by `Session.format_exc`.
 REAL_STDERR = sys.stderr
 
@@ -211,8 +214,12 @@ def _make_binding(bridge: Bridge, spec):
     """One tool as a real `async def`: dsh's description becomes its docstring and its parameters become a keyword-only signature, so `read?`, `help(read)`, and tab-completion all work inside the REPL. The annotations arrive pre-rendered from the host, which projects them with dsh's own `jsonSchemaToPy` — no second mapper to drift out of sync."""
     name = spec["name"]
 
+    # Read the parameter shape ONCE, here. Every consumer below walks the same list, and a malformed entry is a real input — `_make_binding` runs inside `build_bindings`' single comprehension, so one `.get` on a string costs the shell every tool in the batch, not one signature. `entries` keeps the malformed ones so they still reach `dropped`; everything that asks a question OF a parameter asks it of `readable`.
+    entries = spec.get("params") or []
+    readable = [p for p in entries if isinstance(p, dict)]
+
     # A parameter name travels to the tool as a JSON key, so a renamed one has to travel back: the block spells `file_path` and `from_`, the tool still expects `file-path` and `from`. A raw key passed straight through is left alone, which is what a cell written before the rename does.
-    renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
+    renames = {p["name"]: p["raw"] for p in readable if p.get("raw") and p.get("name")}
 
     async def call(**kwargs):
         return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs)
@@ -221,7 +228,7 @@ def _make_binding(bridge: Bridge, spec):
     call.__qualname__ = f"__dsh__.tools.{name}"
     call.__doc__ = spec.get("doc") or None
     # The same prose the block renders beside each parameter, repeated here so `read?` is not the poorer view: the block is read once a turn, while `?` is what a model reaches for to re-check ONE tool without scrolling back. Same source, so the two cannot drift.
-    documented = [p for p in spec.get("params") or [] if p.get("doc")]
+    documented = [p for p in readable if p.get("doc") and p.get("name")]
     if documented:
         # Continuation lines indented, or a description carrying its own newlines reads as the next parameter's.
         section = "Parameters:\n" + "\n".join(f"    {p['name']}: {p['doc'].replace(chr(10), chr(10) + '        ')}" for p in documented)
@@ -229,7 +236,7 @@ def _make_binding(bridge: Bridge, spec):
         # A rebind builds NEW callables, so a name already pulled out with `from __dsh__.tools import read` keeps the docstring it was imported with. `__dsh__.tools.read?` is the authoritative view after a schema revision. True of the signature and return annotation too, and deliberate: the shell's namespace is the model's, and a rebind that reached into it could swap a binding under a cell mid-await.
     # Per-parameter, not one suppress around the whole thing: a single exotic name (`class`, `file-path` — hyphens are routine for MCP tools) used to discard the ENTIRE signature, so `read?` showed `(**kwargs)` while the prompt showed the full parameter list, with no error either way. Anything unrenderable is folded into `**kwargs` so the picture stays honest.
     params, dropped = [], []
-    for p in spec.get("params") or []:
+    for p in entries:
         try:
             params.append(
                 inspect.Parameter(
@@ -239,7 +246,8 @@ def _make_binding(bridge: Bridge, spec):
                     default=inspect.Parameter.empty if p.get("required") else ...,
                 )
             )
-        except (ValueError, TypeError):
+        # The exceptions this try ACTUALLY raises, not the two it was written for: `p["name"]` raises KeyError on a param dict without one, and `inspect.Parameter("")` raises IndexError from CPython's own leading-dot probe. Either escaping here costs the shell EVERY tool in the batch, because `build_bindings` binds them in one comprehension.
+        except (ValueError, TypeError, KeyError, IndexError):
             dropped.append(p)
     if dropped:
         # The overflow parameter must not collide with a real one. A tool declaring its own `kwargs` made `inspect.Signature` raise, and the suppress below then discarded the WHOLE signature — return annotation and every renderable parameter with it — so `weird?` showed `(**kwargs)` while the prompt showed the full list: exactly the regression the comment above says was fixed.
@@ -248,9 +256,13 @@ def _make_binding(bridge: Bridge, spec):
             overflow = f"_{overflow}"
         params.append(inspect.Parameter(overflow, inspect.Parameter.VAR_KEYWORD))
         # Name what was folded, because the prompt block points HERE for it — it renders `# ... see <tool>?` and nothing else lists these. A required parameter appearing in neither place is one the model calls without and the host then rejects it for, with no way to find out why.
-        spelled = ", ".join(f"{p.get('name')!r}: {p.get('type') or 'Any'}{'' if p.get('required') else ' = ...'}" for p in dropped)
-        note = f"Pass via **{overflow} — these parameter names are not Python identifiers: {spelled}."
-        call.__doc__ = f"{call.__doc__}\n\n{note}" if call.__doc__ else note
+        # Only what can be described: a malformed entry lands in `dropped` too, and calling `.get` on a string or `None` here used to raise out of `_make_binding` and take the whole catalogue with it.
+        describable = [p for p in dropped if isinstance(p, dict) and p.get("name")]
+        if describable:
+            # "not identifiers" was false for the half of this set that are KEYWORDS — `from` and `class` are perfectly good identifiers Python simply will not take here. And the sentence used to end in a period straight after `...`, rendering an optional parameter as `= ....`
+            spelled = ", ".join(f"{p['name']!r}: {p.get('type') or 'Any'}{'' if p.get('required') else ' = ...'}" for p in describable)
+            note = f"Cannot be written as keyword arguments here; pass via **{overflow}: {spelled}"
+            call.__doc__ = f"{call.__doc__}\n\n{note}" if call.__doc__ else note
     with contextlib.suppress(ValueError, TypeError):
         # The return annotation matters as much as the parameters here: it is what `read?` can tell the model that no amount of re-reading the call site can. Same source as the prompt block, so the two never disagree.
         call.__signature__ = inspect.Signature(params, return_annotation=spec.get("returns") or "Any")  # type: ignore
@@ -803,6 +815,7 @@ class Kernel:
         return session
 
     async def _exec(self, exec_id, shell, code: str, specs=None) -> None:
+        session = None
         try:
             # Binding happens HERE, not in `_handle`: it is the last pre-exec step that can fail, and out there it failed outside this handler — `serve()` logged it and sent nothing, so the host waited forever on a shell that was demonstrably healthy. Every pre-exec failure is an unanswerable turn unless it is raised inside this try.
             session = self._session_for(shell, specs)
@@ -818,7 +831,8 @@ class Kernel:
                 "ok": False,
                 "stdout": "",
                 "stderr": "",
-                "error": f"KernelError: the kernel failed while running this cell.\n{traceback.format_exc()}",
+                # Answering is not enough when the CATALOGUE is what failed: the host memoises "these bindings landed" on any answer that is not `kernel busy`, so a bind failure reported as an ordinary cell error makes the next cell skip its rebind and run against a stale tool table — or none — while the prompt block re-renders the new one every turn. Same shape as busy, so it needs its own wording for the host to match.
+                "error": f"{UNBOUND if session is None else 'KernelError: the kernel failed while running this cell.'}\n{traceback.format_exc()}",
                 "repr": None,
                 "note": None,
             }

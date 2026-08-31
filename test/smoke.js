@@ -859,6 +859,23 @@ try {
   console.log(`  FAIL a triple quote or trailing backslash costs fidelity, never the block\n       ${error.message}`)
 }
 
+
+// This set is a COPY of Python's, and a copy goes stale: a release that adds a hard keyword would have
+// the block emit `def f(*, <kw>: str)` — a SyntaxError that takes every tool in the fence down, not just
+// the one that named it. So the guard is not a count written in a comment. The list comes from the
+// interpreter that is about to compile the block, which is the only version whose opinion matters here.
+console.log('the keyword set is the running interpreter\'s, not a number in a comment:')
+try {
+  const listed = JSON.parse(execFileSync('python3', ['-c', 'import json, keyword; print(json.dumps(keyword.kwlist + keyword.softkwlist))'], { encoding: 'utf8' }))
+  const properties = Object.fromEntries(listed.map((kw) => [kw, { type: 'string' }]))
+  const block = renderToolsSection([{ name: 'kw', parameters: { type: 'object', properties, required: [] }, output: { type: 'string' } }])
+  const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
+  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  console.log(`  ok   all ${listed.length} of this interpreter's keywords survive the block`)
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL all of this interpreter's keywords survive the block\n       ${error.message}`)
+}
 // CPython applies universal-newline translation to source, so a lone `\r` inside a description is a
 // real line break to the tokenizer even though nothing in JS treats it as one. In a trailing `# `
 // comment that break ends the comment and the rest of the description becomes live code — the same

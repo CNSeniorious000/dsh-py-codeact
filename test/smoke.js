@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, KERNEL_UNBOUND } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 
 const calls = []
@@ -385,6 +385,95 @@ try {
 } catch (error) {
   failures += 1
   console.log(`  FAIL the key moves for anything the kernel would render differently\n       ${error.message}`)
+}
+
+// Building the bindings ran in `_handle`, OUTSIDE the handler whose whole purpose is that an exec is
+// answered however it went wrong — so a spec that raised was logged by `serve()` and answered by
+// nobody, and the host waited forever on a shell that was demonstrably healthy. `init` was the worse
+// half: `start()` awaits `ready`, nothing else resolves it, and the FIRST `start()` carries the specs.
+console.log('a failure before the cell still answers:')
+{
+  // A spec with no `name`, which `build_bindings` reads directly in its comprehension — so it raises where
+  // nothing catches it. A malformed PARAMETER no longer qualifies: the loop's `except` now covers the
+  // exceptions it really raises, which is why this fixture had to move up a level to keep testing anything.
+  const malformed = [{ doc: 'r', params: [{ name: 'x', type: 'str', required: true }] }]
+  const within = (promise, ms = 8000) => Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve({ hung: true }), ms))])
+  const checkAnswer = async (label, verify) => {
+    try { await verify(); console.log(`  ok   ${label}`) }
+    catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
+  }
+
+  const late = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  await late.start([{ name: 'read', doc: 'r', params: [{ name: 'x', type: 'str', required: true }] }])
+  await checkAnswer('a spec that raises answers the exec rather than hanging it', async () => {
+    const answered = await within(late.exec('1 + 1', undefined, malformed))
+    assert.equal(answered.hung, undefined, 'the exec never settled — the host would wait forever')
+    assert.equal(answered.ok, false, 'and it has to say it failed')
+    // Its own wording, not the cell-failure one: the host memoises a delivered catalogue on any other answer, and would then skip the next rebind.
+    // The constant the HOST matches, imported rather than retyped: the two halves agreeing on this string is the whole mechanism. Reword one side and the host memoises a rebind that never happened, leaving the shell on a stale tool table while the block re-renders the new one every turn — silently, with `ok: true`.
+    assert.ok(answered.error.startsWith(KERNEL_UNBOUND), `the kernel must say what the host matches, got: ${answered.error.split('\n')[0]}`)
+  })
+  await checkAnswer('…on a shell that stays usable afterwards', async () => {
+    assert.equal((await within(late.exec('2 + 2', undefined, undefined))).repr, '4')
+  })
+  late.dispose()
+
+  const handshake = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  // `build_bindings` binds the whole catalogue in ONE comprehension, so anything escaping `_make_binding`
+  // costs the shell every tool in the batch rather than one signature. These are the inputs the loop's
+  // `except` was NOT written for; each used to abort the lot, and on the init path hang `start()` outright.
+  await checkAnswer('a parameter the loop cannot read costs its own slot, not the catalogue', async () => {
+    const rough = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+    await within(rough.start([{ name: 'read', doc: 'r', params: [
+      { type: 'str', required: true },   // no `name` at all -> KeyError
+      { name: '', type: 'str' },         // CPython's own leading-dot probe -> IndexError
+      'oops',                            // not a dict at all -> TypeError, then AttributeError in the note
+      { name: 'ok', type: 'str', required: true },
+    ] }]))
+    const shown = await within(rough.exec('import inspect; from __dsh__.tools import read; print(inspect.signature(read))', undefined, undefined))
+    assert.equal(shown.ok, true, shown.error)
+    assert.match(shown.stdout, /\(\*, ok: 'str', \*\*kwargs\)/, 'the readable parameter survives and the rest fold')
+    rough.dispose()
+  })
+  await checkAnswer('the same spec at init still completes the handshake', async () => {
+    assert.equal(await within(handshake.start(malformed).then(() => 'ready')), 'ready', 'start() never returned')
+    assert.equal((await within(handshake.exec('3 * 7', undefined, undefined))).repr, '21', 'a shell that binds nothing still runs cells')
+  })
+  handshake.dispose()
+}
+
+// `name?` is where the block SENDS the model for a parameter it could not spell — it renders
+// `# ... see <tool>?` and nothing else lists them. Both halves of that promise were broken.
+console.log('introspection keeps what the block cannot spell:')
+{
+  const odd = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  await odd.start([
+    { name: 'weird', doc: 'the docstring', returns: 'str', params: [{ name: 'kwargs', type: 'str', required: false }, { name: 'file-path', type: 'str', required: true }] },
+    { name: 'notion_patch', doc: 'patch', returns: 'Any', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] },
+  ])
+  const shown = async (name) => (await odd.exec(`import inspect; from __dsh__.tools import ${name}; print(inspect.signature(${name})); print(${name}.__doc__)`, undefined, undefined)).stdout
+  const checkShown = async (label, verify) => {
+    try { await verify(); console.log(`  ok   ${label}`) }
+    catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
+  }
+
+  // The overflow parameter is hardcoded `kwargs`, so a tool declaring its own collided, `inspect.Signature`
+  // raised, and the blanket suppress discarded the ENTIRE signature — return annotation and every
+  // renderable parameter — leaving `(**kwargs)` while the prompt printed the full list.
+  await checkShown('a tool with its own `kwargs` keeps its whole signature', async () => {
+    const text = await shown('weird')
+    assert.match(text, /\(\*, kwargs: 'str' = Ellipsis, \*\*_kwargs\) -> 'str'/, 'the real parameter and the return survive; the overflow steps aside')
+  })
+  // The `except` kept only a boolean, so name, type and required flag were thrown away and a REQUIRED
+  // parameter appeared in neither place. The model calls without it and the host rejects the call for
+  // an argument it was never shown.
+  await checkShown('a parameter it cannot spell is still named where the block points', async () => {
+    const text = await shown('notion_patch')
+    assert.match(text, /\(\*, limit: 'int' = Ellipsis, \*\*kwargs\) -> 'Any'/, 'the spellable ones render as before')
+    assert.match(text, /Cannot be written as keyword arguments here; pass via \*\*kwargs: 'file-path': str$/m, 'and the unspellable one is spelled out')
+    assert.match(text, /^patch\n/m, 'appended to the tool docstring, not replacing it')
+  })
+  odd.dispose()
 }
 
 // The prompt block is Python the model copies from. One tool it cannot render used to invalidate the WHOLE block, so no line in it could be used.
@@ -1167,7 +1256,8 @@ console.log('shells:')
   await checkShell('a same-named tool with a changed schema is rebound', async () => {
     const v2 = [{ name: 'read', doc: 'REVISED', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }]
     await shells.exec('1', undefined, v2, 'parent')
-    assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__', 'parent')).repr, `'REVISED'`)
+    // First line only: this spec carries a `file-path`, so the docstring also names what the signature could not spell.
+    assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__.splitlines()[0]', 'parent')).repr, `'REVISED'`)
     assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)', 'parent')).repr, `['kwargs', 'limit']`)
   })
 

@@ -733,12 +733,17 @@ console.log('prompt:')
     assert.match(rendered, /\n {4}file_path: str,\n/, 'a hyphen folds, as it does in a tool name')
     assert.match(rendered, /\n {4}from_: str = \.\.\.,\n/, 'a hard keyword takes the trailing underscore Python programmers already write')
     assert.match(rendered, /\n {4}type: str = \.\.\.,\n/, 'a SOFT keyword needs nothing — `def f(*, type: str)` compiles')
-    assert.match(rendered, /\n {4}\*\*kwargs: Any {2}# spell as dict keys: "a b"\n/, 'and only what is left over goes to `**kwargs`, named')
+    assert.match(rendered, /\n {4}\*\*kwargs: Any {2}# spell as dict keys: "a b": str = \.\.\.\n/, 'and only what is left over goes to `**kwargs`, named and marked')
+    // The half the fixture above cannot show: a folded parameter the tool cannot RUN without. Named
+    // but unmarked, it reads exactly like the optional one beside it, and the model finds out by
+    // being rejected — which is the failure the note was added to prevent, not one it should cause.
+    const needed = renderToolsSection([{ name: 'odd', parameters: { properties: { 'a b': { type: 'string' }, 'c d': { type: 'integer' } }, required: ['a b'] } }])
+    assert.match(needed, /# spell as dict keys: "a b": str, "c d": int = \.\.\.\n/, 'a required fold carries no default, an optional one does')
     // Only reachable once the overflow SHARES a signature with named parameters, which is new here: the old
     // fallback replaced them all, so nothing could collide with it. A duplicate argument is a `SyntaxError`
     // that takes the whole fenced block down, for every tool in it.
     const own = renderToolsSection([{ name: 'edit', parameters: { properties: { kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' } }, required: [] } }])
-    assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b"\n/, 'a tool that owns the overflow name makes it step aside')
+    assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b": str = \.\.\.\n/, 'a tool that owns the overflow name makes it step aside')
     console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1
@@ -782,7 +787,7 @@ console.log('a renamed parameter still dispatches under its raw key:')
     const both = toolSpecs([{ name: 'clash', parameters: { properties: { 'file-path': { type: 'string' }, file_path: { type: 'integer' } }, required: [] } }]).specs[0]
     assert.deepEqual(both.params.map((p) => [p.name, p.raw]), [['file-path', undefined], ['file_path', undefined]], 'neither is renamed, so neither can steal the other')
     const rendered = renderToolsSection([{ name: 'clash', parameters: { properties: { 'file-path': { type: 'string' }, file_path: { type: 'integer' } }, required: [] } }])
-    assert.match(rendered, /\n {4}file_path: int = \.\.\.,\n {4}\*\*kwargs: Any {2}# spell as dict keys: "file-path"\n/, 'the real one keeps its name; the hyphenated one stays a dict key')
+    assert.match(rendered, /\n {4}file_path: int = \.\.\.,\n {4}\*\*kwargs: Any {2}# spell as dict keys: "file-path": str = \.\.\.\n/, 'the real one keeps its name; the hyphenated one stays a dict key')
   })
 }
 

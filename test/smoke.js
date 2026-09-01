@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 
 const calls = []
@@ -41,6 +41,19 @@ const check = async (label, code, verify, specs, omitSpecs = false) => {
 }
 
 console.log('kernel:')
+
+try {
+  const reply = toolCallReply({
+    isError: true,
+    error: { message: 'authoritative failure', info: { name: 'HarnessError', code: 'E_CANONICAL' } },
+    content: [{ type: 'text', text: 'rewritten model-facing failure' }],
+  })
+  assert.deepEqual(reply, { ok: false, message: 'authoritative failure' })
+  console.log('  ok   a failed tool call uses the authoritative error message')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a failed tool call uses the authoritative error message\n       ${error.message}`)
+}
 
 await check('persists state across cells (bind)', 'counter = 40', (r) => {
   assert.equal(r.ok, true)

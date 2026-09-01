@@ -580,7 +580,10 @@ console.log('prompt:')
     }, required: ['mode'] } }
     assert.deepEqual(toolSpecs([accepted]).specs[0].params, toolSpecs([structuredClone(accepted)]).specs[0].params, 'stable')
     const kept = renderToolsSection([accepted])
-    for (const spelling of ['mode: Literal["a", "b"]', 'pick: int | None = ...', 'rows: list[dict[str, Any]] = ...', 'tag: Literal["x"] = ...']) {
+    // `rows` moved from `list[dict[str, Any]]` deliberately — naming a parameter object is what the
+    // render context was borrowed FOR, and this row is the degradation it exists to remove. The other
+    // three are the actual guard here: `narrowed` must not touch a type dsh already accepts.
+    for (const spelling of ['mode: Literal["a", "b"]', 'pick: int | None = ...', 'rows: list[KeepArgsRows] = ...', 'tag: Literal["x"] = ...']) {
       assert.ok(kept.includes(spelling), `an accepted schema still renders ${spelling}`)
     }
     console.log('  ok   narrowing only removes a reason to reject, never rewrites an accepted schema')
@@ -1230,7 +1233,11 @@ console.log('the rendered block is a program:')
       { type: 'object', properties: { kind: { type: 'string', const: 'foreground' }, stdout: nested }, required: ['kind', 'stdout'] },
     ] } },
     { name: 'job_list', parameters: { properties: {} }, output: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } } },
-    { name: 'read', parameters: { properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } },
+    // The object-typed parameter is here for the same reason the union output is: its annotation is a
+    // class the block has to DECLARE, and only running the fence says whether it did. That class comes
+    // from dsh's `<Tool>Args` wrapper, which is read for its members and then dropped — drop one line
+    // too many and the annotation is a `NameError` no text assertion would catch.
+    { name: 'read', parameters: { properties: { file_path: { type: 'string' }, window: { type: 'object', properties: { offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['offset'] } }, required: ['file_path'] }, output: { type: 'string' } },
     { name: 'odd', parameters: { properties: { 'file-path': { type: 'string' } }, required: ['file-path'] }, output: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } },
     { name: '123tool', parameters: { properties: {} }, output: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } },
     { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: { type: 'object', additionalProperties: false, required: ['content', 'structuredContent'], properties: { content: { type: 'array', items: {} }, structuredContent: { type: 'object', properties: { hits: { type: 'integer' } }, required: ['hits'] } } } },
@@ -1246,11 +1253,12 @@ console.log('the rendered block is a program:')
   // Its own shell: the fence redefines every tool it imports, so running it anywhere else would
   // leave the stubs behind for the next assertion to call.
   const fence = renderToolsSection(schemas).split('```python\n')[1].split('\n```')[0]
-  const ran = await runner.exec(`${fence}\n[bash.__annotations__["return"], read.__annotations__["return"], sorted(n for n in globals() if n in ("search", "by_self", "odd-name"))]`, undefined, specs)
+  const ran = await runner.exec(`${fence}\n[bash.__annotations__["return"], read.__annotations__["window"].__name__, sorted(n for n in globals() if n in ("search", "by_self", "odd-name"))]`, undefined, specs)
   try {
     assert.ok(ran.ok, `the block runs as written: ${ran.error?.message ?? ran.stderr}`)
     // Not just parseable — the annotations have to EVALUATE, which is where a missing import shows up.
     assert.match(ran.repr ?? '', /BashOutput1 \| .*BashOutput2/, 'and its union annotation is a real type, not a string')
+    assert.match(ran.repr ?? '', /ReadArgsWindow/, 'and a parameter object resolves to the class the block declared')
     // Executing the block must not bind a server's tools: only `mcp` is, and a bare definition
     // under a server header would shadow whatever native tool shares that raw name.
     assert.match(ran.repr ?? '', /\['by_self', 'search'\]/, 'and a server tool binds like any other definition, which is why this runs in its own shell')

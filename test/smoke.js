@@ -739,6 +739,20 @@ console.log('prompt:')
     // that takes the whole fenced block down, for every tool in it.
     const own = renderToolsSection([{ name: 'edit', parameters: { properties: { kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' } }, required: [] } }])
     assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b"\n/, 'a tool that owns the overflow name makes it step aside')
+    // Python's identifier rule is XID, not ASCII, and the kernel's own `inspect.Parameter('路径')`
+    // accepts it — so refusing it here made the block the poorer of the two readings, for exactly the
+    // catalogues most likely to carry such a name.
+    const unicode = renderToolsSection([{ name: 'odd', parameters: { properties: {
+      '路径': { type: 'string' }, 'Ω': { type: 'integer' }, 'ﬁ': { type: 'string' }, 'ｘ': { type: 'string' },
+    }, required: ['路径'] } }])
+    assert.match(unicode, /\n {4}路径: str,\n/, 'an NFKC-stable non-ASCII name is spelled')
+    assert.match(unicode, /\n {4}Ω: int = \.\.\.,\n/, 'and so is a Greek one')
+    // Both of these pass `str.isidentifier()`. Source is NFKC-normalised BEFORE it is tokenised, so
+    // `def f(*, ﬁ=1)` declares `fi` and `f(ｘ=1)` binds `x`: spelled, they would send a key the tool
+    // never declared, and the call would fail as if the tool were broken.
+    assert.match(unicode, /# spell as dict keys: .*ﬁ.*ｘ/, 'an NFKC-unstable one folds even though Python calls it an identifier')
+    const fence = unicode.slice(unicode.indexOf('```python') + 10, unicode.lastIndexOf('```'))
+    execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
     console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1

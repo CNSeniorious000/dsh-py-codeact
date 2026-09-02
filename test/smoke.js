@@ -850,13 +850,14 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     }, required: ['file_path'] } }])
     assert.match(block, /async def read\(\n {4}\*,\n {4}file_path: str,  # Path to read, resolved by the filesystem backend\.\n {4}offset: int = \.\.\.,  # Line to start at\. One-based\.\n\) -> Any:\n {4}"""\n {4}Read a file\.\n {4}Second line\.\n {4}"""/, 'both halves, in the shape a Python reader expects')
   })
-  await checkDoc('prompt groups in tool prose stay literal', async () => {
-    const block = renderToolsSection([{ name: 'workflow', description: 'Use {{variable}} placeholders.', parameters: { properties: {
-      plan: { type: 'string', description: 'Expand {{step}} at run time.' },
+  await checkDoc('all prompt-opening brace runs in tool prose stay literal', async () => {
+    const block = renderToolsSection([{ name: 'workflow', description: 'Keep {one}; split {{two}}, {{{three}}}, and {{{{four}}}}.', parameters: { properties: {
+      plan: { type: 'string', description: 'Expand {{{step}}} at run time.' },
     }, required: ['plan'] } }])
     const rendered = renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
-    assert.match(rendered, /Use \{ \{variable}} placeholders\./, 'a tool description must not become a prompt variable')
-    assert.match(rendered, /Expand \{ \{step}} at run time\./, 'a parameter description must not become a prompt variable')
+    assert.ok(rendered.includes('Keep {one}; split { {two}}, { { {three}}}, and { { { {four}}}}.'), 'tool-description runs must split every opener')
+    assert.ok(rendered.includes('Expand { { {step}}} at run time.'), 'parameter-description runs must split every opener')
+    assert.ok(!rendered.includes('{{'), 'no prompt-variable opener may remain')
   })
   docs.dispose()
 }

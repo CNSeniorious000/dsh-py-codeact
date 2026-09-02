@@ -3,6 +3,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
 import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
@@ -848,6 +849,14 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
       offset: { type: 'integer', description: 'Line to start at.\nOne-based.' },
     }, required: ['file_path'] } }])
     assert.match(block, /async def read\(\n {4}\*,\n {4}file_path: str,  # Path to read, resolved by the filesystem backend\.\n {4}offset: int = \.\.\.,  # Line to start at\. One-based\.\n\) -> Any:\n {4}"""\n {4}Read a file\.\n {4}Second line\.\n {4}"""/, 'both halves, in the shape a Python reader expects')
+  })
+  await checkDoc('prompt groups in tool prose stay literal', async () => {
+    const block = renderToolsSection([{ name: 'workflow', description: 'Use {{variable}} placeholders.', parameters: { properties: {
+      plan: { type: 'string', description: 'Expand {{step}} at run time.' },
+    }, required: ['plan'] } }])
+    const rendered = renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
+    assert.match(rendered, /Use \{ \{variable}} placeholders\./, 'a tool description must not become a prompt variable')
+    assert.match(rendered, /Expand \{ \{step}} at run time\./, 'a parameter description must not become a prompt variable')
   })
   docs.dispose()
 }

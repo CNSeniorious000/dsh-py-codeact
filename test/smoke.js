@@ -7,6 +7,7 @@ import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
 import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
+import './dispatch.js'
 
 const calls = []
 const kernel = new PythonKernel({

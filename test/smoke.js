@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply, HAND_WRITTEN_PROSE, apply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 import './dispatch.js'
 
@@ -863,6 +863,23 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
   docs.dispose()
 }
 
+// The escape above covers prose that arrives from a tool catalogue. The sections this plugin WRITES
+// reach `renderPrompt` verbatim, so the same `{{` costs the whole preset — `interpolate` throws during
+// assembly and no session on it starts. `apply` asserts them brace-free at mount; this puts each one
+// through the real renderer, which is the failure itself rather than a restatement of the check.
+console.log('the prose this plugin writes survives assembly:')
+for (const { label, text } of HAND_WRITTEN_PROSE) {
+  try {
+    // No variables, because these sections are not supposed to reference any: an unknown name throws
+    // here exactly as a malformed one does, which is the second half of what mount is protecting.
+    renderPrompt({ sections: [{ name: `py-codeact:${label}`, text }], contexts: [], tools: [], variables: {} })
+    console.log(`  ok   ${label}`)
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL ${label}\n       ${error.message}`)
+  }
+}
+
 // The block is Python the model copies from, and now it carries PROSE — so a description is no longer
 // only content, it is syntax. One carrying a `"""` or ending in a backslash would close its own
 // docstring and take every tool below it down, which is the failure class #12 was: one tool invalidating
@@ -1287,5 +1304,55 @@ console.log('the rendered block is a program:')
 }
 
 kernel.dispose()
+
+console.log('orchestration section conditional on delegation tool:')
+{
+  const makeCtx = (schemas) => {
+    const sections = []
+    const assembly = { scope: 'global' }
+    return {
+      on() {}, effect(fn) { fn() },
+      tools: { sdkSchemas: () => schemas, guard() {}, register() {} },
+      systemPrompt: { section(opts) { sections.push({ ...opts, _assembly: assembly }) } },
+      _sections: sections,
+    }
+  }
+  const bg = { type: 'object', properties: { kind: { const: 'background' }, id: { type: 'string' } }, required: ['kind', 'id'] }
+  const fg = { type: 'object', properties: { kind: { const: 'foreground' }, output: { type: 'array' } }, required: ['kind', 'output'] }
+  const cont = { type: 'object', properties: { kind: { const: 'continuable' }, id: { type: 'string' } }, required: ['kind', 'id'] }
+  const fullUnion = { name: 'delegate', parameters: { properties: {} }, output: { oneOf: [bg, fg, cont] } }
+  const twoOfThree = { name: 'delegate', parameters: { properties: {} }, output: { oneOf: [bg, fg] } }
+
+  try {
+    const withAll = makeCtx([fullUnion])
+    apply(withAll, { mode: 'code' })
+    const got = withAll._sections.find(s => {
+      const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
+      return text?.includes('Orchestrating')
+    })
+    assert.ok(got, 'three-branch delegation tool triggers orchestration section')
+    const text = typeof got.text === 'function' ? got.text(got._assembly) : got.text
+    assert.match(text, /asyncio\.gather/, 'and the section contains gather examples')
+    console.log('  ok   three-branch delegation tool triggers orchestration')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL three-branch delegation tool triggers orchestration\n       ${error.message}`)
+  }
+
+  try {
+    const without = makeCtx([twoOfThree])
+    apply(without, { mode: 'code' })
+    const none = without._sections.find(s => {
+      const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
+      return text?.includes('Orchestrating')
+    })
+    assert.ok(!none, 'two-branch schema does not trigger orchestration section')
+    console.log('  ok   two-branch schema does not trigger orchestration')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL two-branch schema does not trigger orchestration\n       ${error.message}`)
+  }
+}
+
 console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`)
 process.exit(failures === 0 ? 0 : 1)

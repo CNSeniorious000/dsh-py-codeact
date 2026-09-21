@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply, HAND_WRITTEN_PROSE } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
 import './dispatch.js'
 
@@ -861,6 +861,23 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     assert.ok(!rendered.includes('{{'), 'no prompt-variable opener may remain')
   })
   docs.dispose()
+}
+
+// The escape above covers prose that arrives from a tool catalogue. The sections this plugin WRITES
+// reach `renderPrompt` verbatim, so the same `{{` costs the whole preset — `interpolate` throws during
+// assembly and no session on it starts. `apply` asserts them brace-free at mount; this puts each one
+// through the real renderer, which is the failure itself rather than a restatement of the check.
+console.log('the prose this plugin writes survives assembly:')
+for (const { label, text } of HAND_WRITTEN_PROSE) {
+  try {
+    // No variables, because these sections are not supposed to reference any: an unknown name throws
+    // here exactly as a malformed one does, which is the second half of what mount is protecting.
+    renderPrompt({ sections: [{ name: `py-codeact:${label}`, text }], contexts: [], tools: [], variables: {} })
+    console.log(`  ok   ${label}`)
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL ${label}\n       ${error.message}`)
+  }
 }
 
 // The block is Python the model copies from, and now it carries PROSE — so a description is no longer

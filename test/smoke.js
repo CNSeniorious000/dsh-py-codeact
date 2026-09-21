@@ -408,7 +408,7 @@ console.log('prompt:')
   const pythonBlock = (text) => text.split('```python\n')[1]?.split('```')[0] ?? ''
   const parses = (code) => {
     try {
-      execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
+      execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
       return true
     } catch { return false }
   }
@@ -875,7 +875,7 @@ try {
     { name: 'after', description: 'Must still be here.', parameters: {} },
   ])
   const fence = hostile.slice(hostile.indexOf('```python') + 10, hostile.lastIndexOf('```'))
-  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
   assert.match(fence, /async def after\(\) -> Any:/, 'the tool after the hostile ones still renders')
   console.log('  ok   a triple quote or trailing backslash costs fidelity, never the block')
 } catch (error) {
@@ -890,11 +890,11 @@ try {
 // interpreter that is about to compile the block, which is the only version whose opinion matters here.
 console.log('the keyword set is the running interpreter\'s, not a number in a comment:')
 try {
-  const listed = JSON.parse(execFileSync('python3', ['-c', 'import json, keyword; print(json.dumps(keyword.kwlist + keyword.softkwlist))'], { encoding: 'utf8' }))
+  const listed = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import json, keyword; print(json.dumps(keyword.kwlist + keyword.softkwlist))'], { encoding: 'utf8' }))
   const properties = Object.fromEntries(listed.map((kw) => [kw, { type: 'string' }]))
   const block = renderToolsSection([{ name: 'kw', parameters: { type: 'object', properties, required: [] }, output: { type: 'string' } }])
   const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
-  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
   console.log(`  ok   all ${listed.length} of this interpreter's keywords survive the block`)
 } catch (error) {
   failures += 1
@@ -910,7 +910,7 @@ try {
     file_path: { type: 'string', description: 'Path.\rinjected = 1' },
   }, required: ['file_path'] } }])
   const fence = cr.slice(cr.indexOf('```python') + 10, cr.lastIndexOf('```'))
-  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
   assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
   assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
   // Narrower than `str.splitlines()` on purpose. `\v`, `\f`, `\x85`, `\u2028` and `\u2029` all split a
@@ -921,7 +921,7 @@ try {
     file_path: { type: 'string', description: 'Kept\u2028together\vhere' },
   }, required: ['file_path'] } }])
   const wideFence = wide.slice(wide.indexOf('```python') + 10, wide.lastIndexOf('```'))
-  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
   assert.match(wideFence, /file_path: str,  # Kept\u2028together\vhere\n/, 'a terminator Python does not honour stays in the description')
   console.log('  ok   a lone \\r cannot end the comment it sits in')
 } catch (error) {

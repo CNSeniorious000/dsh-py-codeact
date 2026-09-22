@@ -49,7 +49,6 @@ import inspect
 import io
 import json
 import keyword
-import select
 import sys
 import traceback
 import types
@@ -186,6 +185,7 @@ class Bridge:
         self._send = send
         self._pending: dict = {}
         self._next = 0
+        self._sends: set = set()  # hold fire-and-forget send tasks so the GC cannot drop a `call` frame mid-flight
 
     def call(self, name: str, args):
         self._next += 1
@@ -196,12 +196,18 @@ class Bridge:
         future.add_done_callback(lambda _, cid=call_id: self._pending.pop(cid, None))
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
-        try:
-            self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
-        except Exception as exc:  # noqa: BLE001 - _send is host-provided; any failure must not leak the future
-            # `_send` can raise (e.g. json.dumps hitting a raising __str__); pop the future we just registered so it can't leak, and fail the call instead of hanging the awaiter forever.
-            self._pending.pop(call_id, None)
-            future.set_exception(exc)
+
+        # `_send` is async (it yields to the loop while the fd-3 buffer drains), but `call` stays sync so the binding can `return await bridge.call(...)` and hand the cell the Future itself to await — `await` on a coroutine that returned a Future would hand the cell a pending Future instead of its resolved value. A `call` frame is tiny, so fire it as a task: it runs immediately and only yields if the buffer is full, never blocking the caller. If `_send` itself raises (e.g. json.dumps hitting a raising __str__), fail the call instead of hanging the awaiter — the future's done callback then pops `_pending`.
+        async def _send_call():
+            try:
+                await self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+            except Exception as exc:  # noqa: BLE001 - _send is host-provided; any failure must not leak the future
+                if not future.done():
+                    future.set_exception(exc)
+
+        send = asyncio.create_task(_send_call())
+        send.add_done_callback(self._sends.discard)
+        self._sends.add(send)
         return future
 
     def settle(self, call_id, ok, value, tool, message) -> None:
@@ -835,7 +841,7 @@ class Kernel:
         self._sessions: dict = {}
         self._tasks: dict = {}
 
-    def _send(self, frame: dict) -> None:
+    async def _send(self, frame: dict) -> None:
         # fd 3 is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
         # `errors="replace"` is load-bearing, not tidiness: a lone surrogate — routine from `surrogateescape` decoding, or any `Path` on a non-UTF-8 filename — passes `json.dumps` and then raises `UnicodeEncodeError` here. This send is what answers an exec, so a raise means no `done` frame ever arrives and the turn hangs forever. A U+FFFD in one string beats a wedged session.
         payload = memoryview((json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8", errors="replace"))
@@ -844,8 +850,10 @@ class Kernel:
                 written = self._out.write(payload)
             except BlockingIOError:
                 written = None
-            if written is None:  # the buffer is full; wait for the host to drain it
-                select.select([], [PROTOCOL_FD], [])
+            if (
+                written is None
+            ):  # the buffer is full; yield to the event loop so the host can drain it (and other tasks — interrupts, results — can progress) instead of blocking select with no timeout
+                await asyncio.sleep(0)
                 continue
             payload = payload[written:]
 
@@ -877,16 +885,16 @@ class Kernel:
                 "repr": None,
                 "note": None,
             }
-        self._send(frame)
+        await self._send(frame)
 
-    def _handle(self, frame: dict) -> None:
+    async def _handle(self, frame: dict) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
         if kind == "exec":
             running = self._tasks.get(shell)
             if running is not None and not running.done():
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
-                self._send(
+                await self._send(
                     {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "kernel busy: a previous cell is still running", "repr": None, "note": None}
                 )
                 return
@@ -907,7 +915,7 @@ class Kernel:
                 running = self._tasks.get(shell)
                 if running is None or running.done():
                     self._session_for(shell, specs)
-            self._send(
+            await self._send(
                 {
                     "t": "ready",
                     "shell": shell,
@@ -951,7 +959,7 @@ class Kernel:
             if frame.get("t") == "shutdown":
                 return
             try:
-                self._handle(frame)
+                await self._handle(frame)
             except Exception:  # noqa: BLE001 — one malformed frame must not take the interpreter down
                 # `_handle` runs directly in this loop: an exception here unwinds out of `asyncio.run` and takes the interpreter — and the whole session's state — with it. One malformed frame is not worth that; a `result` whose `id` is unhashable used to do exactly it.
                 print(f"[dsh-py-codeact] dropped a frame that raised: {traceback.format_exc()}", file=REAL_STDERR)

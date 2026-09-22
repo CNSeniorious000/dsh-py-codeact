@@ -192,9 +192,16 @@ class Bridge:
         call_id = self._next
         future = asyncio.get_running_loop().create_future()
         self._pending[call_id] = future
+        # A done callback is the safety net: if the host never replies, or `_send` raised and we fail the future ourselves, or a `wait_for` timeout cancels it, the entry still leaves `_pending` — no leak.
+        future.add_done_callback(lambda _, cid=call_id: self._pending.pop(cid, None))
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
-        self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+        try:
+            self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+        except Exception as exc:  # noqa: BLE001 - _send is host-provided; any failure must not leak the future
+            # `_send` can raise (e.g. json.dumps hitting a raising __str__); pop the future we just registered so it can't leak, and fail the call instead of hanging the awaiter forever.
+            self._pending.pop(call_id, None)
+            future.set_exception(exc)
         return future
 
     def settle(self, call_id, ok, value, tool, message) -> None:
@@ -215,7 +222,8 @@ def _make_binding(bridge: Bridge, spec):
     renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
 
     async def call(**kwargs):
-        return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs)
+        # A per-call timeout is the orphan-future safety net: if the host never sends a result for this `call_id`, the await raises `TimeoutError` instead of hanging forever, and the done callback registered in `Bridge.call` drops the entry from `_pending`. 300s is generous — tool calls can be slow — but finite.
+        return await asyncio.wait_for(bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs), 300)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
@@ -611,7 +619,7 @@ class Capped(io.TextIOBase):
     """Byte-capped StringIO stand-in for one cell's stdout or stderr."""
 
     def __init__(self, limit: int) -> None:
-        self.parts: list = []
+        self.parts: list[bytes] = []
         self.size = 0
         self.limit = limit
         self.truncated = False
@@ -623,11 +631,11 @@ class Capped(io.TextIOBase):
                 room = self.limit - self.size
                 if room > 0:
                     # "ignore", not "replace": slicing encoded bytes at the cap can land mid-character, and "replace" would hand the model a U+FFFD. Dropping the partial character is honest.
-                    self.parts.append(chunk[:room].decode("utf-8", "ignore"))
+                    self.parts.append(chunk[:room])
                     self.size += room
                 self.truncated = True
             else:
-                self.parts.append(s)
+                self.parts.append(chunk)
                 self.size += len(chunk)
         return len(s)
 
@@ -635,7 +643,7 @@ class Capped(io.TextIOBase):
         return True
 
     def text(self) -> str:
-        body = "".join(self.parts)
+        body = b"".join(self.parts).decode("utf-8", "ignore")
         return f"{body}\n[dsh-py-codeact] output truncated at {self.limit} bytes" if self.truncated else body
 
 

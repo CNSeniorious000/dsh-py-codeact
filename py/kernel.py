@@ -263,7 +263,9 @@ class ToolsModule(types.ModuleType):
     def __init__(self) -> None:
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
         self.__path__ = []  # a package, so `__dsh__.tools.mcp` resolves under it
-        self.ToolCallError = ToolCallError
+        # Bypasses the `__setattr__` guard below — `ToolCallError` is a harness-provided exception
+        # type the model is told to catch, not a tool binding, and `__init__` runs before any cell.
+        super().__setattr__("ToolCallError", ToolCallError)
 
     def __getattr__(self, name):  # only reached when the attribute is absent
         if name.startswith("__"):
@@ -275,6 +277,14 @@ class ToolsModule(types.ModuleType):
         # the trajectory at the one moment the model is guaranteed to be reading it.
         available = ", ".join(sorted(listed_tools())) or "(none)"
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
+
+    def __setattr__(self, name, value):
+        # One ToolsModule per process, shared by every agent — a write here would shadow that name
+        # for all of them, permanently and invisibly to `dir()`, which keeps reporting the tool it
+        # no longer reaches. The old per-call `Namespace` made this a local mistake.
+        if not (name.startswith("__") and name.endswith("__")):
+            raise AttributeError("__dsh__.tools belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+        super().__setattr__(name, value)
 
     def __dir__(self):
         return sorted(listed_tools())

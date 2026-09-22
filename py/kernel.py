@@ -228,8 +228,8 @@ def _make_binding(bridge: Bridge, spec):
     renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
 
     async def call(**kwargs):
-        # A per-call timeout is the orphan-future safety net: if the host never sends a result for this `call_id`, the await raises `TimeoutError` instead of hanging forever, and the done callback registered in `Bridge.call` drops the entry from `_pending`. 300s is generous — tool calls can be slow — but finite.
-        return await asyncio.wait_for(bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs), 300)
+        # A per-call timeout is the orphan-future safety net: if the host never sends a result for this `call_id`, the await raises `TimeoutError` instead of hanging forever, and the done callback registered in `Bridge.call` drops the entry from `_pending`. It must sit ABOVE the 600s delegation budget the prompt teaches (`ask(desc, prompt, timeout=600)`), or the kernel kills a legitimate in-flight subagent while the host is still running it — the side effects land, the late result is dropped, and the model retries and duplicates them.
+        return await asyncio.wait_for(bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs), 660)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
@@ -757,7 +757,6 @@ class Session:
         """
         if specs == self._last_specs:
             return
-        self._last_specs = specs
         self.bindings, servers = build_bindings(bridge, specs)
         install_mcp_modules(servers)
         # `mcp_members` reads a servable-filtered tree: a true-dunder raw name (e.g. `__odd__`) is
@@ -765,6 +764,8 @@ class Session:
         # server it sits under is absent from `dir(mcp)`. `install_mcp_modules` takes the unfiltered
         # tree so the server module is still registered for the deep import form.
         self.mcp_tree = mcp_servers({name: call for name, call in self.bindings.items() if servable(name) is not None})
+        # Recorded only once the build above has succeeded: a memo written before a raising spec would make a retry with the same specs early-return and silently serve the stale catalogue.
+        self._last_specs = specs
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""
@@ -835,22 +836,34 @@ class Kernel:
         # fd 3 is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
         # `errors="replace"` is load-bearing, not tidiness: a lone surrogate — routine from `surrogateescape` decoding, or any `Path` on a non-UTF-8 filename — passes `json.dumps` and then raises `UnicodeEncodeError` here. This send is what answers an exec, so a raise means no `done` frame ever arrives and the turn hangs forever. A U+FFFD in one string beats a wedged session.
         payload = memoryview((json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8", errors="replace"))
+        loop = asyncio.get_running_loop()
         async with self._send_lock:
+            cancelled = False
             while payload:
                 try:
                     written = self._out.write(payload)
                 except BlockingIOError:
                     written = None
                 if written is None:  # the buffer is full; wait for the host to drain it — a bare `sleep(0)` would hot-spin a core until it does
-                    loop = asyncio.get_running_loop()
                     drained = loop.create_future()
-                    loop.add_writer(PROTOCOL_FD, drained.set_result, None)
+                    loop.add_writer(PROTOCOL_FD, self._writable, drained)
                     try:
-                        await drained
+                        await asyncio.shield(drained)
+                    except asyncio.CancelledError:
+                        # A cancel must not abandon a half-written frame: the next send splices onto the stump, the host drops both lines, and the aborted exec's `done` never arrives — the 5s `hardInterruptMs` backstop then SIGKILLs the whole kernel. Finish this frame first, then let the cancel through; the host answers a `done` once, so the replacement frame `_exec` sends next is ignored, not fatal.
+                        cancelled = True
                     finally:
-                        loop.remove_writer(PROTOCOL_FD)
+                        loop.remove_writer(PROTOCOL_FD)  # a no-op when the callback already removed it; cancels a queued-but-unrun one
                     continue
                 payload = payload[written:]
+            if cancelled:
+                raise asyncio.CancelledError
+
+    @staticmethod
+    def _writable(drained) -> None:
+        # Remove INSIDE the callback: a level-triggered selector re-fires a still-registered writer on every poll, and the future's done callbacks are `call_soon`-scheduled — the sender's `finally` above runs two loop batches later, by which time a re-fire would `set_result` on the already-done future.
+        asyncio.get_running_loop().remove_writer(PROTOCOL_FD)
+        drained.set_result(None)
 
     def _busy(self, shell) -> bool:
         running = self._tasks.get(shell)

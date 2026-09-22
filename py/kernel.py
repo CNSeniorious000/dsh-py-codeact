@@ -847,7 +847,12 @@ class Kernel:
             if running is not None and not running.done():
                 running.cancel()
         elif kind == "init":
-            self._session_for(shell, frame.get("tools") or [])
+            # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.
+            specs = frame.get("tools")
+            if isinstance(specs, list):
+                running = self._tasks.get(shell)
+                if running is None or running.done():
+                    self._session_for(shell, specs)
             self._send(
                 {
                     "t": "ready",

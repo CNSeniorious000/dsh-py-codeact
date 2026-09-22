@@ -832,6 +832,7 @@ class Kernel:
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
+            # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
             running = self._tasks.get(shell)
             if running is not None and not running.done():
                 running.cancel()
@@ -851,8 +852,10 @@ class Kernel:
                 }
             )
         elif kind == "dispose":
-            # The agent is gone; drop its shell so its globals can be collected.
-            self._tasks.pop(shell, None)
+            # The agent is gone; cancel any in-flight cell, then drop its shell so its globals can be collected.
+            running = self._tasks.pop(shell, None)
+            if running is not None and not running.done():
+                running.cancel()
             self._sessions.pop(shell, None)
 
     async def serve(self) -> None:
@@ -864,7 +867,10 @@ class Kernel:
             os.fdopen(PROTOCOL_FD, "rb", buffering=0),
         )
         while True:
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except ValueError:
+                continue  # a line over the 16 MiB limit overflows the buffer; it is already drained, so skipping is safe
             if not line:
                 return  # host closed fd 3
             try:

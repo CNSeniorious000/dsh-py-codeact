@@ -418,8 +418,11 @@ def alias(members: dict) -> None:
     `setdefault`, so a name that already exists keeps its own value: a server exposing `a-b` beside
     `a_b` gets no alias for `a-b`, and both stay reachable under their own spellings.
     """
-    for raw in [name for name in members if spellable(name) is not None]:
-        members.setdefault(spellable(raw), members[raw])
+    # One pass: `spellable` is deterministic, so computing `{raw: fold}` once and reusing the fold
+    # beats calling it twice per foldable name (once to filter, once to fold).
+    folds = {raw: fold for raw in members if (fold := spellable(raw)) is not None}
+    for raw, fold in folds.items():
+        members.setdefault(fold, members[raw])
 
 
 def canonical(server: str, servers: dict) -> str:
@@ -456,8 +459,12 @@ def mcp_members(module_name: str) -> dict:
 
     Deliberately not a method: a non-dunder attribute on the class would shadow a tool or a server
     of that name, and a raw MCP name is the server's to choose — `_private` is a legal one.
+
+    Reads the `mcp_servers` tree cached on the Session by `rebind`, so an attribute access does not
+    rebuild the whole tree (O(n)) when nothing has changed.
     """
-    servers = mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
+    session = _current_session.get()
+    servers = session.mcp_tree if session is not None else mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
     if module_name == MCP_MODULE:
         # Keyed by the FOLDED name so a hyphenated server and its fold resolve to one module object,
         # not two: `listed` tells an alias from a real neighbour by identity, and two objects would
@@ -537,7 +544,7 @@ def mcp_server_module(server: str) -> McpModule:
     return module
 
 
-def install_mcp_modules(bindings: dict) -> None:
+def install_mcp_modules(servers: dict[str, dict]) -> None:
     """Register a module per visible MCP server.
 
     Eager, because the deep import form never reaches `mcp_members`: `from __dsh__.tools.mcp.x
@@ -547,19 +554,37 @@ def install_mcp_modules(bindings: dict) -> None:
     `sys.modules` only ever gains entries: a server another shell can see costs this one an unused
     module, while removing it would break an import that shell is mid-conversation with. What a
     shell can actually reach is decided by `mcp_members`, not by what is registered.
+
+    Takes the grouped tree from `build_bindings` so `rebind` does not rebuild it a second time.
     """
-    for server in mcp_servers(bindings):
+    for server in servers:
         mcp_server_module(server)
 
 
-def build_bindings(bridge: Bridge, specs) -> dict:
-    """Project one agent's visible tools into awaitables for its shell."""
+def build_bindings(bridge: Bridge, specs) -> tuple[dict, dict[str, dict]]:
+    """Project one agent's visible tools into awaitables for its shell.
+
+    Returns `(bindings, mcp_servers)` so `rebind` can hand the grouped tree to
+    `install_mcp_modules` and cache it for `mcp_members` without rebuilding it.
+    """
     # A tool named `ToolCallError` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
     # `mcp` joins them, and unconditionally: it used to be bound and then overwritten by the namespace, so the tool was uncallable anyway — but only when an MCP server happened to be mounted. A name that means the namespace in one catalogue and a tool in the next is worse than one that always means the same thing.
     reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
     flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
     # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
-    return {**flat, "mcp": MCP_ROOT} if mcp_servers(flat) else flat
+    servers = mcp_servers(flat)
+    bindings = {**flat, "mcp": MCP_ROOT} if servers else flat
+    return bindings, servers
+
+
+def _specs_hash(specs) -> int:
+    """Content hash of the tool specs, so `rebind` can skip byte-identical catalogues.
+
+    `sort_keys=True` so two specs lists that differ only in order hash the same — the order the host
+    serialises them in is not load-bearing for the bindings. `None` (no specs sent) hashes as 0,
+    distinct from any real specs, so a catalogue followed by an empty frame still rebinds.
+    """
+    return hash(json.dumps(specs, sort_keys=True, default=str)) if specs else 0
 
 
 def install_bridge_modules() -> ToolsModule:
@@ -669,6 +694,13 @@ class Session:
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
         self.shell = InteractiveShell(user_ns=namespace, config=history)
+        # Content hash of the specs last bound, so byte-identical catalogues (the common case — a
+        # restriction that did not change anything, or the same tools re-sent) skip `rebind` and its
+        # per-tool callable + signature rebuild. `None` means "nothing bound yet".
+        self._specs_hash: int | None = None
+        # The grouped `mcp_servers` tree from the last `rebind`, cached so `mcp_members` reads it
+        # (O(1) lookup) instead of rebuilding it on every attribute access.
+        self.mcp_tree: dict[str, dict] = {}
         self.rebind(bridge, specs)
         self.sinks: list = [None, None]  # the Capped buffers of the cell in flight
         install_bridge_modules()
@@ -722,9 +754,23 @@ class Session:
         The one place the `sys.modules` registration lives, so `build_bindings` stays the pure
         projection its name promises and no caller can produce bindings the import machinery
         cannot follow.
+
+        Skipped when the specs are byte-identical to the last bound set: `build_bindings` rebuilds
+        every tool callable + `inspect.Signature` per exec, and the common case is a catalogue that
+        never changed between cells. A content hash detects that; object identity would miss specs
+        re-serialised by the host.
         """
-        self.bindings = build_bindings(bridge, specs)
-        install_mcp_modules(self.bindings)
+        current = _specs_hash(specs)
+        if current == self._specs_hash:
+            return
+        self._specs_hash = current
+        self.bindings, servers = build_bindings(bridge, specs)
+        install_mcp_modules(servers)
+        # `mcp_members` reads a servable-filtered tree: a true-dunder raw name (e.g. `__odd__`) is
+        # reachable via the flat name and the deep import, never via `mcp.<server>.<tool>`, so the
+        # server it sits under is absent from `dir(mcp)`. `install_mcp_modules` takes the unfiltered
+        # tree so the server module is still registered for the deep import form.
+        self.mcp_tree = mcp_servers({name: call for name, call in self.bindings.items() if servable(name) is not None})
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""

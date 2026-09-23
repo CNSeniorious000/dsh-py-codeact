@@ -49,7 +49,6 @@ import inspect
 import io
 import json
 import keyword
-import select
 import sys
 import traceback
 import types
@@ -186,6 +185,7 @@ class Bridge:
         self._send = send
         self._pending: dict = {}
         self._next = 0
+        self._sends: set = set()  # hold fire-and-forget send tasks so the GC cannot drop a `call` frame mid-flight
 
     def call(self, name: str, args):
         self._next += 1
@@ -194,7 +194,21 @@ class Bridge:
         self._pending[call_id] = future
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
-        self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+
+        # `_send` is async (it yields to the loop while the fd-3 buffer drains), but `call` stays sync so the binding can `return await bridge.call(...)` and hand the cell the Future itself to await — `await` on a coroutine that returned a Future would hand the cell a pending Future instead of its resolved value. A `call` frame is tiny, so fire it as a task: it runs immediately and only yields if the buffer is full, never blocking the caller. If `_send` itself raises (e.g. json.dumps hitting a raising __str__), fail the call instead of hanging the awaiter — the future's done callback then pops `_pending`.
+        async def _send_call():
+            try:
+                await self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+            except Exception as exc:  # noqa: BLE001 - _send is host-provided; any failure must not leak the future
+                if not future.done():
+                    future.set_exception(exc)
+
+        send = asyncio.create_task(_send_call())
+        send.add_done_callback(self._sends.discard)
+        self._sends.add(send)
+
+        # One done callback for both jobs. Popping `_pending` is the leak safety net: if the host never replies, or `_send` raised and we failed the future ourselves, or a `wait_for` timeout cancelled it, the entry still leaves. Cancelling `send` is the side-effect one: a cancelled or timed-out call whose frame has not gone out yet must not reach the host at all, or the tool runs and its side effects land after the cell already reported the call as cancelled. A frame mid-write is past that point — `_send` holds the lock and shields the drain wait, so it finishes the line rather than splicing the next frame onto a stump.
+        future.add_done_callback(lambda _: (self._pending.pop(call_id, None), send.cancel()))
         return future
 
     def settle(self, call_id, ok, value, tool, message) -> None:
@@ -215,7 +229,8 @@ def _make_binding(bridge: Bridge, spec):
     renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
 
     async def call(**kwargs):
-        return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs)
+        # A per-call timeout is the orphan-future safety net: if the host never sends a result for this `call_id`, the await raises `TimeoutError` instead of hanging forever, and the done callback registered in `Bridge.call` drops the entry from `_pending`. It must sit ABOVE the 600s delegation budget the prompt teaches (`ask(desc, prompt, timeout=600)`), or the kernel kills a legitimate in-flight subagent while the host is still running it — the side effects land, the late result is dropped, and the model retries and duplicates them.
+        return await asyncio.wait_for(bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs), 660)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
@@ -260,10 +275,12 @@ class ToolsModule(types.ModuleType):
 
     `sys.modules` is process-global, so there is exactly ONE of these no matter how many shells are live — yet each agent sees a different catalogue (a subagent's `toolFilter` narrows it, and restrictions move tools in and out between cells). So the bindings live on the Session and every lookup routes through the ContextVar; putting them in `__dict__` would hand every shell the last writer's catalogue."""
 
+    # A class attribute, not an instance one: normal lookup finds it before `__getattr__` ever runs, and the `__setattr__` guard below cannot touch the class body. `ToolCallError` is a harness-provided exception type the model is told to catch, not a tool binding.
+    ToolCallError = ToolCallError
+
     def __init__(self) -> None:
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
         self.__path__ = []  # a package, so `__dsh__.tools.mcp` resolves under it
-        self.ToolCallError = ToolCallError
 
     def __getattr__(self, name):  # only reached when the attribute is absent
         if name.startswith("__"):
@@ -275,6 +292,14 @@ class ToolsModule(types.ModuleType):
         # the trajectory at the one moment the model is guaranteed to be reading it.
         available = ", ".join(sorted(listed_tools())) or "(none)"
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
+
+    def __setattr__(self, name, value):
+        # One ToolsModule per process, shared by every agent — a write here would shadow that name
+        # for all of them, permanently and invisibly to `dir()`, which keeps reporting the tool it
+        # no longer reaches. The old per-call `Namespace` made this a local mistake.
+        if not (name.startswith("__") and name.endswith("__")):
+            raise AttributeError("__dsh__.tools belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+        super().__setattr__(name, value)
 
     def __dir__(self):
         return sorted(listed_tools())
@@ -400,8 +425,9 @@ def alias(members: dict) -> None:
     `setdefault`, so a name that already exists keeps its own value: a server exposing `a-b` beside
     `a_b` gets no alias for `a-b`, and both stay reachable under their own spellings.
     """
-    for raw in [name for name in members if spellable(name) is not None]:
-        members.setdefault(spellable(raw), members[raw])
+    for raw in list(members):  # a snapshot: `setdefault` below adds the folds mid-loop
+        if (fold := spellable(raw)) is not None:
+            members.setdefault(fold, members[raw])
 
 
 def canonical(server: str, servers: dict) -> str:
@@ -438,8 +464,12 @@ def mcp_members(module_name: str) -> dict:
 
     Deliberately not a method: a non-dunder attribute on the class would shadow a tool or a server
     of that name, and a raw MCP name is the server's to choose — `_private` is a legal one.
+
+    Reads the `mcp_servers` tree cached on the Session by `rebind`, so an attribute access does not
+    rebuild the whole tree (O(n)) when nothing has changed.
     """
-    servers = mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
+    session = _current_session.get()
+    servers = session.mcp_tree if session is not None else {}  # no session → no bound tools → no tree
     if module_name == MCP_MODULE:
         # Keyed by the FOLDED name so a hyphenated server and its fold resolve to one module object,
         # not two: `listed` tells an alias from a real neighbour by identity, and two objects would
@@ -519,7 +549,7 @@ def mcp_server_module(server: str) -> McpModule:
     return module
 
 
-def install_mcp_modules(bindings: dict) -> None:
+def install_mcp_modules(servers: dict[str, dict]) -> None:
     """Register a module per visible MCP server.
 
     Eager, because the deep import form never reaches `mcp_members`: `from __dsh__.tools.mcp.x
@@ -529,19 +559,27 @@ def install_mcp_modules(bindings: dict) -> None:
     `sys.modules` only ever gains entries: a server another shell can see costs this one an unused
     module, while removing it would break an import that shell is mid-conversation with. What a
     shell can actually reach is decided by `mcp_members`, not by what is registered.
+
+    Takes the grouped tree from `build_bindings` so `rebind` does not rebuild it a second time.
     """
-    for server in mcp_servers(bindings):
+    for server in servers:
         mcp_server_module(server)
 
 
-def build_bindings(bridge: Bridge, specs) -> dict:
-    """Project one agent's visible tools into awaitables for its shell."""
+def build_bindings(bridge: Bridge, specs) -> tuple[dict, dict[str, dict]]:
+    """Project one agent's visible tools into awaitables for its shell.
+
+    Returns `(bindings, mcp_servers)` so `rebind` can hand the grouped tree to
+    `install_mcp_modules` and cache it for `mcp_members` without rebuilding it.
+    """
     # A tool named `ToolCallError` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
     # `mcp` joins them, and unconditionally: it used to be bound and then overwritten by the namespace, so the tool was uncallable anyway — but only when an MCP server happened to be mounted. A name that means the namespace in one catalogue and a tool in the next is worse than one that always means the same thing.
-    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
+    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"mcp"}
     flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
     # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
-    return {**flat, "mcp": MCP_ROOT} if mcp_servers(flat) else flat
+    servers = mcp_servers(flat)
+    bindings = {**flat, "mcp": MCP_ROOT} if servers else flat
+    return bindings, servers
 
 
 def install_bridge_modules() -> ToolsModule:
@@ -611,7 +649,7 @@ class Capped(io.TextIOBase):
     """Byte-capped StringIO stand-in for one cell's stdout or stderr."""
 
     def __init__(self, limit: int) -> None:
-        self.parts: list = []
+        self.parts: list[bytes] = []
         self.size = 0
         self.limit = limit
         self.truncated = False
@@ -623,11 +661,11 @@ class Capped(io.TextIOBase):
                 room = self.limit - self.size
                 if room > 0:
                     # "ignore", not "replace": slicing encoded bytes at the cap can land mid-character, and "replace" would hand the model a U+FFFD. Dropping the partial character is honest.
-                    self.parts.append(chunk[:room].decode("utf-8", "ignore"))
+                    self.parts.append(chunk[:room])
                     self.size += room
                 self.truncated = True
             else:
-                self.parts.append(s)
+                self.parts.append(chunk)
                 self.size += len(chunk)
         return len(s)
 
@@ -635,7 +673,7 @@ class Capped(io.TextIOBase):
         return True
 
     def text(self) -> str:
-        body = "".join(self.parts)
+        body = b"".join(self.parts).decode("utf-8", "ignore")
         return f"{body}\n[dsh-py-codeact] output truncated at {self.limit} bytes" if self.truncated else body
 
 
@@ -651,6 +689,14 @@ class Session:
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
         self.shell = InteractiveShell(user_ns=namespace, config=history)
+        # The specs last bound, so an identical catalogue (the common case — a restriction that
+        # did not change anything, or the same tools re-sent) skips `rebind` and its per-tool
+        # callable + signature rebuild. `None` means "nothing bound yet"; `==` on the parsed
+        # structures still catches a catalogue the host re-serialised, which identity would miss.
+        self._last_specs: list | None = None
+        # The grouped `mcp_servers` tree from the last `rebind`, cached so `mcp_members` reads it
+        # (O(1) lookup) instead of rebuilding it on every attribute access.
+        self.mcp_tree: dict[str, dict] = {}
         self.rebind(bridge, specs)
         self.sinks: list = [None, None]  # the Capped buffers of the cell in flight
         install_bridge_modules()
@@ -704,9 +750,23 @@ class Session:
         The one place the `sys.modules` registration lives, so `build_bindings` stays the pure
         projection its name promises and no caller can produce bindings the import machinery
         cannot follow.
+
+        Skipped when the specs equal the last bound set: `build_bindings` rebuilds
+        every tool callable + `inspect.Signature` per exec, and the common case is a catalogue that
+        never changed between cells. `==` on the parsed structures catches a catalogue the host
+        re-serialised, which object identity would miss.
         """
-        self.bindings = build_bindings(bridge, specs)
-        install_mcp_modules(self.bindings)
+        if specs == self._last_specs:
+            return
+        self.bindings, servers = build_bindings(bridge, specs)
+        install_mcp_modules(servers)
+        # `mcp_members` reads a servable-filtered tree: a true-dunder raw name (e.g. `__odd__`) is
+        # reachable via the flat name and the deep import, never via `mcp.<server>.<tool>`, so the
+        # server it sits under is absent from `dir(mcp)`. `install_mcp_modules` takes the unfiltered
+        # tree so the server module is still registered for the deep import form.
+        self.mcp_tree = mcp_servers({name: call for name, call in self.bindings.items() if servable(name) is not None})
+        # Recorded only once the build above has succeeded: a memo written before a raising spec would make a retry with the same specs early-return and silently serve the stale catalogue.
+        self._last_specs = specs
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""
@@ -767,23 +827,48 @@ class Kernel:
     def __init__(self) -> None:
         self._out = os.fdopen(PROTOCOL_FD, "wb", buffering=0)
         self._bridge = Bridge(self._send)
+        # One frame at a time: `call` frames fire as tasks beside the `done`/`ready` frames this loop awaits, and a sender that yields mid-frame (buffer full) must not let another write into the gap — the host's `readline` would see two spliced frames and drop both.
+        self._send_lock = asyncio.Lock()
         # One Session per agent, one in-flight task per Session. Keyed by the shell id the host assigns; a fan-out of subagents lands here as N entries sharing this process, its event loop and its packages.
         self._sessions: dict = {}
         self._tasks: dict = {}
 
-    def _send(self, frame: dict) -> None:
+    async def _send(self, frame: dict) -> None:
         # fd 3 is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
         # `errors="replace"` is load-bearing, not tidiness: a lone surrogate — routine from `surrogateescape` decoding, or any `Path` on a non-UTF-8 filename — passes `json.dumps` and then raises `UnicodeEncodeError` here. This send is what answers an exec, so a raise means no `done` frame ever arrives and the turn hangs forever. A U+FFFD in one string beats a wedged session.
         payload = memoryview((json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8", errors="replace"))
-        while payload:
-            try:
-                written = self._out.write(payload)
-            except BlockingIOError:
-                written = None
-            if written is None:  # the buffer is full; wait for the host to drain it
-                select.select([], [PROTOCOL_FD], [])
-                continue
-            payload = payload[written:]
+        loop = asyncio.get_running_loop()
+        async with self._send_lock:
+            cancelled = False
+            while payload:
+                try:
+                    written = self._out.write(payload)
+                except BlockingIOError:
+                    written = None
+                if written is None:  # the buffer is full; wait for the host to drain it — a bare `sleep(0)` would hot-spin a core until it does
+                    drained = loop.create_future()
+                    loop.add_writer(PROTOCOL_FD, self._writable, drained)
+                    try:
+                        await asyncio.shield(drained)
+                    except asyncio.CancelledError:
+                        # A cancel must not abandon a half-written frame: the next send splices onto the stump, the host drops both lines, and the aborted exec's `done` never arrives — the 5s `hardInterruptMs` backstop then SIGKILLs the whole kernel. Finish this frame first, then let the cancel through; the host answers a `done` once, so the replacement frame `_exec` sends next is ignored, not fatal.
+                        cancelled = True
+                    finally:
+                        loop.remove_writer(PROTOCOL_FD)  # a no-op when the callback already removed it; cancels a queued-but-unrun one
+                    continue
+                payload = payload[written:]
+            if cancelled:
+                raise asyncio.CancelledError
+
+    @staticmethod
+    def _writable(drained) -> None:
+        # Remove INSIDE the callback: a level-triggered selector re-fires a still-registered writer on every poll, and the future's done callbacks are `call_soon`-scheduled — the sender's `finally` above runs two loop batches later, by which time a re-fire would `set_result` on the already-done future.
+        asyncio.get_running_loop().remove_writer(PROTOCOL_FD)
+        drained.set_result(None)
+
+    def _busy(self, shell) -> bool:
+        running = self._tasks.get(shell)
+        return running is not None and not running.done()
 
     def _session_for(self, shell, specs=None) -> Session:
         session = self._sessions.get(shell)
@@ -813,16 +898,15 @@ class Kernel:
                 "repr": None,
                 "note": None,
             }
-        self._send(frame)
+        await self._send(frame)
 
-    def _handle(self, frame: dict) -> None:
+    async def _handle(self, frame: dict) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
         if kind == "exec":
-            running = self._tasks.get(shell)
-            if running is not None and not running.done():
+            if self._busy(shell):
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
-                self._send(
+                await self._send(
                     {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "kernel busy: a previous cell is still running", "repr": None, "note": None}
                 )
                 return
@@ -832,12 +916,15 @@ class Kernel:
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
-            running = self._tasks.get(shell)
-            if running is not None and not running.done():
-                running.cancel()
+            # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
+            if self._busy(shell):
+                self._tasks[shell].cancel()
         elif kind == "init":
-            self._session_for(shell, frame.get("tools") or [])
-            self._send(
+            # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.
+            specs = frame.get("tools")
+            if isinstance(specs, list) and not self._busy(shell):
+                self._session_for(shell, specs)
+            await self._send(
                 {
                     "t": "ready",
                     "shell": shell,
@@ -851,8 +938,10 @@ class Kernel:
                 }
             )
         elif kind == "dispose":
-            # The agent is gone; drop its shell so its globals can be collected.
-            self._tasks.pop(shell, None)
+            # The agent is gone; cancel any in-flight cell, then drop its shell so its globals can be collected.
+            running = self._tasks.pop(shell, None)
+            if running is not None and not running.done():
+                running.cancel()
             self._sessions.pop(shell, None)
 
     async def serve(self) -> None:
@@ -864,7 +953,12 @@ class Kernel:
             os.fdopen(PROTOCOL_FD, "rb", buffering=0),
         )
         while True:
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except ValueError:
+                # a line over the 16 MiB limit overflows the buffer; it is already drained, so skipping is safe — but say so: the host's exec never gets its `done` and the turn hangs, and a silent drop hides why
+                print("[dsh-py-codeact] dropped a frame over the 16 MiB line limit", file=REAL_STDERR)
+                continue
             if not line:
                 return  # host closed fd 3
             try:
@@ -876,7 +970,7 @@ class Kernel:
             if frame.get("t") == "shutdown":
                 return
             try:
-                self._handle(frame)
+                await self._handle(frame)
             except Exception:  # noqa: BLE001 — one malformed frame must not take the interpreter down
                 # `_handle` runs directly in this loop: an exception here unwinds out of `asyncio.run` and takes the interpreter — and the whole session's state — with it. One malformed frame is not worth that; a `result` whose `id` is unhashable used to do exactly it.
                 print(f"[dsh-py-codeact] dropped a frame that raised: {traceback.format_exc()}", file=REAL_STDERR)

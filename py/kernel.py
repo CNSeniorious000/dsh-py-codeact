@@ -192,8 +192,6 @@ class Bridge:
         call_id = self._next
         future = asyncio.get_running_loop().create_future()
         self._pending[call_id] = future
-        # A done callback is the safety net: if the host never replies, or `_send` raised and we fail the future ourselves, or a `wait_for` timeout cancels it, the entry still leaves `_pending` — no leak.
-        future.add_done_callback(lambda _: self._pending.pop(call_id, None))
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
 
@@ -208,6 +206,9 @@ class Bridge:
         send = asyncio.create_task(_send_call())
         send.add_done_callback(self._sends.discard)
         self._sends.add(send)
+
+        # One done callback for both jobs. Popping `_pending` is the leak safety net: if the host never replies, or `_send` raised and we failed the future ourselves, or a `wait_for` timeout cancelled it, the entry still leaves. Cancelling `send` is the side-effect one: a cancelled or timed-out call whose frame has not gone out yet must not reach the host at all, or the tool runs and its side effects land after the cell already reported the call as cancelled. A frame mid-write is past that point — `_send` holds the lock and shields the drain wait, so it finishes the line rather than splicing the next frame onto a stump.
+        future.add_done_callback(lambda _: (self._pending.pop(call_id, None), send.cancel()))
         return future
 
     def settle(self, call_id, ok, value, tool, message) -> None:

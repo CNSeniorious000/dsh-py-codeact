@@ -5,8 +5,20 @@ import { apply } from '../lib/index.js'
 for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool/code-dispatch'], [3, 'tool/ptc-dispatch']]) {
   const events = [], listeners = new Map(), calls = []
   let python, outcome = 'success'
-  const session = { header: { version, cwd: process.cwd() }, append: (type, data) => events.push({ type, data }) }
-  const agent = { id: `dispatch-v${version}`, session }
+  const history = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'previous-cell', name: 'python', arguments: '{}' }] },
+  ]
+  const injected = []
+  const session = {
+    header: { version, cwd: process.cwd() },
+    append: (type, data) => events.push({ type, data }),
+    deriveMessages: () => history,
+  }
+  const agent = {
+    id: `dispatch-v${version}`,
+    session,
+    inject: (message) => { injected.push(message) },
+  }
   const ctx = {
     on: (name, listener) => listeners.set(name, listener),
     effect: (effect) => effect(),
@@ -25,6 +37,13 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
   apply(ctx, { mode: 'both' })
   const parent = {}, signal = AbortSignal.timeout(30000)
   try {
+    const created = listeners.get('agent/created')
+    assert.ok(created, `format ${version ?? 'legacy'} listens for agent creation`)
+    assert.equal(listeners.has('agent/session-start'), false, `format ${version ?? 'legacy'} does not use the removed session-start event`)
+    created({ agent })
+    assert.equal(injected.length, 1, `format ${version ?? 'legacy'} announces a prior cell after a host restart`)
+    assert.equal(injected[0].source?.plugin, 'dsh-py-codeact')
+
     for (outcome of ['success', 'error', 'throw']) {
       events.length = 0
       const callId = `cell-${outcome}`
@@ -41,6 +60,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       assert.equal(calls.at(-1).signal, signal)
       console.log(`  ok   format ${version ?? 'legacy'} bridge ${outcome}`)
     }
+    created({ agent })
+    assert.equal(injected.length, 1, `format ${version ?? 'legacy'} does not announce a live same-process kernel again`)
   } finally {
     listeners.get('dispose')()
   }

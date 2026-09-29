@@ -1246,6 +1246,18 @@ console.log('restart detection:')
     ['reopening again after a notice stays quiet', session(cell(), notice()), false],
     ['…but a cell run after the notice earns a new one', session(cell(), notice(), cell()), true],
     ['another plugin\'s notice does not count as ours', session(cell(), { ...notice(), source: { kind: 'plugin', plugin: 'other' } }), true],
+    // The v4 line writes the producer-owned `plugin:<name>` kind instead of the released wrapper.
+    // Either vocabulary counts as "already told", or a migrated session would earn a duplicate.
+    ['a v4 producer-kind notice counts as ours', session(cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact', form: 'notice', summary: 'x' } }), false],
+    ['another producer\'s v4 kind does not count as ours', session(cell(), { ...notice(), source: { kind: 'plugin:other', form: 'notice', summary: 'x' } }), true],
+    // Only `form:'notice'` marks a notice. The image re-attach carries the SAME plugin source with
+    // no form; counting it made history `python cell → image context` hide the restart notice —
+    // the image overwrote the last-notice position and the model was never told the interpreter died.
+    ['an image re-attach under our source is not a notice', session(cell(), { ...notice(), source: { kind: 'plugin', plugin: 'dsh-py-codeact' } }), true],
+    ['a v4 image re-attach under our source is not a notice', session(cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact' } }), true],
+    ['an image re-attach cannot hide an earlier real notice', session(cell(), notice(), cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact' } }), true],
+    // The bare `plugin` kind is a third spelling no emitter here writes; it must not pass as ours.
+    ['a bare plugin kind does not count as ours', session(cell(), { ...notice(), source: { kind: 'dsh-py-codeact', form: 'notice', summary: 'x' } }), true],
   ]
   for (const [label, s, expected] of cases) {
     try {

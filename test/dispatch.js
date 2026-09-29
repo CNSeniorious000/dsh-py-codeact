@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { apply } from '../lib/index.js'
 
 // Exercise the plugin's bridge, not only PythonKernel.onCall: session-format tags are written here.
-for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool/code-dispatch'], [3, 'tool/ptc-dispatch']]) {
+// Format 4 is the 0.1.7+ line: same dispatch tags as v3, but the plugin-wrapper source is
+// retired there, so the injected message must carry the producer-owned kind.
+for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool/code-dispatch'], [3, 'tool/ptc-dispatch'], [4, 'tool/ptc-dispatch']]) {
   const events = [], listeners = new Map(), calls = []
   let python, outcome = 'success'
   const history = [
@@ -42,7 +44,16 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
     assert.equal(listeners.has('agent/session-start'), false, `format ${version ?? 'legacy'} does not use the removed session-start event`)
     created({ agent })
     assert.equal(injected.length, 1, `format ${version ?? 'legacy'} announces a prior cell after a host restart`)
-    assert.equal(injected[0].source?.plugin, 'dsh-py-codeact')
+    // The source literal follows the session format generation: the released wrapper on v2/v3,
+    // the producer-owned `plugin:<name>` on v4, where the wrapper would abort the write.
+    if (version !== undefined && version >= 4) {
+      assert.equal(injected[0].source?.kind, 'plugin:dsh-py-codeact')
+      assert.equal(injected[0].source?.plugin, undefined)
+    } else {
+      assert.equal(injected[0].source?.kind, 'plugin')
+      assert.equal(injected[0].source?.plugin, 'dsh-py-codeact')
+    }
+    assert.equal(injected[0].source?.form, 'notice')
 
     for (outcome of ['success', 'error', 'throw']) {
       events.length = 0

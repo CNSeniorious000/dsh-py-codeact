@@ -45,9 +45,23 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      # Keep the legacy peer line executable, not merely semver-admitted: install the exact
+      # dsh-v0.2.0-rc.1 host set in a clean checkout and run the shipped tests first.
+      - name: Smoke exact dsh 0.2.0-rc.1 host set
+        run: |
+          compat_dir="$(mktemp -d)"
+          trap 'rm -rf "$compat_dir"' EXIT
+          git archive HEAD | tar -x -C "$compat_dir"
+          cd "$compat_dir"
+          bun -e 'const p = await Bun.file("package.json").json(); for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.0-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.0.4"; p.devDependencies["@deepseek-ai/schemastery"] = "3.18.2"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          rm -f bun.lock
+          bun install
+          bun run test
+          TY_UV=scripts uvx ty check py/kernel.py
+
       # What ships is what CI already gates on, run again here: a release must not be the one
       # artifact nobody checked. The suite spawns the real kernel, hence uv above.
-      - run: node test/smoke.js
+      - run: bun run test
       - run: uvx ruff check py/
       - run: TY_UV=scripts uvx ty check py/kernel.py
 

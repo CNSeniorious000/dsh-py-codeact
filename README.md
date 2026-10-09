@@ -185,6 +185,19 @@ The card is hand-written in the client module system's factory form (a classic s
 
 The key is the literal name `python`; a custom `toolName` falls back to the generic row.
 
+### MCP rows
+
+A cell that reaches an MCP tool logs it as a subCall like any other, and `ui-tool` dispatches `tool.call.toolview` by exact wire name — so `mcp__<server>__<tool>` otherwise lands on the generic row: the sparkle icon, and "Tool call" for a title.
+
+The cell is the only place its own subCall names are visible — a keyed `register` needs the name up front, and nothing client-side lists tools — so the card claims each name as it renders:
+
+```
+CodeAct · Call github_code_search from mcp.gh submodule
+   ◈ gh/github_code_search · example        ← `mcp__gh__github_code_search`, claimed by the cell
+```
+
+Two details are load-bearing. The claim is deferred to an effect (registering during a render pass updates the store the row is drawn from), and it polls: a reload restores `subCalls` **in place** on a block the row already holds, so the row is never re-rendered with them present. A restored subCall is also a result node, whose wire name sits under `call.name` rather than at the top level.
+
 ## SUBTOOL rows come free
 
 Each bridged call appends the same two session events Code Mode uses:

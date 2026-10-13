@@ -196,6 +196,8 @@ session.append('tool/code-dispatch',       { ...same, isError, content })
 
 They pair by `subCallId` (`<parent>:py:<n>`), and the settle event carries `tool/result`'s own vocabulary (`content` + `isError`) — so the trajectory UI renders them through the exact code path it uses for native calls, as `SUBTOOL` rows under the `python` call. No client change.
 
+Both events have to land inside one open turn: the v3/v4 read path rejects a `tool/ptc-dispatch` found outside one and refuses to load the session at all. So nothing is left in flight when a cell ends. The cell owns an `AbortController` — the signal every sub-call of it runs under — and `execute` aborts that and then waits for whatever is still outstanding before it releases the shell's slot. A call parked on an approval is answered `cancelled` rather than performed hours later inside no turn, and its settle is still logged, in the same turn as its `-start`. Code Mode's `run_code` holds its run open the same way, which is what makes this contract hold there too.
+
 Both types are in `KNOWN_SESSION_EVENT_TYPES`, so reusing them is supported. Note that an out-of-repo plugin cannot invent a *new* event type: the persistence read path refuses a log containing a type outside that set unless the event is marked `ignorable`, and a registration surface for downstream events is explicitly deferred upstream.
 
 Sub-dispatches carry the outer execution's `parent` token, so they re-enter the complete `pre-execute → guards → execute → post-execute → result` pipeline. The sandbox and approval stack still gate every tool call made from inside a cell.

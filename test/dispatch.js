@@ -68,11 +68,64 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       assert.equal(calls.at(-1).callId, events[0].data.subCallId)
       assert.equal(calls.at(-1).parent, parent)
       assert.equal(calls.at(-1).agent, agent)
-      assert.equal(calls.at(-1).signal, signal)
+      // Sub-calls take the cell's own controller, not the outer execution's signal: that is what lets
+      // `execute` cancel a call still parked on an approval the moment the cell settles.
+      assert.ok(calls.at(-1).signal instanceof AbortSignal)
+      assert.notEqual(calls.at(-1).signal, signal)
+      assert.equal(calls.at(-1).signal.aborted, true, 'the cell cancels its sub-calls once it settles')
       console.log(`  ok   format ${version ?? 'legacy'} bridge ${outcome}`)
     }
     created({ agent })
     assert.equal(injected.length, 1, `format ${version ?? 'legacy'} does not announce a live same-process kernel again`)
+  } finally {
+    listeners.get('dispose')()
+  }
+}
+
+// A sub-call can still be in flight when its cell settles: the kernel's own per-call timeout gave up on
+// a tool parked on an approval, or a cell returned with a detached call outstanding. `execute` cancels
+// the cell's controller and then drains, so the call is refused rather than performed, and its settle
+// is still written — in the same turn as its `-start`, the only place the v3/v4 reader accepts one.
+{
+  const events = [], dispatched = [], listeners = new Map()
+  let python
+  const session = {
+    header: { version: 4, cwd: process.cwd() },
+    append: (type, data) => events.push({ type, data }),
+    deriveMessages: () => [],
+  }
+  const agent = { id: 'late-settle', session, inject: () => {} }
+  const ctx = {
+    on: (name, listener) => listeners.set(name, listener),
+    effect: (effect) => effect(),
+    systemPrompt: { section() {} },
+    tools: {
+      register: (tool) => { python = tool },
+      sdkSchemas: () => [{ name: 'read', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } }],
+      // A dispatch parked on an approval settles only when its signal aborts. Honour it the way the
+      // harness's own pipeline does, so this body is never reached.
+      execute: (call) => {
+        dispatched.push(call)
+        return new Promise((_resolve, reject) => {
+          const abort = () => reject(new Error('tool call aborted before dispatch'))
+          if (call.signal.aborted) abort()
+          else call.signal.addEventListener('abort', abort, { once: true })
+        })
+      },
+    },
+  }
+  apply(ctx, { mode: 'both' })
+  try {
+    listeners.get('agent/created')({ agent })
+    const callId = 'cell-late'
+    const exec = { callId, rootCallId: callId, token: {}, agent, signal: AbortSignal.timeout(30000), deferContext: () => {} }
+    await python.execute({ code: 'import asyncio\nfrom __dsh__.tools import read\nasyncio.ensure_future(read(file_path="README.md"))\nawait asyncio.sleep(0.5)', description: 'Detach a call that outlives this cell' }, exec)
+    assert.equal(dispatched.length, 1, 'the detached call reached the host while the cell was still alive')
+    assert.equal(dispatched[0].signal.aborted, true, 'the settled cell cancelled the call instead of letting it run')
+    assert.deepEqual(events.map((event) => event.type), ['tool/ptc-dispatch-start', 'tool/ptc-dispatch'], 'the settle is still logged, in the turn its start opened')
+    assert.equal(events[1].data.isError, true)
+    assert.match(events[1].data.content[0].text, /aborted before dispatch/, 'and it records the cancellation rather than a run')
+    console.log('  ok   a sub-call still in flight when its cell settles is cancelled and still logged')
   } finally {
     listeners.get('dispose')()
   }

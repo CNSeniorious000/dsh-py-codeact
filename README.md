@@ -237,7 +237,7 @@ By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `L
 
 Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
 
-Changing a session’s sandbox mode terminates its existing kernel, so variables and open handles are lost. Confined kernels are not shared across session identities. Unrestricted parent/child sessions may still share one process.
+Changing a session’s sandbox mode or effective working directory retires its existing kernel, so variables and open handles are lost. Pending bridged calls are cancelled and drained before a replacement starts. Confined kernels are not shared across session identities. Unrestricted parent/child sessions with the same working directory may still share one process.
 
 `COLUMNS`/`LINES` are pinned inside the kernel: with no TTY, `get_terminal_size()` falls back to 80×24 and wraps tracebacks and pretty output far narrower than the harness renders at.
 

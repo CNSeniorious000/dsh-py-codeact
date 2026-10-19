@@ -35,7 +35,7 @@
     "!**/__pycache__"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/client-render.js && node test/execution-policy.js"
+    "test": "node test/smoke.js && node test/client-render.js && node test/execution-policy.js && node test/review-regressions.js"
   },
   "dsh": {
     "bundle": {

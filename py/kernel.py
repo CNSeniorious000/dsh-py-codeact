@@ -10,7 +10,7 @@
 
 """Persistent IPython kernel for the dsh CodeAct REPL tool.
 
-One long-lived process per conversation tree, holding one `InteractiveShell` per agent. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
+Each agent has one `InteractiveShell`; only unrestricted sessions may share a long-lived process across a conversation tree. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
 
 Cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
 

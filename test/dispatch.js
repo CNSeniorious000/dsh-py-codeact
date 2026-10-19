@@ -16,6 +16,7 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
   ]
   const injected = []
   const session = {
+    id: `dispatch-v${version}`,
     header: { version, cwd: process.cwd() },
     append: (type, data) => events.push({ type, data }),
     deriveMessages: () => history,
@@ -101,10 +102,24 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
     assert.equal(shaped, 1)
     const warnings = []
     ctx.logger = { warn: (message) => warnings.push(message) }
-    ctx.waterfall = async () => { throw new Error('log hook failed') }
+    ctx.waterfall = async (_scope, _name, dispatch, next) => { dispatch.content[0].text = 'mutated'; (await next()).push({ type: 'text', text: 'partial hook output' }); throw new Error('log hook failed') }
     assert.match(await execute(), /file contents/, 'a broken log hook does not fail the tool')
     assert.equal(events.at(-1).data.content[0].text, 'file contents')
+    assert.equal(events.at(-1).data.content.length, 1)
     assert.match(warnings[0], /log hook failed/)
+    outcome = 'throw'
+    ctx.waterfall = async () => [{ type: 'text', text: 'shaped rejection' }]
+    assert.match(await execute(), /dispatch rejected/)
+    assert.equal(events.at(-1).data.content[0].text, 'shaped rejection', 'rejected executions use the same log hook')
+    outcome = 'success'
+    await listeners.get('session/event')(session, { type: 'sandbox/mode' })
+    const repeat = () => python.execute({ code: 'from __dsh__.tools import read\nawait read(file_path="README.md")', description: 'Repeat the same outer call after restart' },
+      { callId: 'cell-shape', rootCallId: 'cell-shape', token: parent, agent, signal, deferContext() {} })
+    assert.match(await repeat(), /file contents/)
+    const previousId = events.at(-1).data.subCallId
+    await listeners.get('session/event')(session, { type: 'sandbox/mode' })
+    assert.match(await repeat(), /file contents/)
+    assert.notEqual(events.at(-1).data.subCallId, previousId, 'sub-call ids remain unique across kernel replacement')
     created({ agent })
     assert.equal(injected.length, 1, `format ${version ?? 'legacy'} does not announce a live same-process kernel again`)
   } finally {

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { createServer } from 'node:net'
+import { once } from 'node:events'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSandbox from '@deepseek-ai/dsh-sandbox-local'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
@@ -15,6 +16,10 @@ process.env.DATABASE_URL = 'dsh-test-ambient-credential'
 const host = new Context()
 const sandbox = new LocalSandbox(host, LocalSandbox.Config({}))
 const subprocess = new LocalSubprocess(host)
+const descendantServer = createServer()
+descendantServer.listen(0, '127.0.0.1')
+await once(descendantServer, 'listening')
+let descendantPeer
 const listeners = new Map(), confined = []
 let python, mode = 'read-only', effectiveCwd = root
 effectiveCwd = join(root, 'nested')
@@ -48,6 +53,12 @@ try {
   assert.equal(confined.length, 2)
   assert.equal(confined[1].sessionId, child.id)
 
+  effectiveCwd = join(root, 'moved')
+  await mkdir(effectiveCwd)
+  const moved = await run('import os\nos.getcwd()')
+  assert.match(moved, /moved/, 'changing the effective directory retires a stale kernel')
+  assert.match(moved, /interpreter was restarted/)
+
   mode = 'workspace-write'
   const changing = listeners.get('session/event')(parent.session, { type: 'sandbox/mode' })
   const reset = await run('"remembered" in globals()')
@@ -65,13 +76,21 @@ try {
   assert.match(await run('import os\nos.getpid()', child), new RegExp(await run('parent_pid')))
   assert.equal(confined.length, wraps, 'explicit unrestricted execution bypasses confinement')
 
-  const descendant = await run('import asyncio, sys\nchild = await asyncio.create_subprocess_exec(sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print(\'ready\', flush=True); time.sleep(600)", stdout=asyncio.subprocess.PIPE)\nawait child.stdout.readline()\nchild.pid')
+  let descendantClosed
+  const descendantConnected = once(descendantServer, 'connection', { signal: AbortSignal.timeout(30000) }).then(([peer]) => {
+    descendantPeer = peer
+    descendantClosed = once(peer, 'close', { signal: AbortSignal.timeout(30000) })
+    peer.resume()
+  })
+  const port = descendantServer.address().port
+  const childCode = `import signal,socket,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); sock = socket.create_connection(("127.0.0.1", ${port})); print("ready", flush=True); time.sleep(600)`
+  const descendant = await run(`import asyncio, sys\nchild = await asyncio.create_subprocess_exec(sys.executable, "-c", ${JSON.stringify(childCode)}, stdout=asyncio.subprocess.PIPE)\nawait child.stdout.readline()\nchild.pid`)
   const pid = Number(descendant.trim().split('\n').at(-1))
   assert.ok(Number.isSafeInteger(pid) && pid > 0)
+  await descendantConnected
   mode = 'read-only'
   await listeners.get('session/event')(parent.session, { type: 'sandbox/mode' })
-  const status = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' })
-  assert.ok(status.status === 1 || (status.status === 0 && status.stdout.trim().startsWith('Z')), 'permission changes terminate even descendants that ignore SIGTERM')
+  await descendantClosed // The child owns this socket until it dies; no platform-specific process listing or polling is needed.
 
   await listeners.get('dispose')()
   ctx.sandboxPolicy = undefined
@@ -91,6 +110,8 @@ try {
   else process.env.DATABASE_URL = previousCredential
   await listeners.get('dispose')()
   await host.fiber.dispose()
+  descendantPeer?.destroy()
+  await new Promise((resolve, reject) => descendantServer.close((error) => error ? reject(error) : resolve()))
   await rm(root, { recursive: true, force: true })
 }
 

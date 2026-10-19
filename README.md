@@ -21,18 +21,18 @@ Cells run through `InteractiveShell.run_cell_async`, so magics, `transform_cell`
 
 ## How it differs from dsh's built-in Code Mode
 
-Same idea, opposite state model.
+Both offer programmatic tool calling. This plugin keeps IPython as the model’s action space.
 
 | | Code Mode (`run_code`) | this plugin (`python`) |
 |---|---|---|
 | Language | TypeScript (or Python via a backend) | Python, in IPython |
-| State between calls | none — one fresh worker per run | **persists** for the session |
-| Layer | a `CodeRuntime` seam provider | an ordinary tool plugin |
+| State between calls | runtime-dependent; persistent execution is supported | **persists** for the session |
+| Layer | a `PtcRuntime` seam provider | an ordinary tool plugin |
 | Tool surface | a generated `tools` global | the `__dsh__.tools` module |
 | Exclusivity | `tools.mode: code`, enforced by the registry | `mode: code`, via prompt assembly + a guard |
 | Result | program logs + return value | tagged stdout / return / traceback / note |
 
-**It is deliberately not a `CodeRuntime` backend.** That seam's contract states *"no state survives between runs"*, and Code Mode's own Agent Note records a persistent REPL kernel as rejected-for-MVP, because cross-call state would be invisible to the session log. A persistent kernel cannot conform — so it owns its own process instead of implementing that interface.
+DSH 0.2.1 supports persistent PTC execution (`persistent-in-memory`). This plugin remains an ordinary tool because it provides an IPython-specific interaction model, including magics, history and introspection; persistence alone no longer requires a separate tool.
 
 That tradeoff is real and inherited: the interpreter's live state cannot be reconstructed from a session replay. What IS in the log is every cell's source and every bridged tool call, which is enough to audit what happened.
 
@@ -200,7 +200,7 @@ Both events have to land inside one open turn: the v3/v4 read path rejects a `to
 
 Both types are in `KNOWN_SESSION_EVENT_TYPES`, so reusing them is supported. Note that an out-of-repo plugin cannot invent a *new* event type: the persistence read path refuses a log containing a type outside that set unless the event is marked `ignorable`, and a registration surface for downstream events is explicitly deferred upstream.
 
-Sub-dispatches carry the outer execution's `parent` token, so they re-enter the complete `pre-execute → guards → execute → post-execute → result` pipeline. The sandbox and approval stack still gate every tool call made from inside a cell.
+Sub-dispatches carry the outer execution's `parent` token, so they re-enter the complete `pre-execute → guards → execute → post-execute → result` pipeline. The sandbox and approval stack still gate every tool call made from inside a cell. Settled sub-calls also use the public `tools/ptc-dispatch-log` waterfall and preserve result metadata and structured errors.
 
 ## What the model gets
 
@@ -227,13 +227,17 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 
   The interpreter is then spawned **directly**, never behind `uv run --script`. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an `[the interpreter was restarted]` notice nothing actually caused. `alive` is likewise tracked from the exit event rather than read off `proc.killed`, which Node sets on any `kill()` call, including a signal the process survived.
 - **Containment, not a security boundary.** A separate process with a curated environment, but model code can `import os`. Treat a session on this preset as shell access.
-- **One interpreter per conversation tree, one shell per agent.** A subagent reuses the parent's process — sharing its event loop, `sys.modules`, installed packages and `__dsh__.shared` — but gets its own globals and its own tool catalogue. Costs an `init` frame, not another interpreter.
+- **One shell per agent.** Under `danger-full-access`, a subagent can reuse its parent's process — sharing its event loop, `sys.modules`, installed packages and `__dsh__.shared` — while keeping its own globals and tool catalogue. Confined sessions use separate interpreters.
 - **`__dsh__.shared`** is the one deliberate crack in that isolation: a module every agent in the process can read and write, for handing live objects across a fan-out with no serialization and no tokens.
 - Shells close with their session; the process goes when the last agent pointing at it does.
 
 ## Environment
 
 By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM` — not the empty environment the worker-thread runtime uses. CPython running IPython needs a profile dir and a `PATH` for shell escapes; the point is excluding ambient credentials, which an allowlist does just as well. `inheritEnv: true` passes the whole harness environment.
+
+Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
+
+Changing a session’s sandbox mode terminates its existing kernel, so variables and open handles are lost. Confined kernels are not shared across session identities. Unrestricted parent/child sessions may still share one process.
 
 `COLUMNS`/`LINES` are pinned inside the kernel: with no TTY, `get_terminal_size()` falls back to 80×24 and wraps tracebacks and pretty output far narrower than the harness renders at.
 

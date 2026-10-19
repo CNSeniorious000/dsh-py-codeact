@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
 import { apply } from '../lib/index.js'
+import { Context } from '@deepseek-ai/cordis'
+import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
+
+const host = new Context(), subprocess = new LocalSubprocess(host)
 
 // Exercise the plugin's bridge, not only PythonKernel.onCall: session-format tags are written here.
 // Format 4 is the 0.1.7+ line: same dispatch tags as v3, but the plugin-wrapper source is
@@ -22,6 +26,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
     inject: (message) => { injected.push(message) },
   }
   const ctx = {
+    subprocess,
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: process.cwd() }) },
     on: (name, listener) => listeners.set(name, listener),
     effect: (effect) => effect(),
     systemPrompt: { section() {} },
@@ -31,8 +37,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       execute: async (call) => {
         calls.push(call)
         if (outcome === 'throw') throw new Error('dispatch rejected')
-        if (outcome === 'error') return { isError: true, error: { message: 'read failed' }, content: [{ type: 'text', text: 'read failed' }] }
-        return { isError: false, value: 'file contents', content: [{ type: 'text', text: 'file contents' }] }
+        if (outcome === 'error') return { isError: true, error: { message: 'read failed', info: { code: 'READ_FAILED' } }, meta: { source: 'error' }, content: [{ type: 'text', text: 'read failed' }] }
+        return { isError: false, value: 'file contents', meta: { source: 'success' }, content: [{ type: 'text', text: 'file contents' }] }
       },
     },
   }
@@ -63,6 +69,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       assert.match(result, outcome === 'success' ? /file contents/ : outcome === 'error' ? /read failed/ : /dispatch rejected/)
       assert.deepEqual(events.map((event) => event.type), [`${eventType}-start`, eventType], `format ${version}: both dispatch events must be readable`)
       assert.equal(events[1].data.isError, outcome !== 'success')
+      if (outcome !== 'throw') assert.deepEqual(events[1].data.meta, { source: outcome })
+      if (outcome === 'error') assert.deepEqual(events[1].data.error, { code: 'READ_FAILED' })
       assert.equal(events[1].data.subCallId, events[0].data.subCallId)
       assert.equal(events[0].data.parentCallId, callId)
       assert.equal(calls.at(-1).callId, events[0].data.subCallId)
@@ -75,10 +83,32 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       assert.equal(calls.at(-1).signal.aborted, true, 'the cell cancels its sub-calls once it settles')
       console.log(`  ok   format ${version ?? 'legacy'} bridge ${outcome}`)
     }
+    let shaped = 0
+    ctx.waterfall = async (_scope, name, dispatch, next) => {
+      assert.equal(name, 'tools/ptc-dispatch-log')
+      assert.equal(dispatch.agent, agent)
+      assert.equal(dispatch.exec.agent, agent)
+      assert.equal(dispatch.name, 'read')
+      assert.equal((await next())[0].text, 'file contents')
+      shaped++
+      return [{ type: 'text', text: 'shaped log' }]
+    }
+    outcome = 'success'
+    const execute = () => python.execute({ code: 'await read(file_path="README.md")', description: 'Shape dispatch logs' },
+      { callId: 'cell-shape', rootCallId: 'cell-shape', token: parent, agent, signal, deferContext() {} })
+    assert.match(await execute(), /file contents/, 'log shaping does not alter the Python reply')
+    assert.equal(events.at(-1).data.content[0].text, 'shaped log')
+    assert.equal(shaped, 1)
+    const warnings = []
+    ctx.logger = { warn: (message) => warnings.push(message) }
+    ctx.waterfall = async () => { throw new Error('log hook failed') }
+    assert.match(await execute(), /file contents/, 'a broken log hook does not fail the tool')
+    assert.equal(events.at(-1).data.content[0].text, 'file contents')
+    assert.match(warnings[0], /log hook failed/)
     created({ agent })
     assert.equal(injected.length, 1, `format ${version ?? 'legacy'} does not announce a live same-process kernel again`)
   } finally {
-    listeners.get('dispose')()
+    await listeners.get('dispose')()
   }
 }
 
@@ -96,6 +126,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
   }
   const agent = { id: 'late-settle', session, inject: () => {} }
   const ctx = {
+    subprocess,
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: process.cwd() }) },
     on: (name, listener) => listeners.set(name, listener),
     effect: (effect) => effect(),
     systemPrompt: { section() {} },
@@ -127,6 +159,7 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
     assert.match(events[1].data.content[0].text, /aborted before dispatch/, 'and it records the cancellation rather than a run')
     console.log('  ok   a sub-call still in flight when its cell settles is cancelled and still logged')
   } finally {
-    listeners.get('dispose')()
+    await listeners.get('dispose')()
   }
 }
+await host.fiber.dispose()

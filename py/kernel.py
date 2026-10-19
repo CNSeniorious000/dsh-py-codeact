@@ -10,11 +10,11 @@
 
 """Persistent IPython kernel for the dsh CodeAct REPL tool.
 
-One long-lived process per conversation tree, holding one `InteractiveShell` per agent. A namespace survives between cells — that is the whole point, and the reason this cannot be a `CodeRuntime` backend (that seam mandates "no state survives between runs").
+Each agent has one `InteractiveShell`; only unrestricted sessions may share a long-lived process across a conversation tree. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
 
 Cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
 
-Wire protocol: JSON-lines on fd 3. stdout/stderr stay free for native writes.
+Wire protocol: JSON-lines on the inherited control channel (fd 7 under DSH, fd 3 standalone). stdout/stderr stay free for native writes.
 
 Every frame but `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
 
@@ -63,7 +63,8 @@ from IPython.lib.pretty import pretty
 from objprint import ObjPrint
 from traitlets.config import Config
 
-PROTOCOL_FD = 3
+# DSH’s managed subprocess control channel uses fd 7; standalone launches retain fd 3.
+PROTOCOL_FD = 7 if os.environ.pop("DSH_SUBPROCESS_CONTROL", None) == "pipe" else 3
 
 # Wire default for the `shell` field. The JS host holds its own copy of this literal — the seam is the one place the two languages must agree by hand.
 DEFAULT_SHELL = "main"
@@ -688,7 +689,7 @@ class Session:
         # `:memory:` because a bare `InteractiveShell` writes every cell into the USER's own `~/.ipython/profile_default/history.sqlite` — measured at 87 MB / 47k cells here, shared with their interactive ipython, contended by every kernel process at once, and growing with nothing to prune it. Model cell sources have no business in that file; the session log is the audit record. `_ih`, `_` and `Out[n]` all still work, which is what `repr` is built from.
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
-        self.shell = InteractiveShell(user_ns=namespace, config=history)
+        self.shell = InteractiveShell(user_ns=namespace, config=history, ipython_dir=os.environ.get("IPYTHONDIR"))
         # The specs last bound, so an identical catalogue (the common case — a restriction that
         # did not change anything, or the same tools re-sent) skips `rebind` and its per-tool
         # callable + signature rebuild. `None` means "nothing bound yet"; `==` on the parsed
@@ -834,7 +835,7 @@ class Kernel:
         self._tasks: dict = {}
 
     async def _send(self, frame: dict) -> None:
-        # fd 3 is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
+        # The control descriptor is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
         # `errors="replace"` is load-bearing, not tidiness: a lone surrogate — routine from `surrogateescape` decoding, or any `Path` on a non-UTF-8 filename — passes `json.dumps` and then raises `UnicodeEncodeError` here. This send is what answers an exec, so a raise means no `done` frame ever arrives and the turn hangs forever. A U+FFFD in one string beats a wedged session.
         payload = memoryview((json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8", errors="replace"))
         loop = asyncio.get_running_loop()
@@ -960,7 +961,7 @@ class Kernel:
                 print("[dsh-py-codeact] dropped a frame over the 16 MiB line limit", file=REAL_STDERR)
                 continue
             if not line:
-                return  # host closed fd 3
+                return  # host closed the control channel
             try:
                 frame = json.loads(line)
             except ValueError:
@@ -971,9 +972,12 @@ class Kernel:
                 return
             try:
                 await self._handle(frame)
-            except Exception:  # noqa: BLE001 — one malformed frame must not take the interpreter down
+            except Exception:
                 # `_handle` runs directly in this loop: an exception here unwinds out of `asyncio.run` and takes the interpreter — and the whole session's state — with it. One malformed frame is not worth that; a `result` whose `id` is unhashable used to do exactly it.
                 print(f"[dsh-py-codeact] dropped a frame that raised: {traceback.format_exc()}", file=REAL_STDERR)
+                # A failed initialization has no ready frame. Exit so the host rejects startup instead of waiting forever.
+                if frame.get("t") == "init":
+                    raise
 
 
 if __name__ == "__main__":

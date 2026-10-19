@@ -49,7 +49,9 @@ try {
   assert.equal(confined[0].mode, 'read-only')
   await run('remembered = 42')
   assert.match(await run('remembered'), /42/, 'state persists under an unchanged policy')
-  assert.match(await run('"remembered" in globals()', child), /False/, 'confined child gets a separate kernel')
+  const firstChildCell = await run('"remembered" in globals()', child)
+  assert.match(firstChildCell, /False/, 'confined child gets a separate kernel')
+  assert.doesNotMatch(firstChildCell, /interpreter was restarted/, 'a child with no previous state does not report a restart')
   assert.equal(confined.length, 2)
   assert.equal(confined[1].sessionId, child.id)
 

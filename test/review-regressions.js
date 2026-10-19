@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import { EventEmitter, once } from 'node:events'
-import { execFileSync } from 'node:child_process'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
@@ -74,11 +73,17 @@ try {
   }
   console.log('  ok   provider teardown failures settle startup and close without hanging')
 
-  const interpreter = execFileSync('uv', ['python', 'find', '--script', KERNEL_PY], { encoding: 'utf8' }).trim()
-  for (const options of [{ command: [interpreter, KERNEL_PY] }, { ephemeralEnv: false }]) {
+  async function checkEnvironment(options) {
     const kernel = new PythonKernel(options)
-    try { await kernel.start([]); assert.equal(kernel.pythonEnv.disposable, false, 'a temporary profile does not make interpreter installs disposable') }
+    try {
+      await kernel.start([])
+      assert.equal(kernel.pythonEnv.disposable, false, 'a temporary profile does not make interpreter installs disposable')
+      return kernel.pythonEnv.executable
+    }
     finally { await kernel.dispose() }
   }
+  // Resolve through the same scrubbed environment as the kernel; CI may set UV_CACHE_DIR only in the ambient environment.
+  const interpreter = await checkEnvironment({ ephemeralEnv: false })
+  await checkEnvironment({ command: [interpreter, KERNEL_PY] })
   console.log('  ok   configured and non-ephemeral interpreter environments are reported accurately')
 } finally { await host.fiber.dispose() }

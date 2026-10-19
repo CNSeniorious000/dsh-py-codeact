@@ -63,7 +63,7 @@ from IPython.lib.pretty import pretty
 from objprint import ObjPrint
 from traitlets.config import Config
 
-# DSH’s managed subprocess control channel uses fd 7; standalone launches retain fd 3.
+# DSH's managed subprocess control channel uses fd 7; standalone launches retain fd 3.
 PROTOCOL_FD = 7 if os.environ.pop("DSH_SUBPROCESS_CONTROL", None) == "pipe" else 3
 
 # Wire default for the `shell` field. The JS host holds its own copy of this literal — the seam is the one place the two languages must agree by hand.

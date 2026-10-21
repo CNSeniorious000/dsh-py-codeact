@@ -120,7 +120,7 @@ def _pipe_system(shell):
     return system
 
 
-# `uv`'s cache defaults to `~/.cache/uv`, outside every writable root above, so a fenced `!uv pip install` dies at `Could not acquire lock … Operation not permitted` before resolving a single package. Point it somewhere writable when the default is not — but this runs at import, so every step of it has to be fail-soft: `tempfile.gettempdir()` is not a getter, it PROBES candidates by creating a file and raises `FileNotFoundError` when none is usable, which in a read-only session kills the kernel before it can say why. Anchor on the throwaway venv the host already made instead — its parent IS the platform temp dir, no probing needed — and name the cache into the host's own pid-tagged namespace (`dsh-py-codeact-<harness pid>-…`, the one its venvs already use) so the sweep the host runs on every cold start reclaims it. A plain name would sit in the OS temp dir forever, since that sweep only ever matches a pid-tagged entry.
+# `uv`'s cache defaults to `~/.cache/uv`, outside every writable root above, so a fenced `!uv pip install` dies at `Could not acquire lock … Operation not permitted` before resolving a single package. Point it somewhere writable when the default is not — but this runs at import, so every step of it has to be fail-soft: `tempfile.gettempdir()` is not a getter, it PROBES candidates by creating a file and raises `FileNotFoundError` when none is usable, which in a read-only session kills the kernel before it can say why. Read `TMPDIR` for the fallback's home instead: both it and `/tmp` are writable roots, the host forwards `TMPDIR` deliberately, and reading it needs no probe. Do NOT hang it off `sys.prefix` — with an explicit `command` that is the user's own venv and we would create a cache inside their project. Name it into the host's own pid-tagged namespace (`dsh-py-codeact-<harness pid>-…`, the one its venvs already use) so the sweep the host runs on a cold start reclaims it; a plain name would sit in the OS temp dir forever, since that sweep only ever matches a pid-tagged entry. That sweep sits behind the same early return as the venv, so a kernel configured with an explicit `command` is never swept — the OS temp cleanup is what bounds it there.
 
 
 def _writable_directory(directory: Path) -> bool:
@@ -140,7 +140,7 @@ def _uv_cache_directory() -> Path:
 
 
 if "UV_CACHE_DIR" not in os.environ and not _writable_directory(_uv_cache_directory()):
-    _uv_cache = Path(sys.prefix).parent / f"dsh-py-codeact-{os.getppid()}-uv-cache"
+    _uv_cache = Path(os.environ.get("TMPDIR") or "/tmp") / f"dsh-py-codeact-{os.getppid()}-uv-cache"
     # Nothing is writable in a read-only session, and an install there is a contradiction anyway — leave uv's own error rather than failing at import.
     if _writable_directory(_uv_cache):
         os.environ["UV_CACHE_DIR"] = str(_uv_cache)

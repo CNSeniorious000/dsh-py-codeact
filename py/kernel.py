@@ -44,11 +44,13 @@ if _inherited := os.environ.get("DSH_CODEACT_INHERIT_SITE"):
 
 # These sit below the two blocks above on purpose: COLUMNS/LINES must be set before IPython reads the terminal size, and the inherited site-packages must be on the path before IPython is imported at all.
 import asyncio
+import atexit
 import contextlib
 import inspect
 import io
 import json
 import keyword
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,10 @@ REAL_STDERR = sys.stderr
 # `uv pip install <pkg>` inside a cell has to know WHICH environment to install into. The harness spawns us with an allowlisted environment that deliberately drops VIRTUAL_ENV, and without it uv refuses outright — while IPython's `!cmd` does not fail on a non-zero exit, so the cell reports success and the import fails a cell later, with nothing connecting the two.
 if sys.prefix != sys.base_prefix:
     os.environ.setdefault("VIRTUAL_ENV", sys.prefix)
+
+# The host deletes this throwaway venv when it disposes the kernel, but a harness that is signalled or crashes never reaches that point — while the kernel it leaves behind still exits cleanly on EOF, which is the last moment anyone owns the directory. `DSH_CODEACT_INHERIT_SITE` is set on exactly the path where the host built one, and the name prefix keeps this off a venv that is not ours (`config.python`, `ephemeralEnv: false`).
+if os.environ.get("DSH_CODEACT_INHERIT_SITE") and Path(sys.prefix).name.startswith("dsh-py-codeact-"):
+    atexit.register(shutil.rmtree, sys.prefix, ignore_errors=True)
 
 # ── the execution fence can take the terminal away ───────────────────────────
 # A pty is a device node, and creating one opens `/dev/ptmx` for WRITING. `read-only` and `workspace-write` fence this

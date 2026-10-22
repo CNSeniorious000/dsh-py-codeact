@@ -44,12 +44,16 @@ if _inherited := os.environ.get("DSH_CODEACT_INHERIT_SITE"):
 
 # These sit below the two blocks above on purpose: COLUMNS/LINES must be set before IPython reads the terminal size, and the inherited site-packages must be on the path before IPython is imported at all.
 import asyncio
+import atexit
 import contextlib
 import inspect
 import io
 import json
 import keyword
+import shutil
+import subprocess
 import sys
+import tempfile
 import traceback
 import types
 from contextvars import ContextVar
@@ -75,6 +79,77 @@ REAL_STDERR = sys.stderr
 # `uv pip install <pkg>` inside a cell has to know WHICH environment to install into. The harness spawns us with an allowlisted environment that deliberately drops VIRTUAL_ENV, and without it uv refuses outright — while IPython's `!cmd` does not fail on a non-zero exit, so the cell reports success and the import fails a cell later, with nothing connecting the two.
 if sys.prefix != sys.base_prefix:
     os.environ.setdefault("VIRTUAL_ENV", sys.prefix)
+
+# The host deletes this throwaway venv when it disposes the kernel, but a harness that is signalled or crashes never reaches that point — while the kernel it leaves behind still exits cleanly on EOF, which is the last moment anyone owns the directory. `DSH_CODEACT_INHERIT_SITE` is set on exactly the path where the host built one, and the name prefix keeps this off a venv that is not ours (`config.python`, `ephemeralEnv: false`).
+if os.environ.get("DSH_CODEACT_INHERIT_SITE") and Path(sys.prefix).name.startswith("dsh-py-codeact-"):
+    atexit.register(shutil.rmtree, sys.prefix, ignore_errors=True)
+
+# ── the execution fence can take the terminal away ───────────────────────────
+# A pty is a device node, and creating one opens `/dev/ptmx` for WRITING. `read-only` and `workspace-write` fence this
+# process with `(allow default) (deny file-write*)` plus the workspace and temp roots, so that open returns EPERM and
+# `pty.openpty()` degrades through the legacy `/dev/pty*` scan to the misleading `OSError: out of pty devices`. `!cmd` has
+# no use for a terminal — but IPython's default `system` is `system_piped`, and `system_piped` spawns through pexpect,
+# whose entire design is "the child runs on a pty". So every `!cmd` cell dies before its command starts, pointing at
+# IPython rather than at the fence. Probe once here and, when there is no pty to be had, hand each shell a pipe runner.
+
+
+def _pty_available() -> bool:
+    try:
+        master, slave = os.openpty()
+    # Windows has no `os.openpty` at all, and under a fence the open itself fails — neither may abort the import.
+    except (AttributeError, OSError):
+        return False
+    os.close(master)
+    os.close(slave)
+    return True
+
+
+PTY_AVAILABLE = _pty_available()
+
+
+def _pipe_system(shell):
+    """`system_piped` without the terminal: the same `{var}` expansion, merged streams, `_exit_code` and raise contract, but the child runs on pipes, so its output streams into the cell instead of vanishing into a pty this process cannot open. Returning None matters — `!cmd` is the cell's transformed expression, and any non-None return would be echoed back as the cell's value."""
+
+    def system(cmd: str) -> None:
+        # A backgrounded child inherits the pipe, so the read loop below would block until IT exits — the same reason IPython's own `system_piped` refuses these.
+        if cmd.rstrip().endswith("&"):
+            raise OSError("Background processes not supported.")
+        with subprocess.Popen(shell.var_expand(cmd, depth=1), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+            for chunk in iter(lambda: process.stdout.read(8192), ""):  # ty: ignore[unresolved-attribute]  # stdout=PIPE above, so the pipe is always there
+                sys.stdout.write(chunk)
+            sys.stdout.flush()
+            returncode = process.wait()
+        shell.user_ns["_exit_code"] = returncode
+        if shell.system_raise_on_error and returncode != 0:
+            raise subprocess.CalledProcessError(returncode, cmd)
+
+    return system
+
+
+# `uv`'s cache defaults to `~/.cache/uv`, outside every writable root above, so a fenced `!uv pip install` dies at `Could not acquire lock … Operation not permitted` before resolving a single package. Point it somewhere writable when the default is not — but this runs at import, so every step of it has to be fail-soft: `tempfile.gettempdir()` is not a getter, it PROBES candidates by creating a file and raises `FileNotFoundError` when none is usable, which in a read-only session kills the kernel before it can say why. Read `TMPDIR` for the fallback's home instead: both it and `/tmp` are writable roots, the host forwards `TMPDIR` deliberately, and reading it needs no probe. Do NOT hang it off `sys.prefix` — with an explicit `command` that is the user's own venv and we would create a cache inside their project. Name it into the host's own pid-tagged namespace (`dsh-py-codeact-<harness pid>-…`, the one its venvs already use) so the sweep the host runs on a cold start reclaims it; a plain name would sit in the OS temp dir forever, since that sweep only ever matches a pid-tagged entry. That sweep sits behind the same early return as the venv, so a kernel configured with an explicit `command` is never swept — the OS temp cleanup is what bounds it there.
+
+
+def _writable_directory(directory: Path) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, probe = tempfile.mkstemp(dir=directory)
+    except OSError:
+        return False
+    os.close(descriptor)
+    Path(probe).unlink()
+    return True
+
+
+def _uv_cache_directory() -> Path:
+    """Where `uv` puts its cache when left alone: `UV_CACHE_DIR` is handled by the caller, then the XDG cache dir, then `~/.cache`."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uv"
+
+
+if "UV_CACHE_DIR" not in os.environ and not _writable_directory(_uv_cache_directory()):
+    _uv_cache = Path(os.environ.get("TMPDIR") or "/tmp") / f"dsh-py-codeact-{os.getppid()}-uv-cache"
+    # Nothing is writable in a read-only session, and an install there is a contradiction anyway — leave uv's own error rather than failing at import.
+    if _writable_directory(_uv_cache):
+        os.environ["UV_CACHE_DIR"] = str(_uv_cache)
 
 # Cap one cell's captured output. The host caps the whole result again; this only stops a runaway loop from exhausting memory before the host sees it.
 MAX_STREAM_BYTES = 1 << 20
@@ -690,6 +765,9 @@ class Session:
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
         self.shell = InteractiveShell(user_ns=namespace, config=history, ipython_dir=os.environ.get("IPYTHONDIR"))
+        # No pty means no pexpect (see PTY_AVAILABLE), so `!cmd` gets the pipe runner. An unfenced host keeps `system_piped`, whose pexpect path gives cells colors and interactivity that pipes cannot.
+        if not PTY_AVAILABLE:
+            self.shell.system = _pipe_system(self.shell)
         # The specs last bound, so an identical catalogue (the common case — a restriction that
         # did not change anything, or the same tools re-sent) skips `rebind` and its per-tool
         # callable + signature rebuild. `None` means "nothing bound yet"; `==` on the parsed

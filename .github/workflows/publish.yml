@@ -48,7 +48,8 @@ jobs:
       # Keep the minimum supported host executable, including its managed subprocess/control channel.
       - name: Smoke exact dsh 0.2.1-rc.2 host set
         run: |
-          compat_dir="$(mktemp -d)"
+          # The Linux sandbox replaces /tmp; keep the test source visible inside it.
+          compat_dir="$(mktemp -d "$RUNNER_TEMP/dsh-py-codeact-compat.XXXXXX")"
           trap 'rm -rf "$compat_dir"' EXIT
           git archive HEAD | tar -x -C "$compat_dir"
           cd "$compat_dir"

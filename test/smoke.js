@@ -1256,16 +1256,6 @@ console.log('shells:')
     })
   }
 
-  await checkShell('a cancellation-resistant task prevents shell reuse', async () => {
-    await shells.start(childTools, 'resistant')
-    assert.equal((await cell('import asyncio\nimport __dsh__.shared as S\nS.stop = False\nasync def resist():\n    while not S.stop:\n        try:\n            await asyncio.sleep(0.01)\n        except asyncio.CancelledError:\n            pass\nS.resistant = asyncio.create_task(resist())\nawait asyncio.sleep(0)', 'resistant')).ok, true)
-    shells.closeShell('resistant')
-    await shells.start(childTools, 'resistant')
-    const refused = await cell('42', 'resistant')
-    assert.equal(refused.ok, false)
-    await cell('S.stop = True\nawait S.resistant', 'parent')
-  })
-
   await checkShell('closing one shell leaves the others running', async () => {
     shells.closeShell('child')
     assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)

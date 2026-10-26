@@ -986,13 +986,21 @@ class Kernel:
                 break
         # A timer can retain this session after its last task ends. Only the cleanup window may spawn helpers.
         session.closed = True
+
+        def release(task=None) -> None:
+            tasks.discard(task)
+            if not tasks and self._sessions.get(shell) is session:
+                self._sessions.pop(shell, None)
+                self._tasks.pop(shell, None)
+
         if tasks:
+            # The deadline ends the wait, not ownership. Release the namespace when the last remaining task exits.
             for task in tasks:
                 task.cancel()
+                task.add_done_callback(release)
             print(f"[dsh-py-codeact] session {shell!r} retained {len(tasks)} task(s) after cancellation", file=REAL_STDERR)
-            return  # Retain the closing session: a live old task must never share its shell ID with a replacement.
-        self._sessions.pop(shell, None)
-        self._tasks.pop(shell, None)
+        else:
+            release()
 
     async def _after_cleanup(self, shell, cleanup) -> None:
         try:

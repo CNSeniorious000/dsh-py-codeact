@@ -178,6 +178,51 @@ async def cancel_during_replayed_ready(action):
     assert next(frame for frame in runner.frames if frame.get("id") == 2)["repr"] == "42"
 
 
+async def releases_retained_session_after_last_task():
+    runner = MemoryKernel()
+    await runner._handle({"t": "init", "shell": "retained", "tools": []})
+    session = runner._sessions["retained"]
+    gates = [asyncio.Event() for _ in range(3)]
+
+    async def background(gate, resistant):
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                if not resistant:
+                    raise
+                await gate.wait()
+
+    token = kernel._current_session.set(session)
+    tasks = [asyncio.create_task(background(gate, index != 0)) for index, gate in enumerate(gates)]
+    kernel._current_session.reset(token)
+    await asyncio.sleep(0)
+    await runner._handle({"t": "dispose", "shell": "retained"})
+    await runner._closing["retained"]
+    await asyncio.sleep(0)
+    assert tasks[0].cancelled(), "the second cancellation ends the non-resistant finalizer"
+    assert not tasks[1].done() and not tasks[2].done()
+    await runner._handle({"t": "init", "shell": "retained", "tools": []})
+    await runner._handle({"t": "exec", "shell": "retained", "id": 1, "code": "42"})
+    assert runner._sessions["retained"] is session
+    assert not next(frame for frame in runner.frames if frame.get("id") == 1)["ok"]
+    gates[1].set()
+    await asyncio.gather(tasks[1], return_exceptions=True)
+    assert runner._sessions["retained"] is session, "one old task still owns this shell"
+    gates[2].set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert "retained" not in runner._sessions, "finished tasks must not pin the old namespace"
+    assert "retained" not in runner._tasks
+    await runner._handle({"t": "init", "shell": "retained", "tools": [{"name": "fresh", "params": []}]})
+    await runner._handle({"t": "exec", "shell": "retained", "id": 2, "code": "import __dsh__.tools as T; sorted(dir(T))"})
+    await runner._tasks["retained"]
+    result = next(frame for frame in runner.frames if frame.get("id") == 2)
+    assert result["ok"], result
+    assert result["repr"] == "['fresh']"
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -190,6 +235,7 @@ async def main():
         await deferred_init_precedes_new_exec()
         for action in ("interrupt", "dispose"):
             await cancel_during_replayed_ready(action)
+        await releases_retained_session_after_last_task()
     finally:
         loop.set_task_factory(factory)
         sys.stdout, sys.stderr, sys.displayhook = streams
@@ -197,6 +243,7 @@ async def main():
     print("  ok   old cleanup callbacks preserve replacement sessions")
     print("  ok   interrupting a queued cell preserves the old finalizer")
     print("  ok   deferred initialization stays ordered and cancellable during replay")
+    print("  ok   retained sessions are released after their last task ends")
 
 
 if __name__ == "__main__":

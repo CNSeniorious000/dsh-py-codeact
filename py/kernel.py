@@ -916,6 +916,7 @@ class Kernel:
         self._sessions: dict = {}
         self._tasks: dict = {}
         self._cleanups: set = set()
+        self._closing: dict = {}
 
     async def _send(self, frame: dict) -> None:
         # The control descriptor is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
@@ -954,9 +955,6 @@ class Kernel:
     def _task_factory(loop, coro, **kwargs):
         context = kwargs.get("context")
         session = context.get(_current_session) if context is not None else _current_session.get()
-        if session is not None and session.closing:
-            coro.close()
-            raise RuntimeError("Session is closing")
         task = asyncio.Task(coro, loop=loop, **kwargs)
         if session is not None:
             session.tasks.add(task)
@@ -969,12 +967,24 @@ class Kernel:
             tasks.add(running)
         for task in tasks:
             task.cancel()
+        # Finalizers may spawn helpers (gather, wait_for, async resource cleanup). Give those
+        # helpers the same deadline instead of cancelling them before they can release resources.
+        deadline = asyncio.get_running_loop().time() + 2
+        while tasks:
+            await asyncio.wait(tasks, timeout=max(0, deadline - asyncio.get_running_loop().time()))
+            tasks = {task for task in session.tasks | tasks if not task.done()}
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         if tasks:
-            _, pending = await asyncio.wait(tasks, timeout=2)
-            if pending:
-                print(f"[dsh-py-codeact] session {shell!r} retained {len(pending)} task(s) after cancellation", file=REAL_STDERR)
+            for task in tasks:
+                task.cancel()
+            print(f"[dsh-py-codeact] session {shell!r} retained {len(tasks)} task(s) after cancellation", file=REAL_STDERR)
         self._sessions.pop(shell, None)
         self._tasks.pop(shell, None)
+
+    async def _after_cleanup(self, frame, cleanup) -> None:
+        await cleanup
+        await self._handle(frame)
 
     def _busy(self, shell) -> bool:
         running = self._tasks.get(shell)
@@ -1013,6 +1023,15 @@ class Kernel:
     async def _handle(self, frame: dict) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
+        if kind in ("init", "exec"):
+            cleanup = self._closing.get(shell)
+            if cleanup is not None and not cleanup.done():
+                # Replay in arrival order after cleanup; the host may send exec immediately
+                # after init without waiting for ready. Keep reading finalizers' tool results.
+                pending = asyncio.create_task(self._after_cleanup(frame, cleanup))
+                self._cleanups.add(pending)
+                pending.add_done_callback(self._cleanups.discard)
+                return
         if kind == "exec":
             if self._busy(shell) or (shell in self._sessions and self._sessions[shell].closing):
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
@@ -1053,6 +1072,8 @@ class Kernel:
                 session.closing = True
                 # Keep reading result frames while cancellation finalizers await bridged calls.
                 cleanup = asyncio.create_task(self._dispose(shell, session, self._tasks.get(shell)))
+                self._closing[shell] = cleanup
+                cleanup.add_done_callback(lambda _: self._closing.pop(shell, None))
                 self._cleanups.add(cleanup)
                 cleanup.add_done_callback(self._cleanups.discard)
 

@@ -61,6 +61,32 @@ async def rejects_late_tasks():
     assert late_coro.cr_frame is None, "rejection must close the unawaited coroutine"
 
 
+async def preserves_replacement_cleanup():
+    runner = MemoryKernel()
+    await runner._handle({"t": "init", "shell": "race", "tools": []})
+    await runner._handle({"t": "dispose", "shell": "race"})
+    old_cleanup = runner._closing["race"]
+    # Finish disposal without running its queued done callbacks yet.
+    await asyncio.sleep(0)
+    assert old_cleanup.done()
+    assert runner._closing["race"] is old_cleanup
+    await runner._handle({"t": "init", "shell": "race", "tools": []})
+    await runner._handle({"t": "exec", "shell": "race", "id": 1, "code": "import asyncio; await asyncio.sleep(3600)"})
+    await runner._handle({"t": "dispose", "shell": "race"})
+    new_cleanup = runner._closing["race"]
+    # The old callback now runs while the replacement is still cleaning up.
+    await asyncio.sleep(0)
+    assert not new_cleanup.done()
+    assert runner._closing.get("race") is new_cleanup, "old callback removed the replacement's cleanup"
+    await runner._handle({"t": "init", "shell": "race", "tools": []})
+    await runner._handle({"t": "exec", "shell": "race", "id": 2, "code": "42"})
+    await asyncio.gather(*runner._cleanups)
+    await runner._tasks["race"]
+    result = next(frame for frame in runner.frames if frame.get("id") == 2)
+    assert result["ok"], result
+    assert result["repr"] == "42"
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -68,10 +94,12 @@ async def main():
     loop.set_task_factory(kernel.Kernel._task_factory)
     try:
         await rejects_late_tasks()
+        await preserves_replacement_cleanup()
     finally:
         loop.set_task_factory(factory)
         sys.stdout, sys.stderr, sys.displayhook = streams
     print("  ok   disposed sessions cannot spawn tasks from delayed callbacks")
+    print("  ok   old cleanup callbacks preserve replacement sessions")
 
 
 if __name__ == "__main__":

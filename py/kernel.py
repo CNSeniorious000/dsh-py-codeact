@@ -1101,7 +1101,8 @@ class Kernel:
                 # Keep reading result frames while cancellation finalizers await bridged calls.
                 cleanup = asyncio.create_task(self._dispose(shell, session, self._tasks.get(shell)))
                 self._closing[shell] = cleanup
-                cleanup.add_done_callback(lambda _: self._closing.pop(shell, None))
+                # A replacement may register its cleanup before this task's done callbacks run.
+                cleanup.add_done_callback(lambda done: self._closing.pop(shell, None) if self._closing.get(shell) is done else None)
                 self._cleanups.add(cleanup)
                 cleanup.add_done_callback(self._cleanups.discard)
 

@@ -764,6 +764,7 @@ class Session:
         self.shell_id = shell_id
         self.tasks: set = set()
         self.closing = False
+        self.closed = False
         namespace = HintingNamespace()
         # `:memory:` because a bare `InteractiveShell` writes every cell into the USER's own `~/.ipython/profile_default/history.sqlite` — measured at 87 MB / 47k cells here, shared with their interactive ipython, contended by every kernel process at once, and growing with nothing to prune it. Model cell sources have no business in that file; the session log is the audit record. `_ih`, `_` and `Out[n]` all still work, which is what `repr` is built from.
         history = Config()
@@ -956,6 +957,9 @@ class Kernel:
     def _task_factory(loop, coro, **kwargs):
         context = kwargs.get("context")
         session = context.get(_current_session, _current_session.get()) if context is not None else _current_session.get()
+        if session is not None and session.closed:
+            coro.close()
+            raise RuntimeError("Session is closed")
         if context is not None and _current_session not in context and session is not None:
             context = context.copy()
             context.run(_current_session.set, session)
@@ -980,6 +984,8 @@ class Kernel:
             tasks = {task for task in session.tasks | tasks if not task.done()}
             if asyncio.get_running_loop().time() >= deadline:
                 break
+        # A timer can retain this session after its last task ends. Only the cleanup window may spawn helpers.
+        session.closed = True
         if tasks:
             for task in tasks:
                 task.cancel()

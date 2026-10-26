@@ -56,7 +56,7 @@ import sys
 import tempfile
 import traceback
 import types
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dis import get_instructions
 from functools import lru_cache, wraps
 from inspect import isclass
@@ -279,7 +279,9 @@ class Bridge:
                 if not future.done():
                     future.set_exception(exc)
 
-        send = asyncio.create_task(_send_call())
+        context = copy_context()
+        context.run(_current_session.set, None)  # Protocol writes must finish even when their owning session closes.
+        send = asyncio.create_task(_send_call(), context=context)
         send.add_done_callback(self._sends.discard)
         self._sends.add(send)
 
@@ -760,6 +762,9 @@ class Session:
 
     def __init__(self, bridge: Bridge, specs, shell_id: str) -> None:
         self.shell_id = shell_id
+        self.tasks: set = set()
+        self.closing = False
+        self.closed = False
         namespace = HintingNamespace()
         # `:memory:` because a bare `InteractiveShell` writes every cell into the USER's own `~/.ipython/profile_default/history.sqlite` — measured at 87 MB / 47k cells here, shared with their interactive ipython, contended by every kernel process at once, and growing with nothing to prune it. Model cell sources have no business in that file; the session log is the audit record. `_ih`, `_` and `Out[n]` all still work, which is what `repr` is built from.
         history = Config()
@@ -911,6 +916,9 @@ class Kernel:
         # One Session per agent, one in-flight task per Session. Keyed by the shell id the host assigns; a fan-out of subagents lands here as N entries sharing this process, its event loop and its packages.
         self._sessions: dict = {}
         self._tasks: dict = {}
+        self._cleanups: set = set()
+        self._closing: dict = {}
+        self._deferred: dict = {}
 
     async def _send(self, frame: dict) -> None:
         # The control descriptor is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
@@ -944,6 +952,73 @@ class Kernel:
         # Remove INSIDE the callback: a level-triggered selector re-fires a still-registered writer on every poll, and the future's done callbacks are `call_soon`-scheduled — the sender's `finally` above runs two loop batches later, by which time a re-fire would `set_result` on the already-done future.
         asyncio.get_running_loop().remove_writer(PROTOCOL_FD)
         drained.set_result(None)
+
+    @staticmethod
+    def _task_factory(loop, coro, **kwargs):
+        context = kwargs.get("context")
+        session = context.get(_current_session, _current_session.get()) if context is not None else _current_session.get()
+        if session is not None and session.closed:
+            coro.close()
+            raise RuntimeError("Session is closed")
+        if context is not None and _current_session not in context and session is not None:
+            context = context.copy()
+            context.run(_current_session.set, session)
+            kwargs["context"] = context
+        task = asyncio.Task(coro, loop=loop, **kwargs)
+        if session is not None:
+            session.tasks.add(task)
+            task.add_done_callback(session.tasks.discard)
+        return task
+
+    async def _dispose(self, shell, session, tasks) -> None:
+        # Finalizers may spawn helpers (gather, wait_for, async resource cleanup). Give those
+        # helpers the same deadline instead of cancelling them before they can release resources.
+        deadline = asyncio.get_running_loop().time() + 2
+        while tasks:
+            await asyncio.wait(tasks, timeout=max(0, deadline - asyncio.get_running_loop().time()))
+            tasks = {task for task in session.tasks | tasks if not task.done()}
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+        # A timer can retain this session after its last task ends. Only the cleanup window may spawn helpers.
+        session.closed = True
+
+        def release(task=None) -> None:
+            tasks.discard(task)
+            if not tasks and self._sessions.get(shell) is session:
+                self._sessions.pop(shell, None)
+                self._tasks.pop(shell, None)
+
+        if tasks:
+            # The deadline ends the wait, not ownership. Release the namespace when the last remaining task exits.
+            for task in tasks:
+                task.cancel()
+                task.add_done_callback(release)
+            print(f"[dsh-py-codeact] session {shell!r} retained {len(tasks)} task(s) after cancellation", file=REAL_STDERR)
+        else:
+            release()
+
+    async def _after_cleanup(self, shell, cleanup) -> None:
+        try:
+            await cleanup
+            while self._deferred.get(shell):
+                cleanup = self._closing.get(shell)
+                if cleanup is not None and not cleanup.done():
+                    await cleanup
+                    continue
+                # Leave unprocessed frames visible to cancellation while a ready/done write is blocked.
+                await self._handle(self._deferred[shell].pop(0), replay=True)
+        finally:
+            self._deferred.pop(shell, None)
+
+    async def _cancel_deferred(self, shell, *, dispose=False) -> None:
+        frames = self._deferred.get(shell, [])
+        if shell in self._deferred:
+            self._deferred[shell] = [] if dispose else [frame for frame in frames if frame.get("t") != "exec"]
+        for frame in frames:
+            if frame.get("t") == "exec":
+                await self._send(
+                    {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "InterruptedError: deferred cell cancelled", "repr": None, "note": None}
+                )
 
     def _busy(self, shell) -> bool:
         running = self._tasks.get(shell)
@@ -979,11 +1054,24 @@ class Kernel:
             }
         await self._send(frame)
 
-    async def _handle(self, frame: dict) -> None:
+    async def _handle(self, frame: dict, *, replay=False) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
+        if not replay and kind in ("init", "exec"):
+            cleanup = self._closing.get(shell)
+            if shell in self._deferred or (cleanup is not None and not cleanup.done()):
+                # Keep new frames behind the replay even after cleanup finishes.
+                # Replay in arrival order after cleanup; the host may send exec immediately
+                # after init without waiting for ready. Keep reading finalizers' tool results.
+                if shell not in self._deferred:
+                    self._deferred[shell] = []
+                    pending = asyncio.create_task(self._after_cleanup(shell, cleanup))
+                    self._cleanups.add(pending)
+                    pending.add_done_callback(self._cleanups.discard)
+                self._deferred[shell].append(frame)
+                return
         if kind == "exec":
-            if self._busy(shell):
+            if self._busy(shell) or (shell in self._sessions and self._sessions[shell].closing):
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
                 await self._send(
                     {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "kernel busy: a previous cell is still running", "repr": None, "note": None}
@@ -995,13 +1083,17 @@ class Kernel:
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
+            await self._cancel_deferred(shell)
+            # Disposal already cancelled the old cell; interrupting its replacement must not cancel that finalizer again.
+            if shell in self._sessions and self._sessions[shell].closing:
+                return
             # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
             if self._busy(shell):
                 self._tasks[shell].cancel()
         elif kind == "init":
             # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.
             specs = frame.get("tools")
-            if isinstance(specs, list) and not self._busy(shell):
+            if isinstance(specs, list) and not self._busy(shell) and not (shell in self._sessions and self._sessions[shell].closing):
                 self._session_for(shell, specs)
             await self._send(
                 {
@@ -1017,14 +1109,27 @@ class Kernel:
                 }
             )
         elif kind == "dispose":
-            # The agent is gone; cancel any in-flight cell, then drop its shell so its globals can be collected.
-            running = self._tasks.pop(shell, None)
-            if running is not None and not running.done():
-                running.cancel()
-            self._sessions.pop(shell, None)
+            session = self._sessions.get(shell)
+            if session is not None and not session.closing:
+                session.closing = True
+                # Cancel before yielding: a buffered exec may otherwise run before asynchronous cleanup starts.
+                tasks = set(session.tasks)
+                if running := self._tasks.get(shell):
+                    tasks.add(running)
+                for task in tasks:
+                    task.cancel()
+                # Keep reading result frames while cancellation finalizers await bridged calls.
+                cleanup = asyncio.create_task(self._dispose(shell, session, tasks))
+                self._closing[shell] = cleanup
+                # A replacement may register its cleanup before this task's done callbacks run.
+                cleanup.add_done_callback(lambda done: self._closing.pop(shell, None) if self._closing.get(shell) is done else None)
+                self._cleanups.add(cleanup)
+                cleanup.add_done_callback(self._cleanups.discard)
+            await self._cancel_deferred(shell, dispose=True)
 
     async def serve(self) -> None:
         loop = asyncio.get_running_loop()
+        loop.set_task_factory(self._task_factory)
         # The default 64 KiB line limit is far below a real frame: a catalogue of ~40 tools serialises past 80 KB, and a cell carrying a file body is unbounded by nature. Overrunning it raises out of `readline` and takes every shell's namespace with it.
         reader = asyncio.StreamReader(limit=1 << 24)
         await loop.connect_read_pipe(

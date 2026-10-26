@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 import { EventEmitter, once } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
@@ -84,6 +87,8 @@ try {
   }
   // Resolve through the same scrubbed environment as the kernel; CI may set UV_CACHE_DIR only in the ambient environment.
   const interpreter = await checkEnvironment({ ephemeralEnv: false })
+  const lifecycle = await promisify(execFile)(interpreter, [fileURLToPath(new URL('./kernel-lifecycle.py', import.meta.url))], { timeout: 10000 })
+  process.stdout.write(lifecycle.stdout)
   await checkEnvironment({ command: [interpreter, KERNEL_PY] })
   console.log('  ok   configured and non-ephemeral interpreter environments are reported accurately')
 } finally { await host.fiber.dispose() }

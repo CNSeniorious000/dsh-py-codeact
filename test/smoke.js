@@ -1239,6 +1239,33 @@ console.log('shells:')
     await cell('survivor.cancel()\nawait asyncio.gather(survivor, return_exceptions=True)', 'parent')
   })
 
+  for (const action of ['interrupt', 'dispose']) {
+    await checkShell(`${action} cancels a replacement cell queued behind cleanup`, async () => {
+      await shells.start(childTools, 'queued')
+      assert.equal((await cell('import asyncio, contextvars\nimport __dsh__.shared as S\nS.effect = False\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.sleep(0.2)\nS.queued_task = asyncio.create_task(background(), context=contextvars.Context())\nawait asyncio.sleep(0)', 'queued')).ok, true)
+      shells.closeShell('queued')
+      await shells.start(childTools, 'queued')
+      const abort = new AbortController()
+      const pending = shells.exec('import __dsh__.shared as S; S.effect = True', abort.signal, undefined, 'queued')
+      await new Promise(resolve => setTimeout(resolve, 30))
+      if (action === 'interrupt') abort.abort()
+      else shells.closeShell('queued')
+      assert.equal((await pending).ok, false)
+      const state = await cell('await asyncio.sleep(0.3)\n(S.effect, S.queued_task.cancelled())', 'parent')
+      assert.equal(state.repr, '(False, True)')
+    })
+  }
+
+  await checkShell('a cancellation-resistant task prevents shell reuse', async () => {
+    await shells.start(childTools, 'resistant')
+    assert.equal((await cell('import asyncio\nimport __dsh__.shared as S\nS.stop = False\nasync def resist():\n    while not S.stop:\n        try:\n            await asyncio.sleep(0.01)\n        except asyncio.CancelledError:\n            pass\nS.resistant = asyncio.create_task(resist())\nawait asyncio.sleep(0)', 'resistant')).ok, true)
+    shells.closeShell('resistant')
+    await shells.start(childTools, 'resistant')
+    const refused = await cell('42', 'resistant')
+    assert.equal(refused.ok, false)
+    await cell('S.stop = True\nawait S.resistant', 'parent')
+  })
+
   await checkShell('closing one shell leaves the others running', async () => {
     shells.closeShell('child')
     assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)

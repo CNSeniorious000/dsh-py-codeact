@@ -1222,6 +1222,19 @@ console.log('shells:')
     await running
   })
 
+  await checkShell('disposing a shell cancels its detached tasks and runs finalizers', async () => {
+    assert.equal((await cell('survivor = asyncio.create_task(asyncio.sleep(3600))', 'parent')).ok, true)
+    const setup = await cell('import asyncio\nimport __dsh__.shared as S\nS.cleaned = False\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        S.cleaned = True\nS.background = asyncio.create_task(background())\nawait asyncio.sleep(0)', 'child')
+    assert.equal(setup.ok, true)
+    assert.equal((await cell('S.background.done()', 'parent')).repr, 'False')
+    shells.closeShell('child')
+    const result = await cell('async with asyncio.timeout(3):\n    while not S.background.done():\n        await asyncio.sleep(0.01)\n(S.background.cancelled(), S.cleaned)', 'parent')
+    assert.equal(result.ok, true)
+    assert.equal(result.repr, '(True, True)')
+    assert.equal((await cell('survivor.done()', 'parent')).repr, 'False')
+    await cell('survivor.cancel()\nawait asyncio.gather(survivor, return_exceptions=True)', 'parent')
+  })
+
   await checkShell('closing one shell leaves the others running', async () => {
     shells.closeShell('child')
     assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)

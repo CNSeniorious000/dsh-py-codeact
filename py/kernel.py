@@ -995,9 +995,17 @@ class Kernel:
         self._tasks.pop(shell, None)
 
     async def _after_cleanup(self, shell, cleanup) -> None:
-        await cleanup
-        for frame in self._deferred.pop(shell, []):
-            await self._handle(frame)
+        try:
+            await cleanup
+            while self._deferred.get(shell):
+                cleanup = self._closing.get(shell)
+                if cleanup is not None and not cleanup.done():
+                    await cleanup
+                    continue
+                # Leave unprocessed frames visible to cancellation while a ready/done write is blocked.
+                await self._handle(self._deferred[shell].pop(0), replay=True)
+        finally:
+            self._deferred.pop(shell, None)
 
     async def _cancel_deferred(self, shell, *, dispose=False) -> None:
         frames = self._deferred.get(shell, [])
@@ -1043,12 +1051,13 @@ class Kernel:
             }
         await self._send(frame)
 
-    async def _handle(self, frame: dict) -> None:
+    async def _handle(self, frame: dict, *, replay=False) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
-        if kind in ("init", "exec"):
+        if not replay and kind in ("init", "exec"):
             cleanup = self._closing.get(shell)
-            if cleanup is not None and not cleanup.done():
+            if shell in self._deferred or (cleanup is not None and not cleanup.done()):
+                # Keep new frames behind the replay even after cleanup finishes.
                 # Replay in arrival order after cleanup; the host may send exec immediately
                 # after init without waiting for ready. Keep reading finalizers' tool results.
                 if shell not in self._deferred:

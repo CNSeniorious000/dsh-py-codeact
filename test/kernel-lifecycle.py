@@ -119,6 +119,65 @@ async def interrupt_preserves_old_finalizer():
     assert result["repr"] == "42"
 
 
+async def deferred_init_precedes_new_exec():
+    runner = MemoryKernel()
+    await runner._handle({"t": "init", "shell": "catalogue", "tools": []})
+    gate = asyncio.Event()
+    replay = runner._after_cleanup
+
+    async def paused_replay(shell, cleanup):
+        await gate.wait()
+        await replay(shell, cleanup)
+
+    runner._after_cleanup = paused_replay
+    await runner._handle({"t": "dispose", "shell": "catalogue"})
+    await runner._handle({"t": "init", "shell": "catalogue", "tools": [{"name": "expected", "params": []}]})
+    await runner._closing["catalogue"]
+    # Disposal has completed, but its replay has not received another loop turn.
+    await runner._handle({"t": "exec", "shell": "catalogue", "id": 1, "code": "import __dsh__.tools as T; sorted(dir(T))"})
+    gate.set()
+    await asyncio.gather(*runner._cleanups)
+    await runner._tasks["catalogue"]
+    result = next(frame for frame in runner.frames if frame.get("id") == 1)
+    assert result["ok"], result
+    assert result["repr"] == "['expected']", result
+
+
+async def cancel_during_replayed_ready(action):
+    runner = MemoryKernel()
+    await runner._handle({"t": "init", "shell": "backpressure", "tools": []})
+    ready, drain = asyncio.Event(), asyncio.Event()
+    send = runner._send
+
+    async def blocked_send(frame):
+        if frame["t"] == "ready":
+            ready.set()
+            await drain.wait()
+        await send(frame)
+
+    runner._send = blocked_send
+    effects = []
+    sys.modules["__dsh__.shared"].replay_effects = effects
+    await runner._handle({"t": "dispose", "shell": "backpressure"})
+    await runner._handle({"t": "init", "shell": "backpressure", "tools": []})
+    await runner._handle({"t": "exec", "shell": "backpressure", "id": 1, "code": "import __dsh__.shared as S; S.replay_effects.append('ran')"})
+    await ready.wait()
+    await runner._handle({"t": action, "shell": "backpressure"})
+    drain.set()
+    await asyncio.gather(*runner._cleanups)
+    if running := runner._tasks.get("backpressure"):
+        await running
+    cancelled = [frame for frame in runner.frames if frame.get("id") == 1]
+    assert len(cancelled) == 1 and cancelled[0].get("error") == "InterruptedError: deferred cell cancelled", cancelled
+    assert effects == []
+    if action == "dispose":
+        assert "backpressure" not in runner._sessions
+    await runner._handle({"t": "init", "shell": "backpressure", "tools": []})
+    await runner._handle({"t": "exec", "shell": "backpressure", "id": 2, "code": "42"})
+    await runner._tasks["backpressure"]
+    assert next(frame for frame in runner.frames if frame.get("id") == 2)["repr"] == "42"
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -128,12 +187,16 @@ async def main():
         await rejects_late_tasks()
         await preserves_replacement_cleanup()
         await interrupt_preserves_old_finalizer()
+        await deferred_init_precedes_new_exec()
+        for action in ("interrupt", "dispose"):
+            await cancel_during_replayed_ready(action)
     finally:
         loop.set_task_factory(factory)
         sys.stdout, sys.stderr, sys.displayhook = streams
     print("  ok   disposed sessions cannot spawn tasks from delayed callbacks")
     print("  ok   old cleanup callbacks preserve replacement sessions")
     print("  ok   interrupting a queued cell preserves the old finalizer")
+    print("  ok   deferred initialization stays ordered and cancellable during replay")
 
 
 if __name__ == "__main__":

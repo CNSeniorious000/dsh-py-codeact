@@ -87,6 +87,38 @@ async def preserves_replacement_cleanup():
     assert result["repr"] == "42"
 
 
+async def interrupt_preserves_old_finalizer():
+    runner = MemoryKernel()
+    await runner._handle({"t": "init", "shell": "interrupt", "tools": []})
+    started, cleaning, release, released = (asyncio.Event() for _ in range(4))
+    runner._sessions["interrupt"].shell.user_ns.update(started=started, cleaning=cleaning, release=release, released=released)
+    await runner._handle(
+        {
+            "t": "exec",
+            "shell": "interrupt",
+            "id": 1,
+            "code": "started.set()\ntry:\n    await release.wait()\nfinally:\n    cleaning.set()\n    await release.wait()\n    released.set()",
+        }
+    )
+    await started.wait()
+    await runner._handle({"t": "dispose", "shell": "interrupt"})
+    await cleaning.wait()
+    await runner._handle({"t": "init", "shell": "interrupt", "tools": []})
+    await runner._handle({"t": "exec", "shell": "interrupt", "id": 2, "code": "replacement_ran = True"})
+    await runner._handle({"t": "interrupt", "shell": "interrupt"})
+    cancelled = [frame for frame in runner.frames if frame.get("id") == 2]
+    assert len(cancelled) == 1 and not cancelled[0]["ok"], cancelled
+    release.set()
+    await asyncio.gather(*runner._cleanups)
+    assert released.is_set(), "interrupting the queued cell cancelled the old finalizer"
+    assert "replacement_ran" not in runner._sessions["interrupt"].shell.user_ns
+    await runner._handle({"t": "exec", "shell": "interrupt", "id": 3, "code": "42"})
+    await runner._tasks["interrupt"]
+    result = next(frame for frame in runner.frames if frame.get("id") == 3)
+    assert result["ok"], result
+    assert result["repr"] == "42"
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -95,11 +127,13 @@ async def main():
     try:
         await rejects_late_tasks()
         await preserves_replacement_cleanup()
+        await interrupt_preserves_old_finalizer()
     finally:
         loop.set_task_factory(factory)
         sys.stdout, sys.stderr, sys.displayhook = streams
     print("  ok   disposed sessions cannot spawn tasks from delayed callbacks")
     print("  ok   old cleanup callbacks preserve replacement sessions")
+    print("  ok   interrupting a queued cell preserves the old finalizer")
 
 
 if __name__ == "__main__":

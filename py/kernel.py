@@ -1072,6 +1072,9 @@ class Kernel:
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
             await self._cancel_deferred(shell)
+            # Disposal already cancelled the old cell; interrupting its replacement must not cancel that finalizer again.
+            if shell in self._sessions and self._sessions[shell].closing:
+                return
             # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
             if self._busy(shell):
                 self._tasks[shell].cancel()

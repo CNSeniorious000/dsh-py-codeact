@@ -970,12 +970,7 @@ class Kernel:
             task.add_done_callback(session.tasks.discard)
         return task
 
-    async def _dispose(self, shell, session, running) -> None:
-        tasks = set(session.tasks)
-        if running is not None:
-            tasks.add(running)
-        for task in tasks:
-            task.cancel()
+    async def _dispose(self, shell, session, tasks) -> None:
         # Finalizers may spawn helpers (gather, wait_for, async resource cleanup). Give those
         # helpers the same deadline instead of cancelling them before they can release resources.
         deadline = asyncio.get_running_loop().time() + 2
@@ -1114,17 +1109,23 @@ class Kernel:
                 }
             )
         elif kind == "dispose":
-            await self._cancel_deferred(shell, dispose=True)
             session = self._sessions.get(shell)
             if session is not None and not session.closing:
                 session.closing = True
+                # Cancel before yielding: a buffered exec may otherwise run before asynchronous cleanup starts.
+                tasks = set(session.tasks)
+                if running := self._tasks.get(shell):
+                    tasks.add(running)
+                for task in tasks:
+                    task.cancel()
                 # Keep reading result frames while cancellation finalizers await bridged calls.
-                cleanup = asyncio.create_task(self._dispose(shell, session, self._tasks.get(shell)))
+                cleanup = asyncio.create_task(self._dispose(shell, session, tasks))
                 self._closing[shell] = cleanup
                 # A replacement may register its cleanup before this task's done callbacks run.
                 cleanup.add_done_callback(lambda done: self._closing.pop(shell, None) if self._closing.get(shell) is done else None)
                 self._cleanups.add(cleanup)
                 cleanup.add_done_callback(self._cleanups.discard)
+            await self._cancel_deferred(shell, dispose=True)
 
     async def serve(self) -> None:
         loop = asyncio.get_running_loop()

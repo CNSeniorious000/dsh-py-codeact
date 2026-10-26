@@ -82,13 +82,16 @@ async def preserves_replacement_cleanup(runner):
     assert old_cleanup.done()
     assert runner._closing["test"] is old_cleanup
     await runner.send("init")
-    await runner.send("exec", id=1, code="import asyncio; await asyncio.sleep(3600)")
+    effects = []
+    runner._sessions["test"].shell.user_ns["effects"] = effects
+    await runner.send("exec", id=1, code="effects.append('ran')")
     await runner.send("dispose")
     new_cleanup = runner._closing["test"]
     # The old callback now runs while the replacement is still cleaning up.
     await asyncio.sleep(0)
     assert not new_cleanup.done()
     assert runner._closing.get("test") is new_cleanup, "old callback removed the replacement's cleanup"
+    assert effects == [], "a buffered cell ran after its session closed"
     await runner.send("init")
     await runner.send("exec", id=2, code="42")
     await runner.finish()

@@ -25,11 +25,15 @@ if (!tools.renderToolsSdkPy) {
   const agent = { id: session.id, session }
   ctx.tools.register(tools.defineTool({ name: 'probe', description: 'Return the input plus one.', parameters: { value: { type: 'number', required: true } },
     output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }, execute: ({ value }) => value + 1 }))
+  let admitted = true
+  ctx.tools.register(tools.defineTool({ name: 'conditional', description: 'A conditionally admitted tool.', parameters: {}, output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }, execute: () => 42 }), { when: () => admitted })
+  const delegation = { oneOf: ['foreground', 'background', 'continuable'].map((kind) => ({ type: 'object', additionalProperties: false, properties: { kind: { type: 'string', const: kind, required: true } } })) }
+  ctx.tools.register(tools.defineTool({ name: 'delegate', description: 'Conditional delegation.', parameters: {}, output: { schema: delegation, render: () => [] }, execute: () => ({ kind: 'foreground' }) }), { when: () => admitted })
   apply(ctx)
   try {
     assert.deepEqual(describe({ scope: agent }).schemas.map(({ name }) => name), ['python'])
     assert.match(sections.find(({ name }) => name === 'py-codeact:sdk').text({ scope: agent }), /probe/)
-    const run = async (name, args) => (await ctx.tools.execute({ calls: [{ type: 'tool-call', id: `call-${events.length}`, name, arguments: JSON.stringify(args) }], agent, signal: AbortSignal.timeout(30000) })).results[0].result
+    const run = async (name, args, toolSet) => (await ctx.tools.execute({ calls: [{ type: 'tool-call', id: `call-${events.length}`, name, arguments: JSON.stringify(args) }], agent, toolSet, signal: AbortSignal.timeout(30000) })).results[0].result
     const denied = await run('probe', { value: 41 })
     assert.equal(denied.isError, true, 'exclusive mode must deny direct calls to other tools')
     const result = await run('python', { code: 'from __dsh__.tools import probe\nawait probe(value=41)', description: 'Verify nested dispatch' })
@@ -40,6 +44,27 @@ if (!tools.renderToolsSdkPy) {
     const persisted = await run('python', { code: 'probe.__name__', description: 'Verify persistent state' })
     assert.equal(persisted.isError, false, JSON.stringify(persisted))
     assert.match(persisted.value, /probe/)
+    const resolve = () => ctx.tools.resolve({ agent, signal: AbortSignal.timeout(30000) })
+    const allowed = await resolve()
+    const sdk = sections.find(({ name }) => name === 'py-codeact:sdk')
+    const orchestration = sections.find(({ name }) => name === 'py-codeact:orchestration')
+    try {
+      assert.match(sdk.text({ scope: agent, toolSet: allowed }), /conditional/)
+      assert.notEqual(orchestration.text({ scope: agent, toolSet: allowed }), '')
+      const nested = await run('python', { code: 'from __dsh__.tools import conditional\nawait conditional()', description: 'Verify conditional admission' }, allowed)
+      assert.match(nested.value, /42/, JSON.stringify(nested))
+    } finally { allowed.dispose() }
+    admitted = false
+    const blocked = await resolve()
+    try {
+      assert.doesNotMatch(sdk.text({ scope: agent, toolSet: blocked }), /conditional/)
+      assert.equal(orchestration.text({ scope: agent, toolSet: blocked }), '')
+      const hidden = await run('python', { code: 'import __dsh__.tools as T\nhasattr(T, "conditional")', description: 'Verify refreshed bindings' }, blocked)
+      assert.match(hidden.value, /False/, JSON.stringify(hidden))
+      const stale = await run('python', { code: 'await conditional()', description: 'Verify retained alias is denied' }, blocked)
+      assert.doesNotMatch(stale.value, /<return>\s*42/)
+      assert.match(stale.value, /ToolCallError|unknown|not found|not available/i, JSON.stringify(stale))
+    } finally { blocked.dispose() }
     console.log('  ok   new host schemas, exclusive guard, nested dispatch, and persistent Python state')
   } finally {
     await ctx.parallel('dispose')

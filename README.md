@@ -247,6 +247,14 @@ Changing a session’s sandbox mode or effective working directory retires its e
 dsh plugin --profile <name> add dsh-py-codeact
 ```
 
+On DSH 0.2.2 and other hosts with the split tool-executor API, the Python SDK renderer is **required**. Install it alongside the plugin, using the exact version of your DSH host (for example, `0.2.2-rc.1`):
+
+```sh
+dsh plugin --profile <name> add dsh-py-codeact @deepseek-ai/dsh-tool-executor-ptc@<dsh-version>
+```
+
+The renderer peer is optional in package metadata only to preserve legacy hosts, which export the renderer from `dsh-tools` and cannot satisfy the new executor's host peers. Split-API hosts must provide it; a missing renderer produces an explicit installation error. Other import failures retain their original diagnostic.
+
 Then add the row from `example/agent.cordis.yml` to a preset you own.
 
 The kernel provisions its own Python from the PEP 723 header in `py/kernel.py`, so `uv` is the only prerequisite beyond dsh itself; the first cell pays for that resolve and later ones are warm.

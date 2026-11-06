@@ -42,3 +42,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: crate-ci/typos@v1.51.1
+
+  host-executor:
+    name: executor (dsh 0.2.2-rc.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install matching host packages
+        run: |
+          bun -e 'const p = await Bun.file("package.json").json(); for (const name of new Set([...Object.keys(p.devDependencies), ...Object.keys(p.peerDependencies)])) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.2-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.1.0"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          rm bun.lock
+          bun install
+      - run: node test/host-executor.js && node test/renderer-loading.js

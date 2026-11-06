@@ -807,11 +807,11 @@ class Session:
             with contextlib.redirect_stdout(REAL_STDERR), contextlib.redirect_stderr(REAL_STDERR):
                 return original(*args, **kwargs)
 
-        self.shell._showtraceback = wrapper  # noqa: SLF001  # ty: ignore[invalid-assignment]
+        self.shell._showtraceback = wrapper  # noqa: SLF001
 
         # Keep the display hook's bookkeeping — it binds `_`/`Out[n]` and fills `result.result`, which is where `repr` comes from — but drop its `Out[1]: …` echo. That echo goes to stdout, so the model would see every returned value twice, once in <stdout> and once in <return>.
-        self.shell.displayhook.write_output_prompt = lambda: None  # ty: ignore[invalid-assignment]
-        self.shell.displayhook.write_format_data = lambda *_args, **_kwargs: None  # ty: ignore[invalid-assignment]
+        self.shell.displayhook.write_output_prompt = lambda: None
+        self.shell.displayhook.write_format_data = lambda *_args, **_kwargs: None
         # The instructions tell the model to end every cell on the value worth seeing, so `Out[n]` pins one live object per cell — at the default 1000 that is the last 1000 dataframes. Still reachable as `_`/`Out[n]`, just bounded.
         self.shell.displayhook.cache_size = 100
 

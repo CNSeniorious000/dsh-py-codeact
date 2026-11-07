@@ -25,6 +25,9 @@ if (!tools.renderToolsSdkPy) {
   const agent = { id: session.id, session }
   ctx.tools.register(tools.defineTool({ name: 'probe', description: 'Return the input plus one.', parameters: { value: { type: 'number', required: true } },
     output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }, execute: ({ value }) => value + 1 }))
+  ctx.tools.register(tools.defineTool({ name: 'finish_turn', description: 'Conclude only on success.', parameters: { fail: { type: 'boolean', required: true } },
+    output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
+    execute: ({ fail }, exec) => { exec.concludeTurn(); if (fail) throw new Error('terminal tool failed'); return 42 } }))
   let admitted = true
   ctx.tools.register(tools.defineTool({ name: 'conditional', description: 'A conditionally admitted tool.', parameters: {}, output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }, execute: () => 42 }), { when: () => admitted })
   const delegation = { oneOf: ['foreground', 'background', 'continuable'].map((kind) => ({ type: 'object', additionalProperties: false, properties: { kind: { type: 'string', const: kind, required: true } } })) }
@@ -44,6 +47,12 @@ if (!tools.renderToolsSdkPy) {
     const persisted = await run('python', { code: 'probe.__name__', description: 'Verify persistent state' })
     assert.equal(persisted.isError, false, JSON.stringify(persisted))
     assert.match(persisted.value, /probe/)
+    const terminal = await run('python', { code: 'from __dsh__.tools import finish_turn\nawait finish_turn(fail=False)', description: 'Verify nested turn completion' })
+    assert.equal(terminal.isError, false, JSON.stringify(terminal))
+    assert.equal(terminal.concludesTurn, true, 'successful nested terminal tools must conclude the outer turn')
+    const failedTerminal = await run('python', { code: 'await finish_turn(fail=True)', description: 'Verify failed completion is discarded' })
+    assert.match(failedTerminal.value, /terminal tool failed/)
+    assert.equal(failedTerminal.concludesTurn, undefined, 'failed nested tools must not conclude the turn')
     const resolve = () => ctx.tools.resolve({ agent, signal: AbortSignal.timeout(30000) })
     const allowed = await resolve()
     const sdk = sections.find(({ name }) => name === 'py-codeact:sdk')

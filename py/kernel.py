@@ -4,6 +4,7 @@
 # dependencies = [
 #     "ipython~=9.17.0",
 #     "objprint~=0.3.0",
+#     "partial-python>=0.1.0,<0.2",
 # ]
 # # Checked with `TY_UV=scripts ty check py/kernel.py` — that prefix is what hands ty this script's venv. A `ty.toml` would be found and then silently ignored for PEP 723 scripts (astral-sh/ty#4083), so any ty config has to live here.
 # ///
@@ -12,7 +13,9 @@
 
 Each agent has one `InteractiveShell`; only unrestricted sessions may share a long-lived process across a conversation tree. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
 
-Cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
+Whole cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
+
+Streaming cells use `partial_python.Executor` in one owner task. They share the namespace but bypass IPython transformations, history and expression echo. Only a matching successful source finish supplies EOF.
 
 Wire protocol: JSON-lines on the inherited control channel (fd 7 under DSH, fd 3 standalone). stdout/stderr stay free for native writes.
 
@@ -20,6 +23,10 @@ Every frame but `result` and `shutdown` carries `shell` — the agent whose shel
 
   host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","returns","params":[...]}]}
                   {"t":"exec","id":N,"shell":S,"code":"...","tools":[...]}
+                  {"t":"stream_start","id":N,"shell":S,"tools":[...]}
+                  {"t":"stream_append","id":N,"shell":S,"text":"..."}
+                  {"t":"stream_finish","id":N,"shell":S,"source":"..."}
+                  {"t":"stream_abort","id":N,"shell":S,"message":"..."}
                   {"t":"result","id":N,"ok":true,"value":<json>}
                   {"t":"result","id":N,"ok":false,"tool":"read","message":"..."}
                   {"t":"interrupt","shell":S} | {"t":"dispose","shell":S} | {"t":"shutdown"}
@@ -57,6 +64,7 @@ import tempfile
 import traceback
 import types
 from contextvars import ContextVar, copy_context
+from dataclasses import dataclass, field
 from dis import get_instructions
 from functools import lru_cache, wraps
 from inspect import isclass
@@ -115,7 +123,9 @@ def _pipe_system(shell):
         if cmd.rstrip().endswith("&"):
             raise OSError("Background processes not supported.")
         with subprocess.Popen(shell.var_expand(cmd, depth=1), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as process:
-            for chunk in iter(lambda: process.stdout.read(8192), ""):  # ty: ignore[unresolved-attribute]  # stdout=PIPE above, so the pipe is always there
+            output = process.stdout
+            assert output is not None  # stdout=PIPE always supplies the stream.
+            for chunk in iter(lambda: output.read(8192), ""):
                 sys.stdout.write(chunk)
             sys.stdout.flush()
             returncode = process.wait()
@@ -907,6 +917,18 @@ class Session:
 # ── kernel loop ──────────────────────────────────────────────────────────────
 
 
+@dataclass
+class SourceStream:
+    id: int
+    queue: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
+    parts: list[str] = field(default_factory=list)
+    size: int = 0
+    closed: bool = False
+    error: str | None = None
+    started: bool = False
+    replied: bool = False
+
+
 class Kernel:
     def __init__(self) -> None:
         self._out = os.fdopen(PROTOCOL_FD, "wb", buffering=0)
@@ -919,6 +941,8 @@ class Kernel:
         self._cleanups: set = set()
         self._closing: dict = {}
         self._deferred: dict = {}
+        self._streams: dict[str, SourceStream] = {}
+        self._last_stream_ids: dict[str, int] = {}
 
     async def _send(self, frame: dict) -> None:
         # The control descriptor is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
@@ -1013,9 +1037,11 @@ class Kernel:
     async def _cancel_deferred(self, shell, *, dispose=False) -> None:
         frames = self._deferred.get(shell, [])
         if shell in self._deferred:
-            self._deferred[shell] = [] if dispose else [frame for frame in frames if frame.get("t") != "exec"]
+            self._deferred[shell] = [] if dispose else [frame for frame in frames if frame.get("t") != "exec" and not str(frame.get("t")).startswith("stream_")]
         for frame in frames:
-            if frame.get("t") == "exec":
+            if frame.get("t") == "stream_start" and isinstance(exec_id := frame.get("id"), int):
+                self._last_stream_ids[shell] = max(exec_id, self._last_stream_ids.get(shell, 0))
+            if frame.get("t") in ("exec", "stream_start"):
                 await self._send(
                     {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "InterruptedError: deferred cell cancelled", "repr": None, "note": None}
                 )
@@ -1054,10 +1080,69 @@ class Kernel:
             }
         await self._send(frame)
 
+    def _abort_stream(self, shell, message: str) -> None:
+        state = self._streams.get(shell)
+        if state is None:
+            return
+        if state.error is not None:
+            return  # Repeated abort frames must not cancel an asynchronous finalizer again.
+        state.error = message
+        state.closed = True
+        state.queue.put_nowait(None)
+        # Cancelling a task before its first step skips its finally block and the done frame.
+        # Let an unstarted owner observe the error itself instead.
+        if state.started and self._busy(shell):
+            self._tasks[shell].cancel()
+
+    async def _exec_stream(self, exec_id, shell, state: SourceStream) -> None:
+        from partial_python import Executor
+
+        state.started = True
+        session = self._session_for(shell)
+        redundant = []
+        session_token = _current_session.set(session)
+        hint_token = _redundant_imports.set(redundant)
+
+        async def chunks():
+            while True:
+                if state.error is not None:
+                    raise RuntimeError(state.error)
+                delta = await state.queue.get()
+                if state.error is not None:
+                    raise RuntimeError(state.error)
+                if delta is None:
+                    return
+                yield delta
+
+        try:
+            # One owner and capture for the logical cell: parser flushes must not reset
+            # task-local tool routing, output, or the lifetime of detached Python tasks.
+            error = None
+            with session._capture() as captured:  # noqa: SLF001 — the kernel owns the Session capture lifecycle
+                try:
+                    async with contextlib.aclosing(Executor(session.shell.user_ns).stream(chunks())) as events:
+                        async for _ in events:
+                            pass
+                except BaseException as exc:  # noqa: BLE001 — user code must produce a done frame even for SystemExit
+                    error = state.error or (
+                        "InterruptedError: the harness cancelled this streaming cell. Earlier effects remain."
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                    )
+            stdout, stderr = captured
+            frame = {"t": "done", "id": exec_id, "shell": shell, "ok": error is None, "stdout": stdout, "stderr": stderr, "repr": None, "error": error, "note": format_import_hint(redundant)}
+        finally:
+            _redundant_imports.reset(hint_token)
+            _current_session.reset(session_token)
+            if self._streams.get(shell) is state:
+                self._streams.pop(shell, None)
+        state.replied = True
+        await self._send(frame)
+
     async def _handle(self, frame: dict, *, replay=False) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
-        if not replay and kind in ("init", "exec"):
+        if not replay and kind in ("init", "exec", "stream_start", "stream_append", "stream_finish", "stream_abort"):
             cleanup = self._closing.get(shell)
             if shell in self._deferred or (cleanup is not None and not cleanup.done()):
                 # Keep new frames behind the replay even after cleanup finishes.
@@ -1070,7 +1155,11 @@ class Kernel:
                     pending.add_done_callback(self._cleanups.discard)
                 self._deferred[shell].append(frame)
                 return
-        if kind == "exec":
+        if kind in ("exec", "stream_start"):
+            if kind == "stream_start":
+                exec_id = frame.get("id")
+                if type(exec_id) is not int or exec_id <= self._last_stream_ids.get(shell, 0):
+                    return  # Host execution ids increase per shell; retain one replay watermark.
             if self._busy(shell) or (shell in self._sessions and self._sessions[shell].closing):
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
                 await self._send(
@@ -1079,7 +1168,53 @@ class Kernel:
                 return
             specs = frame.get("tools")
             self._session_for(shell, specs if isinstance(specs, list) else None)
-            self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
+            if kind == "exec":
+                self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
+            else:
+                exec_id = frame.get("id")
+                assert isinstance(exec_id, int)  # Validated before the busy/rebind checks.
+                state = SourceStream(exec_id)
+                self._streams[shell] = state
+                self._last_stream_ids[shell] = exec_id
+                task = self._tasks[shell] = asyncio.create_task(self._exec_stream(exec_id, shell, state))
+
+                def stream_finished(done, state: SourceStream = state):
+                    error = None
+                    if done.cancelled() and not state.started:
+                        error = "InterruptedError: streaming cell cancelled before execution"
+                    elif not done.cancelled() and (exc := done.exception()) is not None:
+                        error = f"KernelError: streaming execution failed internally: {type(exc).__name__}: {exc}"
+                    if error is not None and not state.replied:
+                        state.replied = True
+                        if self._streams.get(shell) is state:
+                            self._streams.pop(shell, None)
+                        reply = asyncio.create_task(self._send({"t": "done", "id": exec_id, "shell": shell, "ok": False, "stdout": "", "stderr": "", "repr": None, "note": None, "error": error}))
+                        self._cleanups.add(reply)
+                        reply.add_done_callback(self._cleanups.discard)
+
+                task.add_done_callback(stream_finished)
+        elif kind in ("stream_append", "stream_finish", "stream_abort"):
+            state = self._streams.get(shell)
+            if state is None or state.id != frame.get("id"):
+                return  # Late frames from a finished/aborted source cannot affect the next cell.
+            if kind == "stream_abort":
+                self._abort_stream(shell, frame.get("message") or "SourceError: generation did not complete")
+            elif state.closed:
+                self._abort_stream(shell, "SourceProtocolError: source already closed")
+            elif kind == "stream_append":
+                text = frame.get("text")
+                size = len(text.encode("utf-8", errors="surrogatepass")) if isinstance(text, str) else 0
+                if not isinstance(text, str) or state.size + size > 2 << 20:
+                    self._abort_stream(shell, "SourceProtocolError: invalid or oversized source delta")
+                elif text:
+                    state.parts.append(text)
+                    state.size += size
+                    state.queue.put_nowait(text)
+            elif frame.get("source") != "".join(state.parts):
+                self._abort_stream(shell, "SourceProtocolError: final source differs from accepted deltas")
+            else:
+                state.closed = True
+                state.queue.put_nowait(None)
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
@@ -1088,7 +1223,9 @@ class Kernel:
             if shell in self._sessions and self._sessions[shell].closing:
                 return
             # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
-            if self._busy(shell):
+            if shell in self._streams:
+                self._abort_stream(shell, "InterruptedError: the harness cancelled this streaming cell. Earlier effects remain.")
+            elif self._busy(shell):
                 self._tasks[shell].cancel()
         elif kind == "init":
             # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.

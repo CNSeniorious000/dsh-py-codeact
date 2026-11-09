@@ -18,6 +18,8 @@ jobs:
       # `TY_UV=scripts` is what hands ty the script's own PEP 723 environment; without it the IPython imports are unresolved and the run is meaningless rather than failing.
       - name: Check typing
         run: TY_UV=scripts uvx ty check py/kernel.py
+      - name: Check streaming worker lifecycle
+        run: uv run --script test/streaming-kernel.py
 
   smoke:
     name: smoke (${{ matrix.os }})
@@ -44,8 +46,12 @@ jobs:
       - uses: crate-ci/typos@v1.51.1
 
   host-executor:
-    name: executor (dsh 0.2.2-rc.1)
-    runs-on: ubuntu-latest
+    name: executor + streaming (dsh 0.2.2-rc.1, ${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu, macos]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.2
@@ -59,3 +65,4 @@ jobs:
           rm bun.lock
           bun install
       - run: node test/host-executor.js && node test/renderer-loading.js
+      - run: bun run test:streaming

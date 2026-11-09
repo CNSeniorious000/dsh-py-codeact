@@ -59,6 +59,18 @@ jobs:
           bun run test
           TY_UV=scripts uvx ty check py/kernel.py
 
+      - name: Check streaming on dsh 0.2.2-rc.1
+        run: |
+          stream_dir="$(mktemp -d "$RUNNER_TEMP/dsh-py-codeact-stream.XXXXXX")"
+          trap 'rm -rf "$stream_dir"' EXIT
+          git archive HEAD | tar -x -C "$stream_dir"
+          cd "$stream_dir"
+          bun -e 'const p = await Bun.file("package.json").json(); for (const name of new Set([...Object.keys(p.devDependencies), ...Object.keys(p.peerDependencies)])) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.2-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.1.0"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          rm bun.lock
+          bun install
+          bun run test:streaming
+          uv run --script test/streaming-kernel.py
+
       # What ships is what CI already gates on, run again here: a release must not be the one
       # artifact nobody checked. The suite spawns the real kernel, hence uv above.
       - run: bun run test

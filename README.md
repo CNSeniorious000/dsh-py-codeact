@@ -211,6 +211,26 @@ Sub-dispatches carry the outer execution's `parent` token, so they re-enter the 
 - **Tagged observations.** `<stdout>`, `<stderr>`, `<return>`, `<traceback>`, `<note>` — with four things possibly present at once, the model needs to know which is which. A plain successful value stays bare.
 - **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the list — `mcp` rather than the hundred flat names under it, matching what the block printed — then `dir(mcp)` and `dir(mcp.<server>)` for those, and `%whos` for its own bindings. `__all__` is left alone: it is what `import *` binds, not what the model is shown — so it carries every flat name the listings drop, and `ToolCallError`, which no listing shows because it is not a tool but which `except ToolCallError` needs after an `import *`. What it introspects matches what the block showed it: the listing carries `mcp` rather than the hundred flat names under it, and an optional parameter renders `= ...` there as it does here — `inspect.signature` uses `repr`, and `repr(...)` is `Ellipsis`, which is what `read?` used to say.
 
+## Streaming execution
+
+Set `streaming: true` on the plugin row to execute stable Python statements while the model is still generating its tool arguments. Streaming requires DSH 0.2.2 or later, `mode: code`, and session persistence. The default remains whole-cell IPython execution.
+
+```yaml
+- name: dsh-py-codeact
+  config:
+    streaming: true
+```
+
+The plugin reads the same `agent/assistant-stream` events as the WebUI. [partial-python](https://github.com/promplate/partial-python) executes each stable statement once in the existing namespace; the final tool invocation joins that execution. No host patch is needed. Source admission passes through the normal tool policy pipeline and is persisted before execution; bridged tools retain the step's tool set, sandbox policy, and approval checks. Streaming admission authorizes code that is still arriving, so retain whole-cell mode when approval must inspect the complete program.
+
+Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies must cover this capability as well as the final `python` call; approving the final call cannot undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
+
+Streaming uses raw Python with top-level `await`. Use `print(...)` for output and `help(...)` for introspection; IPython magics, shell escapes, history updates, and automatic final-expression echo are unavailable. Stable statements inside `if`, `with`, and `async with` may run before the block closes. Loops, `try`, function definitions, and other unsupported compound kinds wait for their complete statement. Open contexts span source generation: time spent waiting for tokens counts toward `asyncio.timeout()`, and locks or transactions may stay open longer.
+
+Truncation, malformed arguments, disconnects, and cancellation abort pending source and unwind open contexts before the step settles. Earlier effects remain; the plugin never reruns the source to recover or automatically retries a model attempt after execution starts. CPU-bound code still uses the kernel's interrupt escalation. A restored admission with no conclusive result is reported to the model as an unknown outcome, not as proof that nothing ran; interpreter memory is not restored.
+
+One streamed Python call is supported per response. Other direct tools remain unavailable in exclusive CodeAct mode. The generated tool description and SDK instructions explain these rules to the model. A configured `python` or `command` interpreter must supply `partial-python>=0.1.0,<0.2` as well as IPython and objprint; the default `uv` setup installs them from the worker's PEP 723 metadata.
+
 ## Cancellation
 
 An aborted turn sends an in-band `interrupt` frame, cancelling the running cell at any `await` point. `run_cell_async` catches the `CancelledError` itself, so the model is told plainly (`InterruptedError: the harness cancelled this cell. State is intact; the cell did not finish.`) rather than handed a raw traceback it might read as a bug in its own code. The session and every binding survive.
@@ -255,17 +275,23 @@ dsh plugin --profile <name> add dsh-py-codeact @deepseek-ai/dsh-tool-executor-pt
 
 The renderer peer is optional in package metadata only to preserve legacy hosts, which export the renderer from `dsh-tools` and cannot satisfy the new executor's host peers. Split-API hosts must provide it; a missing renderer produces an explicit installation error. Other import failures retain their original diagnostic.
 
-Then add the row from `example/agent.cordis.yml` to a preset you own.
+On DSH 0.2.2, add the row from `example/agent.cordis.yml` to an owned `@deepseek-ai/dsh-agent-preset` declaration's `config.plugins` through a profile bundle patch. Inspect the existing composition first and retain its realms, tools, sandbox, and approval providers. The registry accepts declarative plugin rows; it does not scan preset directories or provide `copy()`.
+
+Headless is preset-free. Insert the row directly into its profile overlay and disable the existing `tool-executor-native` row; each scope allows one executor. Keep the normal headless services. Streaming additionally needs `sessions`, `sessionProjections`, and `llm`; the plugin follows those services' lifecycle and waits for persistence before executing source.
 
 The kernel provisions its own Python from the PEP 723 header in `py/kernel.py`, so `uv` is the only prerequisite beyond dsh itself; the first cell pays for that resolve and later ones are warm.
 
-**For the card, also list the package in the profile's `dsh.profile.bundles`** (`~/.dsh/profiles/<name>/package.json`). The browser bundle is served only for packages named by an *enabled Loader entry*, and a preset's rows are per-session — they are not in the profile's entry list at boot, so a preset-only mount never gets its card. This package's own `cordis.patch.yml` therefore inserts one profile-level row carrying `uiOnly: true`, which makes the host half a no-op there: mounting it at profile level would register `python` globally and apply exclusive mode's guard to every preset. Never edit a shipped preset — copy it first (`ctx.agentPresets.copy('standard', 'py-codeact')`) and mount-validate the result with `standingKeyFor('py-codeact')`.
+**For the card, also list the package in the profile's `dsh.profile.bundles`** (`~/.dsh/profiles/<name>/package.json`). The browser bundle is served only for packages named by an enabled Loader entry. This package's `cordis.patch.yml` inserts a profile-level row with `uiOnly: true` to load the card without registering an executor globally. Keep execution in the selected preset's composition; only preset-free hosts such as headless should mount the executor at profile level.
 
 ## Verified end to end
 
 Against `Macaron V1 Venti` on a real dsh session. Given a plain task — "read this CSV and tell me which region earned most", with no mention of Python or the module — the model imported from `__dsh__.tools`, ran the cell, and answered with a table. The request carried exactly one tool schema (`python`); all 33 others were reachable only from inside the cell, and the bridged `read` appears as a `SUBTOOL` row under the `python` call in the trajectory tab. A `headless` run completes and exits in ~11s.
 
+Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged effects occurred before provider completion, each ran once, a second call reused the namespace, and the persisted session restored its recovery notice. The same task in whole-cell mode produced effects only after generation finished.
+
 ## Test
+
+`bun run test` covers the minimum supported host. `bun run test:streaming` requires a matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams. CI installs each host set separately.
 
 ```sh
 node test/smoke.js

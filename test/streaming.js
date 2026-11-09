@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { defineTool, ToolBatchExecutionError } from '@deepseek-ai/dsh-tools'
+import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { createHost } from './streaming-fixture.js'
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -276,6 +276,46 @@ await scenario('admitted-provider-error-vetoes-retry', {
   assert.deepEqual(effects.map(({ value }) => value), ['retained'])
 })
 
+for (const mode of ['adapter', 'middleware']) {
+  let effect, flushes = 0, retryCalls = 0
+  const original = mode === 'adapter' ? 'ORIGINAL_PROVIDER_FAILURE' : 'ORIGINAL_MIDDLEWARE_FAILURE'
+  await scenario(`${mode}-error-survives-cleanup-flush-failures`, {
+    setup({ ctx }) {
+      ctx.on('session/flush', () => { if ([2, 3].includes(++flushes)) throw new Error(`storage failed ${flushes}`) })
+      ctx.on('agent/request-error', () => { retryCalls++; return { kind: 'retry' } })
+      if (mode === 'middleware') ctx.on('llm/stream', async function* (_options, next) {
+        for await (const chunk of next()) {
+          if (chunk.type === 'finish' && chunk.reason.kind === 'error') throw new Error(original)
+          yield chunk
+        }
+      })
+    },
+    async *stream(_request, attempt) {
+      if (attempt === 1) {
+        yield delta('{"description":"Fail after one effect","code":"' + encode("from __dsh__.tools import probe\nprefix_count = globals().get('prefix_count', 0) + 1\nawait probe(value='retained')\n"))
+        await effect('retained')
+        throw new LlmError('ORIGINAL_PROVIDER_FAILURE', 'PROVIDER_FIXTURE_FAILURE', { status: 503, requestId: 'original-request' })
+      }
+      yield delta(JSON.stringify({ code: "print('PREFIX_COUNT', prefix_count)\nawait probe(value='next')\n", description: 'Continue after storage recovers' }), 'python-2')
+      yield finish()
+    },
+  }, async ({ host, effects, observed }) => {
+    effect = observed
+    await assert.rejects(host.run({ signal: AbortSignal.timeout(15000) }), { message: original })
+    assert.equal(host.requests, 1)
+    assert.deepEqual(effects.map(({ value }) => value), ['retained'])
+    if (mode === 'adapter') assert.deepEqual(host.events.findLast(event => event.type === 'turn/end').data.reason.error,
+      { message: original, code: 'PROVIDER_FIXTURE_FAILURE', status: 503, requestId: 'original-request' })
+    await host.run({ signal: AbortSignal.timeout(15000) })
+    assert.equal(host.requests, 2)
+    assert.equal(retryCalls, 0)
+    assert.deepEqual(effects.map(({ value }) => value), ['retained', 'next'])
+    const result = host.events.findLast(event => event.type === 'tool/result').data.message
+    assert.equal(result.isError, false)
+    assert.match(JSON.stringify(result.content), /PREFIX_COUNT 1/)
+  })
+}
+
 let contextEffect
 await scenario('open-context-unwinds-on-provider-disconnect', {
   async *stream(_request, attempt) {
@@ -400,6 +440,64 @@ for (const failures of [[2], [2, 3]]) {
     const result = host.events.findLast(event => event.type === 'tool/result').data.message
     assert.equal(result.isError, true)
     assert.match(JSON.stringify(result.content), /storage failed/)
+  })
+}
+
+for (const mode of ['denied', 'cancel-before-dispatch', 'cancel-after-commit', 'post-policy-block', 'batch-log-failure']) {
+  let accepted, attachments = 0
+  const marker = 'Context accepted before final dispatch'
+  await scenario(`accepted-context-after-${mode}`, {
+    setup({ ctx }) {
+      ctx.tools.register(defineTool({ name: 'attach_context', description: 'Attach accepted context.', parameters: {},
+        output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+        execute(_args, exec) {
+          attachments++
+          exec.deferContext(createUserMessage({ source: { kind: 'streaming-test' }, content: [{ type: 'text', text: marker }] }))
+          return 'attached'
+        } }))
+      if (mode === 'denied' || mode === 'batch-log-failure') ctx.tools.guard(exec => exec.name === 'python' ? 'final dispatch denied' : undefined)
+      if (mode === 'cancel-before-dispatch') ctx.on('tools/pre-execute', async (exec, next) => { if (exec.name === 'python') exec.agent.cancel({ kind: 'user' }); return next() })
+      if (mode === 'cancel-after-commit') ctx.on('agent/assistant-stream', ({ agent, frame }) => { if (frame.type === 'end' && frame.outcome.kind === 'committed') agent.cancel({ kind: 'user' }) })
+      if (mode === 'post-policy-block') ctx.on('tools/post-execute', (exec, _result, next) => exec.name === 'python' ? { kind: 'block', feedback: [{ type: 'text', text: 'final output blocked' }] } : next())
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe, attach_context\nawait attach_context()\nawait probe(value='accepted')\n", description: 'Preserve earlier accepted context' }))
+      await accepted('accepted')
+      yield finish()
+    },
+  }, async ({ host, effects, observed }) => {
+    accepted = observed
+    const append = host.session.append, execute = host.ctx.tools.execute, failure = new Error('injected result commit failure')
+    let batchError
+    if (mode === 'batch-log-failure') {
+      host.session.append = function (type, ...args) {
+        if (type === 'tool/result') { host.session.append = append; throw failure }
+        return append.call(this, type, ...args)
+      }
+      host.ctx.tools.execute = async function (input) {
+        try { return await execute.call(this, input) }
+        catch (error) { if (input.log) batchError = error; throw error }
+      }
+    }
+    try {
+      const running = host.run({ signal: AbortSignal.timeout(15000) })
+      if (mode === 'batch-log-failure') await assert.rejects(running, /injected result commit failure/)
+      else await running
+      assert.deepEqual(effects.map(({ value }) => value), ['accepted'])
+      assert.equal(attachments, 1)
+      const inserted = host.events.filter(event => event.type === 'agent/inbox/spliced').flatMap(event => event.data.inserted ?? [])
+      assert.equal(inserted.filter(message => JSON.stringify(message).includes(marker)).length, mode === 'post-policy-block' ? 0 : 1)
+      if (mode === 'batch-log-failure') {
+        assert.ok(batchError instanceof ToolBatchExecutionError)
+        assert.equal(batchError.cause, failure)
+        assert.deepEqual(batchError.partial.results, [])
+        assert.equal(batchError.partial.concluded, false)
+        assert.equal(batchError.partial.additionalContexts.length, 1)
+      }
+    } finally {
+      host.session.append = append
+      host.ctx.tools.execute = execute
+    }
   })
 }
 

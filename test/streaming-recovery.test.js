@@ -204,7 +204,7 @@ test('restored recovery distinguishes empty output, failed output and an absent 
       [{ result: { isError: false, content: [{ type: 'image', attachment: { attachmentId: 'fixture-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } }] } }, completed],
       [{ result: { isError: true, content: [] } }, failed],
       [{}, missing],
-      [{ error: '' }, missing],
+      [{ error: '' }, failed],
     ]
     for (const [index, [data, expected]] of cases.entries()) {
       const session = env.ctx.sessions.create(`empty-output-${index}`, { meta: { cwd: process.cwd() } })

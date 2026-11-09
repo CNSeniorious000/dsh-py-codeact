@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { createHost } from './streaming-fixture.js'
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -204,6 +205,45 @@ await scenario('cancel-while-awaiting-source', {
   assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
 })
 
+for (const phase of ['admission', 'execution']) {
+  const waiting = Promise.withResolvers(), release = Promise.withResolvers()
+  let flushes = 0
+  await scenario(`structured-cancellation-during-${phase}`, {
+    setup({ ctx }) {
+      if (phase === 'admission') ctx.on('session/flush', async () => { if (++flushes === 1) { waiting.resolve(); await release.promise } })
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nimport asyncio\nawait probe(value='before-cancel')\nawait asyncio.sleep(30)\n", description: 'Handle structured cancellation' }))
+      yield finish()
+    },
+  }, async ({ host, effects, observed }) => {
+    const running = host.run({ signal: AbortSignal.timeout(15000) })
+    try {
+      if (phase === 'admission') await waiting.promise
+      else {
+        await observed('before-cancel')
+        await pause(20)
+        assert.ok(host.events.some(event => event.type === 'assistant/message'), 'the final call must already be committed')
+      }
+      host.agent.cancel({ kind: 'user' })
+      release.resolve()
+      assert.equal((await running).kind, 'aborted')
+      const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+      const result = host.events.findLast(event => event.type === 'tool/result')
+      assert.doesNotMatch(JSON.stringify([notice, result]), /\[object Object\]/)
+      if (phase === 'admission') {
+        assert.deepEqual(effects, [])
+        assert.match(notice.data.source.outcome, /InterruptedError:.*cancelled.*Earlier effects remain/)
+      } else {
+        assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
+        assert.equal(result.data.message.isError, true)
+        assert.match(JSON.stringify(result.data.message.content), /InterruptedError:.*cancelled.*Earlier effects remain/)
+        assert.match(notice.data.source.outcome, /aborted/)
+      }
+    } finally { release.resolve() }
+  })
+}
+
 await scenario('stream-admission-denial-never-falls-back', {
   setup({ ctx }) { ctx.tools.guard(exec => exec.name === 'python_stream' ? 'stream admission denied' : undefined) },
   async *stream() {
@@ -321,7 +361,10 @@ await scenario('persistence-failure-does-not-poison-next-turn', {
     yield finish()
   },
 }, async ({ host, effects }) => {
-  await assert.rejects(host.run({ signal: AbortSignal.timeout(15000) }), /temporary persistence failure 2/)
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  const failed = host.events.findLast(event => event.type === 'tool/result').data.message
+  assert.equal(failed.isError, true)
+  assert.match(JSON.stringify(failed.content), /temporary persistence failure 2/)
   assert.deepEqual(effects, [], 'failed admission must not execute source')
   await host.run({ signal: AbortSignal.timeout(15000) })
   assert.equal(host.requests, 2)
@@ -329,6 +372,36 @@ await scenario('persistence-failure-does-not-poison-next-turn', {
   assert.equal(host.events.findLast(event => event.type === 'tool/result').data.message.isError, false)
   assert.ok(recoveryFlushes >= 4)
 })
+
+for (const failures of [[2], [2, 3]]) {
+  let flushes = 0, attachments = 0
+  const marker = 'Accepted context survives storage failure'
+  await scenario(`accepted-context-survives-${failures.length}-result-flush-failures`, {
+    setup({ ctx }) {
+      ctx.on('session/flush', () => { if (failures.includes(++flushes)) throw new Error(`storage failed ${flushes}`) })
+      ctx.tools.register(defineTool({ name: 'attach_context', description: 'Attach accepted context.', parameters: {},
+        output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+        execute(_args, exec) {
+          attachments++
+          exec.deferContext(createUserMessage({ source: { kind: 'streaming-test' }, content: [{ type: 'text', text: marker }] }))
+          return 'attached'
+        } }))
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe, attach_context\nawait probe(value='once')\nawait attach_context()\n", description: 'Preserve accepted context on failure' }))
+      yield finish()
+    },
+  }, async ({ host, effects }) => {
+    await host.run({ signal: AbortSignal.timeout(15000) })
+    assert.deepEqual(effects.map(({ value }) => value), ['once'])
+    assert.equal(attachments, 1)
+    const inserted = host.events.filter(event => event.type === 'agent/inbox/spliced').flatMap(event => event.data.inserted ?? [])
+    assert.equal(inserted.filter(message => JSON.stringify(message).includes(marker)).length, 1)
+    const result = host.events.findLast(event => event.type === 'tool/result').data.message
+    assert.equal(result.isError, true)
+    assert.match(JSON.stringify(result.content), /storage failed/)
+  })
+}
 
 await scenario('accepted-content-survives-final-join', {
   setup({ ctx }) {

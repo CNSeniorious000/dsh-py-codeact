@@ -176,6 +176,50 @@ test('native notices preserve model-visible admission and settlement across fork
   } finally { await env.close() }
 })
 
+test('bounded recovery notices preserve Unicode through persistence and provider encoding', async () => {
+  const env = await environment()
+  try {
+    for (const offset of [3998, 3999, 4000]) for (const failure of [false, true]) {
+      const session = env.ctx.sessions.create(`unicode-${offset}-${failure}`, { meta: { cwd: process.cwd() } })
+      const text = 'x'.repeat(offset) + '😀tail', expected = 'x'.repeat(offset) + (offset === 3998 ? '😀' : '')
+      record(session, 'start')
+      record(session, 'result', failure ? { error: text } : { result: { content: [{ type: 'text', text }] } })
+      const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
+      const restored = Session.create(saved.header.id, saved.events, saved.header)
+      const notice = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
+      assert.equal(notice.source.outcome.isWellFormed(), true, 'truncation must not create an unpaired surrogate')
+      assert.equal(notice.source.outcome, expected)
+      assert.equal(Buffer.from(notice.content[0].text, 'utf8').toString('utf8'), notice.content[0].text)
+    }
+  } finally { await env.close() }
+})
+
+test('restored recovery distinguishes empty output, failed output and an absent result', async () => {
+  const env = await environment()
+  try {
+    const completed = 'Execution completed without textual output.', failed = 'Execution failed without textual output.', missing = 'Execution settled without a recorded result'
+    const cases = [
+      [{ result: { isError: false, content: [] } }, completed],
+      [{ result: { isError: false, content: [{ type: 'text', text: '' }] } }, completed],
+      [{ result: { isError: false, content: [{ type: 'image', attachment: { attachmentId: 'fixture-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } }] } }, completed],
+      [{ result: { isError: true, content: [] } }, failed],
+      [{}, missing],
+      [{ error: '' }, missing],
+    ]
+    for (const [index, [data, expected]] of cases.entries()) {
+      const session = env.ctx.sessions.create(`empty-output-${index}`, { meta: { cwd: process.cwd() } })
+      record(session, 'start')
+      record(session, 'result', data)
+      const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
+      const restored = Session.create(saved.header.id, saved.events, saved.header)
+      const notice = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
+      assert.equal(notice.source.outcome, expected)
+      assert.ok(notice.content[0].text.endsWith(expected))
+      assert.ok(env.recovery.context(restored).endsWith(expected))
+    }
+  } finally { await env.close() }
+})
+
 test('authoritative Python arguments compare decoded values while rejecting ambiguous JSON', () => {
   const expected = hashDecodedArguments({ code: 'print("你好")\n', description: 'Print' })
   assert.equal(hashArguments('{ "description": "Print", "code": "print(\\"你好\\")\\n" }'), expected)

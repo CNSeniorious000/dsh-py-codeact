@@ -313,6 +313,23 @@ await scenario('missing-persistence-refuses-early-effects', {
   assert.deepEqual(effects, [])
 })
 
+let recoveryFlushes = 0
+await scenario('persistence-failure-does-not-poison-next-turn', {
+  setup({ ctx }) { ctx.on('session/flush', () => { if (++recoveryFlushes <= 2) throw new Error(`temporary persistence failure ${recoveryFlushes}`) }) },
+  async *stream(_request, attempt) {
+    yield delta(JSON.stringify({ code: `from __dsh__.tools import probe\nawait probe(value='turn-${attempt}')\n`, description: 'Recover after persistence returns' }), `python-${attempt}`)
+    yield finish()
+  },
+}, async ({ host, effects }) => {
+  await assert.rejects(host.run({ signal: AbortSignal.timeout(15000) }), /temporary persistence failure 2/)
+  assert.deepEqual(effects, [], 'failed admission must not execute source')
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.equal(host.requests, 2)
+  assert.deepEqual(effects.map(({ value }) => value), ['turn-2'])
+  assert.equal(host.events.findLast(event => event.type === 'tool/result').data.message.isError, false)
+  assert.ok(recoveryFlushes >= 4)
+})
+
 await scenario('accepted-content-survives-final-join', {
   setup({ ctx }) {
     ctx.on('tools/post-execute', async (exec, _result, next) => exec.name === 'python_stream' ? { kind: 'accept', content: [{ type: 'text', text: 'REDACTED' }] } : next())

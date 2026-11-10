@@ -229,7 +229,7 @@ Streaming uses raw Python with top-level `await`. Use `print(...)` for output an
 
 Truncation, malformed arguments, disconnects, and cancellation abort pending source and unwind open contexts before the step settles. Earlier effects remain; the plugin never reruns the source to recover or automatically retries a model attempt after execution starts. CPU-bound code still uses the kernel's interrupt escalation. A restored admission with no conclusive result is reported to the model as an unknown outcome, not as proof that nothing ran; interpreter memory is not restored.
 
-One streamed Python call is supported per response. Other direct tools remain unavailable in exclusive CodeAct mode. The generated tool description and SDK instructions explain these rules to the model. A configured `python` or `command` interpreter must supply `partial-python>=0.1.0,<0.2` as well as IPython and objprint; the default `uv` setup installs them from the worker's PEP 723 metadata.
+One streamed Python call is supported per response. Other direct tools remain unavailable in exclusive CodeAct mode. The generated tool description and SDK instructions explain these rules to the model. A configured `python` or `command` interpreter must supply [`partial-python~=0.1.0`](https://github.com/promplate/partial-python) as well as IPython and objprint; the default `uv` setup installs them from the worker's PEP 723 metadata.
 
 ## Cancellation
 

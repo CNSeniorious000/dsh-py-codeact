@@ -36,5 +36,13 @@ for (const icons of [
   assert.equal(row.type.name, 'CodeActCard')
   const card = row.type(row.props)
   assert.equal(card.props['data-tool'], 'python')
+  const partial = view({ toolName: 'python', block: { phase: 'preparing', args: { text: (key) => ({ code: 'await probe()', description: 'Read streamed arguments' })[key] } } })
+  const preparing = JSON.stringify(partial.type(partial.props))
+  assert.match(preparing, /Read streamed arguments/)
+  assert.match(preparing, /await probe\(\)/)
+  const descriptionOnly = view({ toolName: 'python', block: { phase: 'preparing', argsRaw: '{"description":"Describe first"', args: { text: (key) => key === 'description' ? 'Describe first' : undefined } } })
+  const emptySource = JSON.stringify(descriptionOnly.type(descriptionOnly.props))
+  assert.match(emptySource, /Describe first/)
+  assert.doesNotMatch(emptySource, /"lang":"python"/, 'a description-only native reader must not display raw JSON as Python')
   console.log(`client render: ${icons.join(' + ')} ok`)
 }

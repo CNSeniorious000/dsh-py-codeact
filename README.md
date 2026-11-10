@@ -17,7 +17,7 @@ df.groupby("region").revenue.sum().nlargest(3)
 
 `python` is the only tool the model can call directly. Everything else lives in `__dsh__.tools`, so the action space really is one tool — the CodeAct shape.
 
-Cells run through `InteractiveShell.run_cell_async`, so magics, `transform_cell`, top-level `await`, execution history, and IPython's traceback formatter all come for free. The shell setup and the LLM-specific touches below follow [`CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`](https://github.com/CNSeniorious000/temporary-mcp-servers/blob/main/ipython-mcp.py).
+By default, cells run through `InteractiveShell.run_cell_async`, so magics, `transform_cell`, top-level `await`, execution history, and IPython's traceback formatter all come for free. The shell setup and the LLM-specific touches below follow [`CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`](https://github.com/CNSeniorious000/temporary-mcp-servers/blob/main/ipython-mcp.py).
 
 ## How it differs from dsh's built-in Code Mode
 
@@ -213,7 +213,9 @@ Sub-dispatches carry the outer execution's `parent` token, so they re-enter the 
 
 ## Streaming execution
 
-Set `streaming: true` on the plugin row to execute stable Python statements while the model is still generating its tool arguments. Streaming requires DSH 0.2.2 or later, `mode: code`, and session persistence. The default remains whole-cell IPython execution.
+In DSH Web's **Plugins** page, open **dsh-py-codeact** and enable **Streaming execution** to execute stable Python statements while the model generates its tool arguments. Both modes use the same CodeAct preset and `python` tool. The switch applies from the next model step without restarting the Python namespace; an active cell keeps its execution mode. Streaming requires DSH 0.2.2 or later, `mode: code`, and session persistence. It is off by default.
+
+Leave `streaming` unset on the preset's plugin row to follow this profile preference. An explicit `true` or `false` overrides it for that preset:
 
 ```yaml
 - name: dsh-py-codeact
@@ -221,7 +223,9 @@ Set `streaming: true` on the plugin row to execute stable Python statements whil
     streaming: true
 ```
 
-The plugin reads the same `agent/assistant-stream` events as the WebUI. [partial-python](https://github.com/promplate/partial-python) executes each stable statement once in the existing namespace; the final tool invocation joins that execution. No host patch is needed. Source admission passes through the normal tool policy pipeline and is persisted before execution; bridged tools retain the step's tool set, sandbox policy, and approval checks. Streaming admission authorizes code that is still arriving, so retain whole-cell mode when approval must inspect the complete program.
+The live preference belongs to the profile's `py-codeact-settings` entry, installed by the [bundle patch](cordis.patch.yml). The execution row retains ordinary configuration lifecycle rules; editing its explicit override can remount the plugin and discard interpreter state.
+
+The plugin reads the same `agent/assistant-stream` events as the WebUI. [partial-python](https://github.com/promplate/partial-python) executes each stable statement once in the existing namespace; the final tool invocation joins that execution. Streaming execution uses the host's public plugin APIs. Source admission passes through the normal tool policy pipeline and is persisted before execution; bridged tools retain the step's tool set, sandbox policy, and approval checks. Streaming admission authorizes code that is still arriving, so retain whole-cell mode when approval must inspect the complete program.
 
 Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies must cover this capability as well as the final `python` call; approving the final call cannot undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
 

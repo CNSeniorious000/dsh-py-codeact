@@ -39,7 +39,7 @@ export async function createHost({ stream, streaming = true, id = 'streaming-tes
       try { await file.writeFile(JSON.stringify({ header: session.header, events: session.snapshotEvents() })); await file.sync() }
       finally { await file.close() }
     })
-    await ctx.plugin(plugin, { ...config, streaming })
+    await ctx.plugin(plugin, { streaming, ...config })
     ctx.on('agent/pre-step', async (payload, next) => payload.step > 1 ? { kind: 'reject' } : next())
     const frames = []
     ctx.on('agent/assistant-stream', ({ frame }) => { frames.push(frame) }, { global: true })

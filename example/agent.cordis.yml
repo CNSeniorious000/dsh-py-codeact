@@ -25,8 +25,9 @@
     # 'both' keeps the native schemas too — for debugging a composition.
     mode: code
 
-    # Execute stable raw Python while arguments arrive. Requires DSH 0.2.2, mode: code, and session persistence; use print for output instead of IPython's final-expression echo.
-    streaming: false
+    # Omit streaming to follow Plugins > dsh-py-codeact > Streaming execution (off by default).
+    # An explicit true or false overrides that switch for this preset. Streaming requires DSH 0.2.2, mode: code, and session persistence; use print for output.
+    # streaming: true
 
     # false (default) spawns with an allowlisted environment — PATH, HOME, TMPDIR, LANG, LC_ALL, TERM — so no ambient credentials reach model code. (Not an EMPTY env like the worker-thread runtime: CPython running IPython needs a profile dir and a PATH for shell escapes.) Set true to pass the whole harness environment through.
     inheritEnv: false

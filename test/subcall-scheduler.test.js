@@ -2,6 +2,30 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { SubcallScheduler } from '../lib/subcall-scheduler.js'
 
+test('a blocked first call bounds completed outcomes awaiting commit', { timeout: 3000 }, async () => {
+  const controller = new AbortController(), release = Promise.withResolvers(), windowStarted = Promise.withResolvers()
+  const starts = [], commits = []
+  const scheduler = new SubcallScheduler({
+    executionMode: () => ({ kind: 'parallel' }),
+    prepare: async exec => ({ kind: 'dispatch', exec }),
+    async dispatch(exec) {
+      starts.push(exec)
+      if (starts.length === 10) windowStarted.resolve()
+      if (exec === 0) await release.promise
+      return { result: exec }
+    },
+    complete: async (exec, outcome) => { commits.push(exec); return outcome.result },
+  }, controller.signal)
+  const results = Promise.all(Array.from({ length: 1000 }, (_, id) => scheduler.run(id, () => {}, result => result)))
+  await windowStarted.promise
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(starts.length, 10)
+  assert.deepEqual(commits, [])
+  release.resolve()
+  assert.deepEqual(await results, Array.from({ length: 1000 }, (_, id) => id))
+  controller.abort()
+})
+
 test('parallel bodies settle out of order but commit in submission order', async () => {
   const controller = new AbortController(), secondFinished = Promise.withResolvers(), release = Promise.withResolvers()
   const commits = []

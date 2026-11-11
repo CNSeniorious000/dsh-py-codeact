@@ -208,6 +208,44 @@ async def releases_retained_session_after_last_task(runner):
     runner.expect(2, ok=True, repr="['fresh']")
 
 
+async def bridge_queue_deadlines(runner):
+    frames = asyncio.Queue()
+    bridge = kernel.Bridge(frames.put)
+    binding = kernel._make_binding(bridge, {"name": "probe", "params": []})
+    with patch.object(kernel, "TOOL_CALL_TIMEOUT", 0.1):
+        task = asyncio.create_task(binding())
+        call_id = (await frames.get())["id"]
+        bridge.progress(call_id, "queued")
+        await asyncio.sleep(0.15)
+        assert not task.done(), "queue time must not consume the execution deadline"
+        bridge.progress(call_id, "started")
+        bridge.settle(call_id, True, 42, None, None)
+        assert await task == 42
+        for phase in (None, "started"):
+            task = asyncio.create_task(binding())
+            call_id = (await frames.get())["id"]
+            if phase:
+                bridge.progress(call_id, phase)
+                # Late/duplicate status frames must not disable an active deadline.
+                bridge.progress(call_id, "queued")
+            await asyncio.sleep(0.15)
+            assert task.done(), "the bridge deadline must still expire"
+            try:
+                await task
+            except TimeoutError:
+                assert task.done()
+            else:
+                raise AssertionError("missing results must still time out")
+        task = asyncio.create_task(binding())
+        call_id = (await frames.get())["id"]
+        bridge.progress(call_id, "queued")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled(), "queued calls must honor caller cancellation"
+        await asyncio.sleep(0)
+        assert not bridge._pending and not bridge._timeouts
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -215,6 +253,7 @@ async def main():
     loop.set_task_factory(kernel.Kernel._task_factory)
     try:
         for test, *args in (
+            (bridge_queue_deadlines,),
             (rejects_late_tasks,),
             (preserves_replacement_cleanup,),
             (interrupt_preserves_old_finalizer,),

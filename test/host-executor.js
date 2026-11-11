@@ -53,7 +53,7 @@ if (!tools.renderToolsSdkPy) {
     const failedTerminal = await run('python', { code: 'await finish_turn(fail=True)', description: 'Verify failed completion is discarded' })
     assert.match(failedTerminal.value, /terminal tool failed/)
     assert.equal(failedTerminal.concludesTurn, undefined, 'failed nested tools must not conclude the turn')
-    let active = 0, peak = 0, policyActive = false
+    let active = 0, peak = 0, policyActive = false, delay = 20
     const schedule = []
     ctx.tools.register(tools.defineTool({ name: 'schedule_probe', description: 'Observe tool scheduling.',
       parameters: { id: { type: 'number', required: true }, parallel: { type: 'boolean', required: true } },
@@ -61,7 +61,7 @@ if (!tools.renderToolsSdkPy) {
       isConcurrencySafe: ({ parallel }) => parallel,
       async execute({ id }) {
         active++; peak = Math.max(peak, active); schedule.push(`start:${id}`)
-        await new Promise(resolve => setTimeout(resolve, 20))
+        await new Promise(resolve => setTimeout(resolve, delay))
         schedule.push(`end:${id}`); active--
         return id
       } }))
@@ -89,6 +89,18 @@ if (!tools.renderToolsSdkPy) {
     assert.ok(schedule.indexOf('post:0') < schedule.indexOf('pre:1'))
     assert.ok(schedule.indexOf('post:1') < schedule.indexOf('pre:2'))
     console.log('  ok   Python gathers honor exclusive barriers, bounded safe concurrency, and ordered policy')
+    delay = 150
+    const queued = await run('python', { code: `old_timeout = schedule_probe.__globals__['TOOL_CALL_TIMEOUT']
+schedule_probe.__globals__['TOOL_CALL_TIMEOUT'] = 0.25
+try:
+    results = await asyncio.gather(schedule_probe(id=0, parallel=False), schedule_probe(id=1, parallel=False))
+finally:
+    schedule_probe.__globals__['TOOL_CALL_TIMEOUT'] = old_timeout
+results`, description: 'Exclude scheduler queue time from bridge deadlines' })
+    assert.equal(queued.isError, false, JSON.stringify(queued))
+    assert.match(queued.value, /\[0, 1\]/)
+    delay = 20
+    console.log('  ok   queued calls retain their full execution timeout')
     const resolve = () => ctx.tools.resolve({ agent, signal: AbortSignal.timeout(30000) })
     const allowed = await resolve()
     const sdk = sections.find(({ name }) => name === 'py-codeact:sdk')

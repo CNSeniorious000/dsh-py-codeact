@@ -925,6 +925,20 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     const fence = renderToolsSection([schema]).split('```python\n')[1].split('\n```')[0]
     execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
   })
+  await checkDoc('new uppercase mappings cannot introduce invalid type names', async () => {
+    const object = { type: 'object', properties: { x: { type: 'string' } } }
+    for (const schema of [
+      { name: 'read', parameters: { properties: { window: { type: 'object', properties: { ƛ: object } } } } },
+      { name: 'ƛ', parameters: { properties: { value: object } }, output: object },
+      { name: 'ƛ', parameters: { type: 'object', additionalProperties: false }, output: { type: 'object', additionalProperties: false } },
+    ]) {
+      const block = renderToolsSection([schema])
+      assert.doesNotMatch(block, /Ƛ/)
+      assert.match(JSON.stringify(toolSpecs([schema])), /dict\[str, Any\]/)
+      const fence = block.split('```python\n')[1].split('\n```')[0]
+      execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
+    }
+  })
   await checkDoc('folded parameter names and literal types survive prompt interpolation', async () => {
     const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
       'a b': { type: 'string', const: '{{missing}}' },

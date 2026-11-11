@@ -17,12 +17,8 @@ permissions:
   actions: write
   id-token: write
 
-concurrency:
-  # The action checks comment/review eligibility after scheduling. Give those runs unique groups so even a skipped run cannot replace a pending lifecycle review.
-  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}${{ github.event_name != 'pull_request_target' && github.event_name != 'push' && format('-{0}', github.run_id) || '' }}
-
 jobs:
-  review:
+  eligibility:
     # Same-repository PRs, plus pushes to main so merged work is reviewed too; the App's own PRs wait until they leave draft.
     if: >
       github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -31,6 +27,29 @@ jobs:
           && (github.event.action != 'ready_for_review' || github.event.pull_request.user.type == 'Bot')
           && (github.event_name == 'pull_request_target' || github.event.sender.type != 'Bot'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      allowed: ${{ steps.permission.outputs.allowed }}
+    steps:
+      - uses: actions/github-script@v9
+        id: permission
+        with:
+          script: |
+            if (['push', 'pull_request_target', 'workflow_dispatch'].includes(context.eventName)) {
+              core.setOutput('allowed', true)
+              return
+            }
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: context.payload.sender.login })
+            core.setOutput('allowed', ['admin', 'maintain', 'write'].includes(data.permission))
+
+  review:
+    needs: eligibility
+    if: needs.eligibility.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    # Authorize before joining the queue, then serialize all runs that can share this PR's cached review session.
+    concurrency:
+      group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
     steps:
       - uses: promplate/code-review@main
         with:

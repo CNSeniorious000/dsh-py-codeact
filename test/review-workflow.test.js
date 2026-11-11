@@ -1,26 +1,39 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { runInNewContext } from 'node:vm'
+const workflow = readFileSync(new URL('../.github/workflows/code-review.yml', import.meta.url), 'utf8')
+const script = workflow.match(/          script: \|\n((?: {12}.+\n)+)/)[1].replace(/^ {12}/gm, '')
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const authorize = new AsyncFunction('github', 'context', 'core', script)
 
-const group = readFileSync(new URL('../.github/workflows/code-review.yml', import.meta.url), 'utf8').match(/^  group: (.+)$/m)[1]
-// This expression uses the shared JS/GitHub subset of property access, comparisons, and boolean operators.
-const concurrencyGroup = (event_name, run_id, sender = 'User') => group.replace(/\$\{\{ (.+?) \}\}/g, (_match, expression) => String(runInNewContext(expression, {
-  github: { event_name, run_id, ref: 'refs/heads/main', event: { pull_request: { number: 106 }, issue: { number: 106 }, sender: { type: sender } } },
-  format: (template, value) => template.replace('{0}', value),
-})))
+async function allowed(eventName, permission) {
+  let value, lookups = 0
+  const context = { eventName, repo: { owner: 'owner', repo: 'repo' }, payload: { sender: { login: 'sender' } } }
+  const github = { rest: { repos: { async getCollaboratorPermissionLevel(input) {
+    assert.deepEqual(input, { owner: 'owner', repo: 'repo', username: 'sender' })
+    lookups++
+    if (permission instanceof Error) throw permission
+    return { data: { permission } }
+  } } } }
+  await authorize(github, context, { setOutput(name, result) { assert.equal(name, 'allowed'); value = result } })
+  return { value, lookups }
+}
 
-test('lifecycle reviews for the same PR keep their coalescing group', () => {
-  assert.equal(concurrencyGroup('pull_request_target', 1), concurrencyGroup('pull_request_target', 2))
-  assert.equal(concurrencyGroup('pull_request_target', 1, 'Bot'), concurrencyGroup('pull_request_target', 2))
-  assert.equal(concurrencyGroup('push', 1), concurrencyGroup('push', 2))
+test('automatic reviews do not require a commenter permission lookup', async () => {
+  for (const event of ['push', 'pull_request_target', 'workflow_dispatch']) assert.deepEqual(await allowed(event), { value: true, lookups: 0 })
 })
 
-test('comment and review runs cannot replace lifecycle or other interactive reviews', () => {
-  for (const event of ['issue_comment', 'pull_request_review', 'pull_request_review_comment', 'workflow_dispatch']) {
-    for (const sender of ['User', 'Bot']) {
-      assert.notEqual(concurrencyGroup(event, 1, sender), concurrencyGroup('pull_request_target', 2))
-      assert.notEqual(concurrencyGroup(event, 1, sender), concurrencyGroup(event, 2, sender))
-    }
+test('interactive reviews require the same write permissions as the review action', async () => {
+  for (const event of ['issue_comment', 'pull_request_review', 'pull_request_review_comment']) {
+    for (const role of ['admin', 'maintain', 'write']) assert.deepEqual(await allowed(event, role), { value: true, lookups: 1 })
+    for (const role of ['read', 'triage', 'none']) assert.deepEqual(await allowed(event, role), { value: false, lookups: 1 })
   }
+  await assert.rejects(allowed('issue_comment', new Error('permission lookup failed')), /permission lookup failed/)
+})
+
+test('only authorized jobs enter the shared per-PR review queue', () => {
+  assert.match(workflow, /  review:\n    needs: eligibility\n    if: needs\.eligibility\.outputs\.allowed == 'true'/)
+  assert.match(workflow, /    concurrency:\n      group: code-review-\$\{\{ github\.event\.pull_request\.number \|\| github\.event\.issue\.number \|\| github\.ref \}\}/)
+  assert.doesNotMatch(workflow, /^concurrency:/m, 'workflow-level concurrency would run before authorization')
+  assert.doesNotMatch(workflow, /github\.run_id/, 'authorized comments and lifecycle runs must share the same queue')
 })

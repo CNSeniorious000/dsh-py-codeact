@@ -902,6 +902,18 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     const literals = [...block.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(([value]) => JSON.parse(value))
     for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}', '{{key}}']) assert.ok(literals.includes(value), 'escaped names and literals must preserve their values')
   })
+  await checkDoc('fallback parameter types survive prompt interpolation', async () => {
+    // One unspellable parameter degrades the whole args TypedDict, so every parameter type comes from
+    // `jsonSchemaToPy` rather than dsh's render — a path the declarations' own escaping never reaches.
+    const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
+      'a b': { type: 'string' },
+      choice: { type: 'string', enum: ['{{x}}'] },
+    }, required: ['a b'] } }])
+    renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
+    const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
+    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
+    assert.ok(values.includes('{{x}}'), 'a fallback annotation must retain its literal value')
+  })
   docs.dispose()
 }
 

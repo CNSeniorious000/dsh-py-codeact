@@ -1,0 +1,82 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createContext, runInContext } from 'node:vm'
+import test from 'node:test'
+
+const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+function harness() {
+  let bundle
+  const stops = [], definitions = new Map(), listeners = new Set(), slots = new Map(), slotListeners = new Map(), factories = new Map(), profile = { arrayVisits: 0 }
+  const notify = (subscribers) => { for (const listener of [...subscribers ?? []]) listener() }
+  const own = (dispose) => { stops.push(dispose); return dispose }
+  const events = { entries: () => [...definitions.values()], subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) }, register(definition) {
+    assert.ok(!definitions.has(definition.kind), `duplicate definition ${definition.kind}`); definitions.set(definition.kind, definition); notify(listeners)
+    return () => { if (definitions.get(definition.kind) === definition) { definitions.delete(definition.kind); notify(listeners) } }
+  } }
+  const slotService = {
+    entries: (name) => slots.get(name) ?? [], entriesOfSlot: (name) => slots.get(name) ?? [],
+    subscribe(name, listener) { if (!slotListeners.has(name)) slotListeners.set(name, new Set()); slotListeners.get(name).add(listener); return () => slotListeners.get(name).delete(listener) },
+    inject(_name, setup) { const result = setup(); if (result?.next) for (const _ of result) {} },
+    register(options, component) {
+      const entry = { options: { key: options.key, priority: options.priority }, component, children: options.children }
+      slots.set(options.name, [...slots.get(options.name) ?? [], entry]); notify(slotListeners.get(options.name))
+      return own(() => { slots.set(options.name, (slots.get(options.name) ?? []).filter(item => item !== entry)); notify(slotListeners.get(options.name)) })
+    },
+    registerFactory(options, component) {
+      assert.ok(!factories.has(options.name)); const entry = { options, component }; factories.set(options.name, entry)
+      return own(() => { if (factories.get(options.name) === entry) factories.delete(options.name) })
+    },
+  }
+  const ctx = { slots: slotService, uiConversation: { events }, effect: setup => own(setup()), inject(services, setup) { if (services.includes('uiConversation')) setup(ctx) } }
+  const sandbox = createContext({ window: { __ModuleLoader__: { load: value => { bundle = value } } }, document: { querySelector: () => null }, profile })
+  // Count copied array entries, rather than relying on machine-dependent elapsed time to catch quadratic delta retention.
+  runInContext('Array.prototype[Symbol.iterator] = function* () { for (let i = 0; i < this.length; i++) { profile.arrayVisits++; yield this[i] } }', sandbox)
+  runInContext(source, sandbox); bundle.factory(() => ({ createElement() {} })).apply(ctx)
+  return { events, definitions, slots: slotService, factories, profile, close() { while (stops.length) stops.pop()?.(); assert.equal(listeners.size, 0); for (const set of slotListeners.values()) assert.equal(set.size, 0) } }
+}
+function native(kind = 'tool-call') {
+  const starts = [], updates = []
+  return { kind, target: kind === 'tool-call' ? 'chat' : 'trajectory', starts, updates,
+    match: event => event.type === 'tool/call' ? { id: event.data.callId, role: 'start' } : null,
+    start(_context, match) { starts.push(match); return Object.freeze({}) },
+    update(context, match) { updates.push(match); return context.state }, buildViewNode: () => null,
+  }
+}
+const event = (type, data) => ({ type, data })
+const delta = (seq, argumentsDelta, name) => ({ event: { ...event('assistant/live-chunk', { chunk: { type: 'tool-call-delta', id: 'parent', argumentsDelta, name } }), seq }, role: 'start', location: { kind: 'unresolved' } })
+
+test('production adapter claims only its child events in Chat and follows native registration lifetimes', () => {
+  const h = harness(), original = native(), stop = h.events.register(original), definition = h.definitions.get('py-codeact-stream')
+  const child = event('tool/ptc-dispatch-start', { rootCallId: 'parent', parentCallId: 'parent', subCallId: 'parent:py:child' })
+  assert.equal(definition.match(child).exclusive, true)
+  assert.equal(definition.match({ ...child, data: { ...child.data, subCallId: 'another-child' } }), null)
+  assert.equal(definition.match(event('tool/call', { callId: 'parent', name: 'python' })).exclusive, undefined)
+  assert.equal(definition.match(delta(1, '{', 'python').event).exclusive, undefined)
+  const stopView = h.slots.register({ name: 'conversation.chat.node', key: 'tool-call' }, function NativeTree() {})
+  assert.ok(h.factories.has('py-codeact.tool-tree')); stopView(); assert.equal(h.factories.size, 0)
+  stop(); assert.equal(h.definitions.has('py-codeact-stream'), false)
+  const replacement = native(); h.events.register(replacement); assert.notEqual(h.definitions.get('py-codeact-stream'), definition)
+  h.events.register(native('trajectory-tool-call')); assert.ok(h.definitions.has('py-codeact-trajectory'))
+  h.close(); assert.deepEqual([...h.definitions.keys()], ['tool-call', 'trajectory-tool-call']); assert.equal(h.factories.size, 0)
+})
+
+test('production preparation passes late-name and block-end prefixes to native readers', () => {
+  for (const fullBlock of [false, true]) {
+    const h = harness(), original = native(); h.events.register(original)
+    const definition = h.definitions.get('py-codeact-stream'), first = delta(1, '{"code":"print('), matches = [first]
+    let state = definition.start({ matches, state: undefined }, first)
+    const next = fullBlock ? { ...delta(2, ''), event: { ...event('assistant/live-chunk', { chunk: { type: 'block-end', block: { type: 'tool-call', id: 'parent', name: 'python', arguments: '{"code":"print(1)"}' } } }), seq: 2 } } : delta(2, '1)"}', 'python')
+    matches.push(next); state = definition.update({ matches, state }, next)
+    assert.equal(original.starts.length, 1); assert.equal(original.starts[0].event.data.chunk.argumentsDelta, '{"code":"print(1)"}')
+    assert.equal(first.event.data.chunk.name, undefined); h.close()
+  }
+})
+
+test('production preparation does not copy a growing history for every argument delta', () => {
+  const h = harness(), original = native(); h.events.register(original)
+  const definition = h.definitions.get('py-codeact-stream'), matches = []; let state
+  h.profile.arrayVisits = 0
+  for (let i = 0; i < 2000; i++) { const match = delta(i, 'x', 'python'); matches.push(match); state = (i ? definition.update : definition.start)({ matches, state }, match) }
+  assert.ok(h.profile.arrayVisits < 16000, `copied ${h.profile.arrayVisits} array entries for 2000 deltas`)
+  assert.equal(original.starts.length, 1); assert.equal(original.updates.length, 1999); h.close()
+})

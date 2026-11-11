@@ -200,7 +200,7 @@ session.append('tool/code-dispatch-start', { rootCallId, parentCallId, subCallId
 session.append('tool/code-dispatch',       { ...same, isError, content })
 ```
 
-They pair by `subCallId` (`<parent>:py:<n>`), and the settle event carries `tool/result`'s own vocabulary (`content` + `isError`) — so the trajectory UI renders them through the exact code path it uses for native calls, as `SUBTOOL` rows under the `python` call. No client change.
+They pair by `subCallId` (`<parent>:py:<n>`), and the settle event carries `tool/result`'s own vocabulary (`content` + `isError`). The client uses the native tool tree to render them as `SUBTOOL` rows under the `python` call.
 
 Both events have to land inside one open turn: the v3/v4 read path rejects a `tool/ptc-dispatch` found outside one and refuses to load the session at all. So nothing is left in flight when a cell ends. The cell owns an `AbortController` — the signal every sub-call of it runs under — and `execute` aborts that and then waits for whatever is still outstanding before it releases the shell's slot. A call parked on an approval is answered `cancelled` rather than performed hours later inside no turn, and its settle is still logged, in the same turn as its `-start`. Code Mode's `run_code` holds its run open the same way, which is what makes this contract hold there too.
 
@@ -232,6 +232,8 @@ Leave `streaming` unset on the preset's plugin row to follow this profile prefer
 The live preference belongs to the profile's `py-codeact-settings` entry, installed by the [bundle patch](cordis.patch.yml). The execution row retains ordinary configuration lifecycle rules; editing its explicit override can remount the plugin and discard interpreter state.
 
 The plugin reads the same `agent/assistant-stream` events as the WebUI. [partial-python](https://github.com/promplate/partial-python) executes each stable statement once in the existing namespace; the final tool invocation joins that execution. Streaming execution uses the host's public plugin APIs. Source admission passes through the normal tool policy pipeline and is persisted before execution; bridged tools retain the step's tool set, sandbox policy, and approval checks. Streaming admission authorizes code that is still arriving, so retain whole-cell mode when approval must inspect the complete program.
+
+Streaming and whole-cell execution share the **CodeAct · description** card and native child tools. The [browser client](lib/client.js) projects children that arrive before the final parent call into Chat and Trajectory, including restored history. It uses official DSH extension points; no host fork or session migration is required, and opening history never replays code.
 
 Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies must cover this capability as well as the final `python` call; approving the final call cannot undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
 
@@ -302,6 +304,8 @@ Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged 
 ## Test
 
 `bun run test` covers the installed host, including its registry API. The committed development dependencies use DSH 0.2.2; CI also installs the exact minimum supported 0.2.1-rc.2 host set separately. `bun run test:streaming` requires the matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
+
+`bun run test:web` installs official DSH and a packed plugin in a temporary directory, then tests streaming, whole-cell execution, Stop, Inspect, approvals, and cold history restoration in Chromium. It requires Bun, pnpm, and uv; all test servers use automatically assigned ports.
 
 ```sh
 node test/smoke.js

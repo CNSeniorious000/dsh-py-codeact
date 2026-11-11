@@ -1179,9 +1179,9 @@ console.log('mcp namespace:')
   await t('the reservation the host mirrors is the whole reservation', 'import types\nimport __dsh__.tools as T\nsorted(n for n in set(vars(type(T))) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"} if not n.startswith("_"))', (r) => {
     assert.equal(r.repr, "['ToolCallError', 'mcp']", r.error ?? 'a new plain attribute here needs mirroring in RESERVED_NAMES')
   })
-  await t('writing to the namespace is refused instead of poisoning every other agent', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
+  await t('writing to the namespace cannot shadow harness tools', 'from __dsh__.tools import mcp\nmcp.calendar = "poison"', (r) => {
     assert.equal(r.ok, false)
-    assert.match(r.error, /shared by every agent in this process/)
+    assert.match(r.error, /belongs to the harness/)
   })
   await t('deleting a server module out of sys.modules does not wedge the session', 'import sys\ndel sys.modules["__dsh__.tools.mcp.calendar"]\nfrom __dsh__.tools import mcp\n(sorted(dir(mcp)), (await mcp.calendar.list_events(calendar_id="c"))["from"])', (r) => {
     assert.equal(r.repr, "(['calendar', 'notion'], 'mcp__calendar__list_events')", r.error ?? 'the module is rebuilt on the next ask')

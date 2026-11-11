@@ -261,9 +261,8 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 
   The interpreter is then spawned **directly**, never behind `uv run --script`. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an `[the interpreter was restarted]` notice nothing actually caused. `alive` is likewise tracked from the exit event rather than read off `proc.killed`, which Node sets on any `kill()` call, including a signal the process survived.
 - **Containment, not a security boundary.** A separate process with a curated environment, but model code can `import os`. Treat a session on this preset as shell access.
-- **One shell per agent.** Under `danger-full-access`, a subagent can reuse its parent's process — sharing its event loop, `sys.modules`, installed packages and `__dsh__.shared` — while keeping its own globals and tool catalogue. Confined sessions use separate interpreters.
-- **`__dsh__.shared`** is the one deliberate crack in that isolation: a module every agent in the process can read and write, for handing live objects across a fan-out with no serialization and no tokens.
-- Shells close with their session; the process goes when the last agent pointing at it does.
+- **One interpreter per session.** Parent and child sessions have separate processes in every sandbox mode. A blocking cell, hard interrupt, or session disposal cannot stop another session's interpreter. State persists across cells and turns within the same session; its process closes when that session is disposed.
+- **Cross-session objects are not shared.** `__dsh__.shared` is local to one session. Pass data through tool arguments, results, or files when delegating work.
 
 ## Environment
 
@@ -271,7 +270,7 @@ By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `L
 
 Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
 
-Changing a session’s sandbox mode or effective working directory retires its existing kernel, so variables and open handles are lost. Pending bridged calls are cancelled and drained before a replacement starts. Confined kernels are not shared across session identities. Unrestricted parent/child sessions with the same working directory may still share one process.
+Changing a session’s sandbox mode or effective working directory retires its existing kernel, so variables and open handles are lost. Pending bridged calls are cancelled and drained before a replacement starts. Other sessions keep their interpreters.
 
 `COLUMNS`/`LINES` are pinned inside the kernel: with no TTY, `get_terminal_size()` falls back to 80×24 and wraps tracebacks and pretty output far narrower than the harness renders at.
 

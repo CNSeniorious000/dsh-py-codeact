@@ -75,7 +75,8 @@ try {
   await listeners.get('session/event')(parent.session, { type: 'sandbox/mode' })
   const wraps = confined.length
   await run('import os\nparent_pid = os.getpid()')
-  assert.match(await run('import os\nos.getpid()', child), new RegExp(await run('parent_pid')))
+  const childPid = Number((await run('import os\nos.getpid()', child)).trim().split('\n').at(-1))
+  assert.notEqual(childPid, Number((await run('parent_pid')).trim()), 'unrestricted child gets a separate process too')
   assert.equal(confined.length, wraps, 'explicit unrestricted execution bypasses confinement')
 
   let descendantClosed

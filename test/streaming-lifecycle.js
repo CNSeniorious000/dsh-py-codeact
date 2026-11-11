@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createServer } from 'node:net'
+import { once } from 'node:events'
 import { Context, Service } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { SessionStore } from '@deepseek-ai/dsh-session'
@@ -50,6 +52,77 @@ try {
   assert.deepEqual(entered.at(-1), ['scoped-first', 'scoped-first'])
   console.log('PASS: concurrent agent-scoped mounts stay isolated and survive sibling disposal')
 } finally { clearTimeout(timeout); bothEntered.resolve(); await second?.dispose(); await host.close() }
+
+for (const streaming of [false, true]) {
+  const sources = new Map(), server = createServer(), sockets = new Set()
+  server.on('connection', peer => { sockets.add(peer); peer.on('close', () => sockets.delete(peer)); peer.resume() })
+  const host = await createHost({ id: `isolated-${streaming}`, streaming, config: { hardInterruptMs: 150 },
+    async *stream(request, attempt) {
+      yield { type: 'tool-call-delta', index: 0, id: `isolated-${attempt}`, name: 'python', argumentsDelta: '{"description":"Verify session isolation","code":"' + encode(sources.get(request.sessionId)) }
+      yield { type: 'tool-call-delta', index: 0, id: `isolated-${attempt}`, name: 'python', argumentsDelta: '"}' }
+      yield finish
+    },
+  })
+  let child, pending, timeout
+  const createChild = () => host.ctx.agents.create({ sessionId: `isolated-child-${streaming}`, agentOptions: { provider: 'fixture', model: 'controlled' },
+    meta: { cwd: process.cwd(), parentSession: host.agent.id } })
+  const run = async (agent, code) => {
+    const before = agent.session.snapshotEvents().length
+    sources.set(agent.id, code)
+    agent.followup(prompt())
+    await agent.whenIdle()
+    const result = agent.session.snapshotEvents().slice(before).findLast(event => event.type === 'tool/result')?.data.message
+    assert.ok(result, JSON.stringify(agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')))
+    return result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+  }
+  const pid = output => Number(output.match(/pid=(\d+)/)?.[1])
+  // The socket keeps Python inside a synchronous recv until the test releases it; no sleep timing assumptions.
+  const block = async () => {
+    const connected = once(server, 'connection', { signal: AbortSignal.timeout(15000) })
+    pending = run(host.agent, `import socket\nblocked = socket.create_connection(("127.0.0.1", ${server.address().port}))\nblocked.recv(1)\nblocked.close()\n`)
+    return (await connected)[0]
+  }
+  try {
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    child = await createChild()
+    const parentPid = pid(await run(host.agent, 'import os\nowner = "parent"\nprint(f"pid={os.getpid()}")\n'))
+    const childPid = pid(await run(child.agent, 'import os\nowner = "child"\nprint(f"pid={os.getpid()}")\n'))
+    assert.ok(parentPid > 0 && childPid > 0)
+    assert.notEqual(parentPid, childPid, 'an unrestricted child must own a separate process')
+    let peer = await block()
+    try {
+      const responsive = await Promise.race([run(child.agent, 'print(owner, os.getpid())\n'), once(peer, 'close').then(() => { throw new Error('parent stopped before the child ran') }),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('parent blocked the child interpreter')), 5000) })])
+      assert.match(responsive, new RegExp(`child ${childPid}`), 'child state survives across turns while the parent blocks')
+    } finally { clearTimeout(timeout); peer.end('x'); await pending }
+    assert.match(await run(host.agent, 'print(owner, os.getpid())\n'), new RegExp(`parent ${parentPid}`), 'the same session retains its interpreter')
+    peer = await block()
+    host.agent.cancel({ kind: 'user' })
+    await pending
+    assert.match(await run(child.agent, 'print(owner, os.getpid())\n'), new RegExp(`child ${childPid}`), 'a parent hard kill must preserve the child interpreter')
+    const restarted = await run(host.agent, 'import os\nprint("owner" in globals())\nprint(f"pid={os.getpid()}")\n')
+    assert.match(restarted, /False/)
+    assert.notEqual(pid(restarted), parentPid, 'a synchronous cell requires a hard kill')
+    await run(host.agent, 'owner = "restored"\n')
+    await child.dispose()
+    child = undefined
+    assert.match(await run(host.agent, 'print(owner)\n'), /restored/, 'disposing another session must preserve this interpreter')
+    child = await createChild()
+    const recreated = await run(child.agent, 'import os\nprint("owner" in globals())\nprint(f"pid={os.getpid()}")\n')
+    assert.match(recreated, /False/, 'reusing a disposed session identity starts fresh')
+    assert.notEqual(pid(recreated), childPid)
+    console.log(`PASS: ${streaming ? 'streaming' : 'whole-cell'} parent/child kernels isolate blocking, hard kills, and disposal while retaining session state`)
+  } finally {
+    clearTimeout(timeout)
+    for (const peer of sockets) peer.destroy()
+    host.agent.cancel({ kind: 'user' })
+    await pending?.catch(() => {})
+    await child?.dispose()
+    await host.close()
+    await new Promise(resolve => server.close(resolve))
+  }
+}
 
 const ctx = new Context(), waiting = Promise.withResolvers(), release = Promise.withResolvers()
 class DelayedProjections extends SessionProjectionRegistry {

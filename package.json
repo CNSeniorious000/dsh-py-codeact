@@ -90,7 +90,7 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/schemastery": "3.18.5",
+    "@deepseek-ai/schemastery": "3.19.0",
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.1",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.1",

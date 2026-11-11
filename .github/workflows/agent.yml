@@ -1,4 +1,4 @@
-name: code-review
+name: agent invoke
 
 on:
   pull_request_target:

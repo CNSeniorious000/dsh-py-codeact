@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "ipython~=9.17.0",
+#     "ipython~=9.18.1",
 #     "objprint~=0.3.0",
 #     "partial-python~=0.1.0",
 # ]

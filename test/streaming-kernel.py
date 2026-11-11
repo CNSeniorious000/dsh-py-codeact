@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["ipython~=9.17.0", "objprint~=0.3.0", "partial-python~=0.1.0"]
+# dependencies = ["ipython~=9.18.1", "objprint~=0.3.0", "partial-python~=0.1.0"]
 # ///
 """Real control-channel smoke for raw-Python streaming and cancellation."""
 

@@ -351,7 +351,7 @@ for (const [label, code, check] of [
 ]) {
   try {
     const result = await Promise.race([
-      kernel.exec(code, undefined, undefined, 'survivable'),
+      kernel.exec(code),
       new Promise((_, rejectTimeout) => setTimeout(() => rejectTimeout(new Error('no `done` frame within 15s')), 15_000).unref()),
     ])
     assert.ok(check(result), `${label} — got ${JSON.stringify(result).slice(0, 160)}`)
@@ -364,7 +364,7 @@ for (const [label, code, check] of [
 
 // The interpreter must still be there afterwards — each failure above used to kill it or the harness.
 try {
-  const alive = await kernel.exec('x[:3] + "|alive"', undefined, undefined, 'survivable')
+  const alive = await kernel.exec('x[:3] + "|alive"')
   assert.equal(alive.repr, "'AAA|alive'", 'the shell keeps its state through all of the above')
   console.log('  ok   the interpreter survives all three')
 } catch (error) {
@@ -375,9 +375,9 @@ try {
 // Model cell sources used to land in the USER's own ~/.ipython history.sqlite (87 MB / 47k cells here), shared with their interactive ipython and contended by every kernel at once.
 console.log('kernel hygiene:')
 try {
-  const hist = await kernel.exec('get_ipython().history_manager.hist_file', undefined, undefined, 'survivable')
+  const hist = await kernel.exec('get_ipython().history_manager.hist_file')
   assert.equal(hist.repr, "':memory:'", 'history must not touch the user\'s profile')
-  const cache = await kernel.exec('get_ipython().displayhook.cache_size', undefined, undefined, 'survivable')
+  const cache = await kernel.exec('get_ipython().displayhook.cache_size')
   assert.ok(Number(cache.repr) <= 100, 'Out[n] retention must be bounded — the default 1000 pins 1000 live values')
   console.log('  ok   history stays in memory and Out[n] retention is bounded')
 } catch (error) {
@@ -1137,9 +1137,8 @@ console.log('mcp namespace:')
   await t('a tool whose raw name starts with an underscore is still reachable', 'from __dsh__.tools import mcp\n(await mcp.cal._private())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__cal___private'", r.error)
   }, UNDERSCORED)
-  // Every one of these is a way the process-global registry can be corrupted from a cell, and
-  // each was a live defect: the modules are shared by every agent in the process, so a mistake in
-  // one shell used to be permanent and invisible to `dir()`.
+  // These regressions corrupted the process-global registry across cells, leaving tools
+  // permanently inaccessible or invisible to `dir()`.
   await t('a tool whose raw name starts with `__` is reachable, not just listed', 'from __dsh__.tools.mcp.und import __odd\n(await __odd())["from"]', (r) => {
     assert.equal(r.repr, "'mcp__und____odd'", r.error ?? 'a leading-`__` raw name survives dsh\'s normalisation verbatim')
   }, [{ name: 'mcp__und____odd', doc: 'Leading dunder, no trailing.', params: [] }])
@@ -1187,142 +1186,109 @@ console.log('mcp namespace:')
     assert.equal(r.repr, "(['calendar', 'notion'], 'mcp__calendar__list_events')", r.error ?? 'the module is rebuilt on the next ask')
   })
 
-  // The root exists for the whole process, so it survives a shell that mounted no MCP server at
-  // all — `mcp` means the namespace or nothing, never a half-installed package. The tool LISTING
-  // is still honest: `dir(__dsh__.tools)` does not offer `mcp` when there is nothing under it.
+  // The MCP root must exist on first import even when no server has ever been mounted.
+  // The tool listing still omits `mcp` when there is nothing under it.
   const NO_MCP = [{ name: 'read', doc: 'A native tool, and the only one.', params: [] }]
-  await ns.start(NO_MCP, 'plain')
+  const plain = new PythonKernel({ cwd: process.cwd() })
   try {
-    const r = await ns.exec('import __dsh__.tools as T\nfrom __dsh__.tools import mcp\n(type(mcp).__name__, dir(mcp), "mcp" in dir(T), sorted(dir(T)))', undefined, NO_MCP, 'plain')
+    await plain.start(NO_MCP)
+    const r = await plain.exec('import __dsh__.tools as T\nfrom __dsh__.tools import mcp\n(type(mcp).__name__, dir(mcp), "mcp" in dir(T), sorted(dir(T)))')
     assert.equal(r.repr, `('McpModule', [], False, ['read'])`, r.error ?? 'unexpected result')
     console.log('  ok   a shell with no MCP server still has the package, and is not offered it')
-  } catch (error) { failures += 1; console.log(`  FAIL a shell with no MCP server still has the package, and is not offered it\n       ${error.message}`) }
+  } catch (error) { failures += 1; console.log(`  FAIL a shell with no MCP server still has the package, and is not offered it\n       ${error.message}`) } finally { await plain.dispose() }
 
-  // `sys.modules` is process-global and only ever gains entries, so a server ANOTHER shell mounted
-  // stays importable here. Pinned rather than left to chance: what leaks is the module's existence,
-  // not a tool — it resolves empty, and the grouping still lists only this shell's servers.
-  await ns.start([{ name: 'mcp__vault__unlock', doc: 'Only this shell has it.', params: [] }], 'other')
-  await ns.exec('from __dsh__.tools.mcp.vault import unlock', undefined, [{ name: 'mcp__vault__unlock', doc: 'x', params: [] }], 'other')
-  await t('a server only another shell mounted imports here, but is empty', 'import __dsh__.tools.mcp.vault as v\n(dir(v), hasattr(v, "unlock"), "vault" in dir(mcp))', (r) => {
+  // Previously imported server modules can outlive a catalogue change, but must expose no retired tools.
+  await ns.exec('from __dsh__.tools.mcp.vault import unlock', undefined, [{ name: 'mcp__vault__unlock', doc: 'x', params: [] }])
+  await t('a server from a previous catalogue stays importable but empty', 'import __dsh__.tools.mcp.vault as v\n(dir(v), hasattr(v, "unlock"), "vault" in dir(mcp))', (r) => {
     assert.equal(r.repr, "([], False, False)", r.error)
   })
   ns.dispose()
 }
 
-// One process per conversation tree, one shell per agent. This is what makes a fan-out of subagents cheap — and what keeps their globals apart.
-console.log('shells:')
+// A second InteractiveShell would replace sys.modules['__main__'], corrupting pickle class identity.
+console.log('session kernel:')
 {
-  const shells = new PythonKernel({ cwd: process.cwd(), onCall: async (name) => ({ ok: true, value: { from: name } }) })
-  const parentTools = [{ name: 'read', doc: 'r', params: [{ name: 'x', type: 'str', required: true }] }]
-  const childTools = [{ name: 'write', doc: 'w', params: [{ name: 'x', type: 'str', required: true }] }]
-  await shells.start(parentTools, 'parent')
-  await shells.start(childTools, 'child')
-  const cell = (code, shell) => shells.exec(code, undefined, undefined, shell)
-  const checkShell = async (label, verify) => {
+  const owner = new PythonKernel({ cwd: process.cwd(), onCall: async (name) => ({ ok: true, value: { from: name } }) })
+  const other = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  const specs = [{ name: 'read', doc: 'r', params: [{ name: 'x', type: 'str', required: true }] }]
+  const cell = (code) => owner.exec(code, undefined, undefined, 'owner')
+  const refused = /A Python kernel belongs to one session/
+  const checkSession = async (label, verify) => {
     try { await verify(); console.log(`  ok   ${label}`) }
     catch (error) { failures += 1; console.log(`  FAIL ${label}\n       ${error.message}`) }
   }
-
-  await checkShell('a second shell reuses the interpreter instead of spawning one', async () => {
-    const [a, b] = [await cell('import os; os.getpid()', 'parent'), await cell('import os; os.getpid()', 'child')]
-    assert.equal(a.repr, b.repr)
-    assert.equal(Number(a.repr), shells.proc.pid)
-  })
-
-  await checkShell('globals are not shared between shells', async () => {
-    await cell('secret = "parent-only"', 'parent')
-    assert.equal((await cell('"secret" in dir()', 'child')).repr, 'False')
-  })
-
-  await checkShell('each shell sees only its own tool catalogue', async () => {
-    assert.equal((await cell('import __dsh__.tools as T; sorted(dir(T))', 'parent')).repr, `['read']`)
-    assert.equal((await cell('import __dsh__.tools as T; sorted(dir(T))', 'child')).repr, `['write']`)
-  })
-
-  await checkShell('`__dsh__.shared` is the deliberate exception', async () => {
-    await cell('import __dsh__.shared as S; S.payload = {"n": 42}', 'parent')
-    assert.equal((await cell('import __dsh__.shared as S; S.payload', 'child')).repr, `{'n': 42}`)
-  })
-
-  // sys.stdout and sys.displayhook are process-global; without per-task routing one cell's output lands in the other's buffer and the RESULTS come back swapped.
-  await checkShell('concurrent cells in different shells do not cross', async () => {
-    const [a, b] = await Promise.all([
-      cell('import asyncio\nfor i in range(3):\n    print(f"P{i}"); await asyncio.sleep(0.05)\n"P-done"', 'parent'),
-      cell('import asyncio\nprint("C0"); await asyncio.sleep(0.01)\n"C-done"', 'child'),
-    ])
-    assert.equal(a.stdout.trim(), 'P0\nP1\nP2')
-    assert.equal(b.stdout.trim(), 'C0')
-    assert.equal(a.repr, `'P-done'`)   // not the other shell's value
-    assert.equal(b.repr, `'C-done'`)
-  })
-
-  // The case above interleaves, but its trailing expressions happen to land outside each other's window. This one is built so the parent's lands INSIDE the child's: IPython's `display_trap` swaps `sys.displayhook` for the running shell's own hook, so without neutralising it the parent's value is filled into the CHILD's ExecutionResult, overwritten there by the child's own, and the parent reports no return value at all.
-  await checkShell('a trailing expression evaluated inside another shell\'s window still lands home', async () => {
-    const parent = cell('import asyncio\nawait asyncio.sleep(0.1)\n"P-inner"', 'parent')
-    await new Promise((resume) => setTimeout(resume, 50).unref())   // the child starts while the parent is suspended...
-    const child = cell('import asyncio\nawait asyncio.sleep(0.4)\n"C-outer"', 'child')  // ...and outlives it, so the parent finishes inside the child's window
-    const [a, b] = await Promise.all([parent, child])
-    assert.equal(a.repr, `'P-inner'`, 'the parent must not lose its value to the shell that happened to be running')
-    assert.equal(b.repr, `'C-outer'`)
-  })
-
-  // A tool can keep its name and change everything else — an MCP server reconnecting with a revised schema is the ordinary case. Keying the rebind-skip on names alone left the kernel serving the old signature while the prompt showed the new one.
-  await checkShell('a same-named tool with a changed schema is rebound', async () => {
-    const v2 = [{ name: 'read', doc: 'REVISED', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }]
-    await shells.exec('1', undefined, v2, 'parent')
-    assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__', 'parent')).repr, `'REVISED'`)
-    assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)', 'parent')).repr, `['kwargs', 'limit']`)
-  })
-
-  // The host skips a rebind it believes already landed, and a busy kernel answers with an ordinary `ok: false` frame — so `exec` RESOLVES and the outcome has to be read. This pins the exact wording that decision keys on: change it here and the host silently starts trusting a rebind that never happened.
-  await checkShell('a busy shell is refused with the wording the host keys on', async () => {
-    const running = cell('import asyncio\nawait asyncio.sleep(0.5)', 'parent')
-    await new Promise((resume) => setTimeout(resume, 80).unref())
-    const refused = await cell('1', 'parent')
-    assert.equal(refused.ok, false)
-    assert.equal(refused.error, 'kernel busy: a previous cell is still running')
-    await running
-  })
-
-  await checkShell('disposing a shell cancels its detached tasks and runs finalizers', async () => {
-    assert.equal((await cell('survivor = asyncio.create_task(asyncio.sleep(3600))', 'parent')).ok, true)
-    const setup = await cell('import asyncio\nimport __dsh__.shared as S\nS.cleaned = False\nasync def release():\n    await asyncio.sleep(0.05)\n    S.cleaned = True\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.gather(release())\nS.background = asyncio.create_task(background())\nawait asyncio.sleep(0)', 'child')
-    assert.equal(setup.ok, true)
-    assert.equal((await cell('S.background.done()', 'parent')).repr, 'False')
-    shells.closeShell('child')
-    await shells.start([{ name: 'replacement', params: [] }], 'child')
-    const reopened = await cell('import __dsh__.tools as T; sorted(dir(T))', 'child')
-    assert.equal(reopened.ok, true, JSON.stringify(reopened))
-    assert.equal(reopened.repr, "['replacement']")
-    const result = await cell('async with asyncio.timeout(3):\n    while not S.background.done():\n        await asyncio.sleep(0.01)\n(S.background.cancelled(), S.cleaned)', 'parent')
-    assert.equal(result.ok, true)
-    assert.equal(result.repr, '(True, True)')
-    assert.equal((await cell('survivor.done()', 'parent')).repr, 'False')
-    await cell('survivor.cancel()\nawait asyncio.gather(survivor, return_exceptions=True)', 'parent')
-  })
-
-  for (const action of ['interrupt', 'dispose']) {
-    await checkShell(`${action} cancels a replacement cell queued behind cleanup`, async () => {
-      await shells.start(childTools, 'queued')
-      assert.equal((await cell('import asyncio, contextvars\nimport __dsh__.shared as S\nS.effect = False\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.sleep(0.2)\nS.queued_task = asyncio.create_task(background(), context=contextvars.Context())\nawait asyncio.sleep(0)', 'queued')).ok, true)
-      shells.closeShell('queued')
-      await shells.start(childTools, 'queued')
-      const abort = new AbortController()
-      const pending = shells.exec('import __dsh__.shared as S; S.effect = True', abort.signal, undefined, 'queued')
-      await new Promise(resolve => setTimeout(resolve, 30))
-      if (action === 'interrupt') abort.abort()
-      else shells.closeShell('queued')
-      assert.equal((await pending).ok, false)
-      const state = await cell('await asyncio.sleep(0.3)\n(S.effect, S.queued_task.cancelled())', 'parent')
-      assert.equal(state.repr, '(False, True)')
+  try {
+    const starting = owner.start(specs, 'owner')
+    await checkSession('concurrent startup cannot assign a second session', async () => {
+      await assert.rejects(owner.start([], 'other'), refused)
     })
-  }
+    await starting
+    await owner.start(specs, 'owner')
+    await other.start([], 'other')
 
-  await checkShell('closing one shell leaves the others running', async () => {
-    shells.closeShell('child')
-    assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)
-  })
-  shells.dispose()
+    for (const streaming of [false, true]) {
+      await checkSession(`pickle retains class identity after a rejected second shell (${streaming ? 'streaming' : 'whole cell'})`, async () => {
+        const execute = (kernel, shell, code) => streaming ? kernel.execStream((async function* () { yield code })(), undefined, undefined, shell) : kernel.exec(code, undefined, undefined, shell)
+        const setup = "import pickle\nclass Point:\n    marker = 'owner'\nblob = pickle.dumps(Point())\n"
+        assert.equal((await execute(owner, 'owner', setup)).ok, true)
+        await assert.rejects(owner.start([], 'other'), refused)
+        assert.equal((await execute(other, 'other', "class Point:\n    marker = 'other'\n")).ok, true)
+        const result = await execute(owner, 'owner', "import __main__\nprint(type(pickle.loads(blob)) is Point, __main__.Point is Point, Point.__module__, __name__)\n")
+        assert.equal(result.ok, true, result.error)
+        assert.equal(result.stdout, 'True True __main__ __main__\n')
+      })
+    }
+    await checkSession('exec cannot implicitly create another shell', async () => {
+      await assert.rejects(owner.exec('raise AssertionError("must not run")', undefined, [], 'other'), refused)
+      assert.equal((await cell('Point.marker')).repr, "'owner'")
+    })
+    await checkSession('a refused streaming shell never consumes its source', async () => {
+      let consumed = false
+      const chunks = (async function* () { consumed = true; yield 'raise AssertionError("must not run")\n' })()
+      await assert.rejects(owner.execStream(chunks, undefined, [], 'other'), refused)
+      assert.equal(consumed, false)
+    })
+    await checkSession('a changed tool schema is still rebound in the same session', async () => {
+      const v2 = [{ name: 'read', doc: 'REVISED', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }]
+      await owner.exec('1', undefined, v2, 'owner')
+      assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__')).repr, "'REVISED'")
+      assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)')).repr, "['kwargs', 'limit']")
+    })
+    await checkSession('a busy session keeps the error wording the host keys on', async () => {
+      const running = cell('import asyncio\nawait asyncio.sleep(0.5)')
+      await new Promise((resume) => setTimeout(resume, 80).unref())
+      const result = await cell('1')
+      assert.equal(result.ok, false)
+      assert.equal(result.error, 'kernel busy: a previous cell is still running')
+      await running
+    })
+    await checkSession('closing the shell keeps its process identity and drains finalizers before reopening', async () => {
+      const setup = await cell('import asyncio\nimport __dsh__.shared as S\nS.cleaned = False\nasync def release():\n    await asyncio.sleep(0.05)\n    S.cleaned = True\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.gather(release())\nS.background = asyncio.create_task(background())\nawait asyncio.sleep(0)')
+      assert.equal(setup.ok, true, setup.error)
+      owner.closeShell('owner')
+      await assert.rejects(owner.start([], 'other'), refused)
+      await assert.rejects(owner.exec('1', undefined, [], 'other'), refused)
+      await owner.start([{ name: 'replacement', params: [] }], 'owner')
+      const result = await cell('import __dsh__.shared as S\nimport __dsh__.tools as T\n(S.background.cancelled(), S.cleaned, sorted(dir(T)))')
+      assert.equal(result.repr, "(True, True, ['replacement'])", result.error)
+    })
+    for (const action of ['interrupt', 'dispose']) {
+      await checkSession(`${action} cancels a replacement cell queued behind cleanup`, async () => {
+        assert.equal((await cell('import asyncio, contextvars\nimport __dsh__.shared as S\nS.effect = False\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.sleep(0.2)\nS.queued_task = asyncio.create_task(background(), context=contextvars.Context())\nawait asyncio.sleep(0)')).ok, true)
+        owner.closeShell('owner')
+        await owner.start(specs, 'owner')
+        const abort = new AbortController()
+        const pending = owner.exec('import __dsh__.shared as S; S.effect = True', abort.signal, undefined, 'owner')
+        await new Promise(resolve => setTimeout(resolve, 30))
+        if (action === 'interrupt') abort.abort()
+        else owner.closeShell('owner')
+        assert.equal((await pending).ok, false)
+        await owner.start(specs, 'owner')
+        const state = await cell('import asyncio\nimport __dsh__.shared as S\nawait asyncio.sleep(0.3)\n(S.effect, S.queued_task.cancelled())')
+        assert.equal(state.repr, '(False, True)', state.error)
+      })
+    }
+  } finally { await Promise.all([owner.dispose(), other.dispose()]) }
 }
 
 // A harness restart wipes the in-memory kernel map but NOT the session log, so the durable history is the only signal that survives the event it has to detect.

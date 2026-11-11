@@ -939,6 +939,14 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
       execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
     }
   })
+  await checkDoc('class-name separators preserve valid named types', async () => {
+    for (const name of ['a.b', 'a/b', 'a b', 'a$b', 'a:b', 'a+b', 'a~b']) {
+      const object = { type: 'object', properties: { x: { type: 'string' } } }
+      const { specs } = toolSpecs([{ name, parameters: { properties: { window: object } }, output: object }])
+      assert.equal(specs[0].params[0].type, 'ABArgsWindow')
+      assert.equal(specs[0].returns, 'ABOutput')
+    }
+  })
   await checkDoc('folded parameter names and literal types survive prompt interpolation', async () => {
     const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
       'a b': { type: 'string', const: '{{missing}}' },

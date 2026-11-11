@@ -223,14 +223,15 @@ await scenario('cancel-while-awaiting-source', {
   assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must retain earlier state without replaying the interrupted source')
 })
 
-for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution'], [false, 'execution'], [true, 'execution', 'inner'], [false, 'execution', 'inner'], [true, 'execution', 'outer'], [true, 'execution', 'block']]) {
+for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution'], [false, 'execution'], [true, 'execution', 'inner'], [false, 'execution', 'inner'], [true, 'execution', 'outer'], [true, 'execution', 'both'], [true, 'execution', 'block']]) {
   const waiting = Promise.withResolvers(), release = Promise.withResolvers()
   let flushes = 0
   await scenario(`${streaming ? 'streaming' : 'whole-cell'}-cancellation-during-${phase}${policy ? `-${policy}-policy` : ''}`, {
     streaming,
     setup({ ctx }) {
       if (phase === 'admission') ctx.on('session/flush', async () => { if (++flushes === 1) { waiting.resolve(); await release.promise } })
-      if (policy) ctx.on('tools/post-execute', (exec, _result, next) => exec.name !== (streaming && policy === 'inner' ? 'python_stream' : 'python') ? next()
+      const names = policy === 'both' ? ['python_stream', 'python'] : [streaming && policy === 'inner' ? 'python_stream' : 'python']
+      if (policy) ctx.on('tools/post-execute', (exec, _result, next) => !names.includes(exec.name) ? next()
         : policy === 'block' ? { kind: 'block', feedback: [{ type: 'text', text: 'BLOCKED' }] } : { kind: 'accept', content: [{ type: 'text', text: 'REDACTED' }] })
     },
     async *stream(_request, attempt) {
@@ -268,14 +269,14 @@ for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution
         const content = result.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
         if (policy) {
           assert.match(content, policy === 'block' ? /BLOCKED/ : /^REDACTED$/)
-          assert.doesNotMatch(JSON.stringify(policy === 'inner' ? [notice, result] : result), /stdout before interrupt|stderr before interrupt|cleanup after interrupt/)
+          assert.doesNotMatch(JSON.stringify(['inner', 'both'].includes(policy) ? [notice, result] : result), /stdout before interrupt|stderr before interrupt|cleanup after interrupt/)
         } else {
           assert.match(content, /<stdout>\s*stdout before interrupt/)
           assert.match(content, /<stderr>stderr before interrupt/)
           assert.match(content, /cleanup after interrupt/)
           assert.match(content, /InterruptedError|KeyboardInterrupt/)
         }
-        if (streaming && (!policy || policy === 'inner')) assert.equal(notice.data.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
+        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
         await host.run({ signal: AbortSignal.timeout(15000) })
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must neither replay prior effects nor execute the cancelled suffix')
       }
@@ -316,6 +317,42 @@ for (const [streaming, policy] of [[false, 'accept'], [true, 'accept'], [false, 
       assert.match(content, /InterruptedError|KeyboardInterrupt/)
       const inserted = host.events.filter(event => event.type === 'agent/inbox/spliced').flatMap(event => event.data.inserted ?? [])
       assert.equal(inserted.filter(message => JSON.stringify(message).includes(marker)).length, 1)
+      assert.deepEqual(effects.map(({ value }) => value), ['once'])
+    } finally { release.resolve(); await running.catch(() => {}) }
+  })
+}
+
+for (const redacted of [false, true]) {
+  const waiting = Promise.withResolvers(), joining = Promise.withResolvers(), release = Promise.withResolvers()
+  let flushes = 0
+  await scenario(`cancel-during-result-flush${redacted ? '-redacted' : ''}`, {
+    setup({ ctx }) {
+      ctx.on('session/flush', async () => { if (++flushes === 2) { waiting.resolve(); await release.promise } })
+      ctx.on('tools/execute', (exec, next) => { if (exec.name === 'python') joining.resolve(); return next() })
+      ctx.on('tools/post-execute', (exec, result, next) => {
+        if (exec.name !== 'python_stream') return next()
+        assert.equal(result.isError, false, 'the inner result must succeed before its persistence is interrupted')
+        return redacted ? { kind: 'accept', content: [{ type: 'text', text: 'REDACTED' }] } : next()
+      })
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\nprint('output awaiting persistence')\n", description: 'Cancel while persisting a successful result' }))
+      yield finish()
+    },
+  }, async ({ host, effects }) => {
+    const running = host.run({ signal: AbortSignal.timeout(15000) })
+    try {
+      await Promise.race([Promise.all([waiting.promise, joining.promise]), running.then(() => { throw new Error('Turn finished before the result-flush gate') })])
+      host.agent.cancel({ kind: 'user' })
+      release.resolve()
+      assert.equal((await running).kind, 'aborted')
+      const result = host.events.findLast(event => event.type === 'tool/result').data.message
+      assert.equal(result.isError, true)
+      const content = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+      assert.match(content, redacted ? /REDACTED/ : /output awaiting persistence/)
+      assert.match(content, /InterruptedError|KeyboardInterrupt/)
+      const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+      if (redacted) assert.doesNotMatch(JSON.stringify([notice, result]), /output awaiting persistence/)
       assert.deepEqual(effects.map(({ value }) => value), ['once'])
     } finally { release.resolve(); await running.catch(() => {}) }
   })

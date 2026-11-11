@@ -237,7 +237,7 @@ Streaming and whole-cell execution share the **CodeAct · description** card and
 
 On DSH 0.2.2-rc.1, keep the client extension enabled when opening streaming history; the host's built-in projection cannot handle children recorded before their parent call.
 
-Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies must cover this capability as well as the final `python` call; approving the final call cannot undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
+Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies, including output policies, must cover this capability as well as the final `python` call. Recovery notices contain the accepted `python_stream` result; a later policy on `python` cannot retroactively change that notice or undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
 
 Streaming uses raw Python with top-level `await`. Use `print(...)` for output and `help(...)` for introspection; IPython magics, shell escapes, history updates, and automatic final-expression echo are unavailable. Stable statements inside `if`, `with`, and `async with` may run before the block closes. Loops, `try`, function definitions, and other unsupported compound kinds wait for their complete statement. Open contexts span source generation: time spent waiting for tokens counts toward `asyncio.timeout()`, and locks or transactions may stay open longer.
 

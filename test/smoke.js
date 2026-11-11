@@ -7,7 +7,6 @@ import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
 import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply, HAND_WRITTEN_PROSE, apply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
-import './dispatch.js'
 
 const calls = []
 const kernel = new PythonKernel({
@@ -1439,7 +1438,7 @@ console.log('orchestration section conditional on delegation tool:')
 
   try {
     const withAll = makeCtx([fullUnion])
-    apply(withAll, { mode: 'code' })
+    apply(withAll, { mode: 'both' })
     const got = withAll._sections.find(s => {
       const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
       return text?.includes('Orchestrating')
@@ -1455,7 +1454,7 @@ console.log('orchestration section conditional on delegation tool:')
 
   try {
     const without = makeCtx([twoOfThree])
-    apply(without, { mode: 'code' })
+    apply(without, { mode: 'both' })
     const none = without._sections.find(s => {
       const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
       return text?.includes('Orchestrating')

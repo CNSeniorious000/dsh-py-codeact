@@ -53,7 +53,7 @@ jobs:
           trap 'rm -rf "$compat_dir"' EXIT
           git archive HEAD | tar -x -C "$compat_dir"
           cd "$compat_dir"
-          bun -e 'const p = await Bun.file("package.json").json(); for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/dsh-subprocess"] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/cordis"] = "4.0.5"; p.devDependencies["@deepseek-ai/schemastery"] = "3.18.5"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          bun -e 'const p = await Bun.file("package.json").json(); delete p.devDependencies["@deepseek-ai/dsh-tool-executor-ptc"]; for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/cordis"] = "4.0.5"; p.devDependencies["@deepseek-ai/schemastery"] = "3.18.5"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
           rm -f bun.lock
           bun install
           bun run test
@@ -61,13 +61,6 @@ jobs:
 
       - name: Check streaming on dsh 0.2.2-rc.1
         run: |
-          stream_dir="$(mktemp -d "$RUNNER_TEMP/dsh-py-codeact-stream.XXXXXX")"
-          trap 'rm -rf "$stream_dir"' EXIT
-          git archive HEAD | tar -x -C "$stream_dir"
-          cd "$stream_dir"
-          bun -e 'const p = await Bun.file("package.json").json(); for (const name of new Set([...Object.keys(p.devDependencies), ...Object.keys(p.peerDependencies)])) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.2-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.1.0"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
-          rm bun.lock
-          bun install
           bun run test:streaming
           uv run --script test/streaming-kernel.py
 

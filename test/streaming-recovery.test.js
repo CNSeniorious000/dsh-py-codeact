@@ -176,7 +176,7 @@ test('native notices preserve model-visible admission and settlement across fork
   } finally { await env.close() }
 })
 
-test('bounded recovery notices preserve Unicode through persistence and provider encoding', async () => {
+test('recovery metadata stays bounded while persisted notices retain the full output', async () => {
   const env = await environment()
   try {
     for (const offset of [3998, 3999, 4000]) for (const failure of [false, true]) {
@@ -189,6 +189,7 @@ test('bounded recovery notices preserve Unicode through persistence and provider
       const notice = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
       assert.equal(notice.source.outcome.isWellFormed(), true, 'truncation must not create an unpaired surrogate')
       assert.equal(notice.source.outcome, expected)
+      assert.ok(notice.content[0].text.endsWith(text), 'history must retain output beyond the recovery metadata limit')
       assert.equal(Buffer.from(notice.content[0].text, 'utf8').toString('utf8'), notice.content[0].text)
     }
   } finally { await env.close() }

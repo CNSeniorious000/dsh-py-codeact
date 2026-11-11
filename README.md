@@ -247,9 +247,9 @@ One streamed Python call is supported per response. Other direct tools remain un
 
 ## Cancellation
 
-An aborted turn sends an in-band `interrupt` frame, cancelling the running cell at any `await` point. `run_cell_async` catches the `CancelledError` itself, so the model is told plainly (`InterruptedError: the harness cancelled this cell. State is intact; the cell did not finish.`) rather than handed a raw traceback it might read as a bug in its own code. The session and every binding survive.
+An aborted turn sends an in-band `interrupt` frame, cancelling the running cell at an `await` point. Streaming and whole-cell execution preserve captured stdout and stderr alongside an `InterruptedError` message, including output produced during cleanup. Output policies still apply. Earlier effects and bindings remain; cancellation does not roll them back. If source generation stops before a complete tool call exists, the streaming settlement notice preserves the output instead.
 
-A pure CPU loop (`while True: pass`) never reaches an await point. After `hardInterruptMs` (default 5s) the interpreter is SIGKILLed and the next call respawns it; that observation is prefixed with `[the interpreter was restarted; every earlier binding is gone]` so the model does not keep referring to variables that no longer exist.
+A pure CPU loop (`while True: pass`) never reaches an await point. After `hardInterruptMs` (default 5s) the interpreter is SIGKILLed, losing its bindings and buffered output. The next call respawns it; that observation is prefixed with `[the interpreter was restarted; every earlier binding is gone]` so the model does not keep referring to variables that no longer exist.
 
 ## Known limitations
 

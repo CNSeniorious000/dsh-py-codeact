@@ -11,7 +11,7 @@
 
 """Persistent IPython kernel for the dsh CodeAct REPL tool.
 
-Each agent has one `InteractiveShell`; only unrestricted sessions may share a long-lived process across a conversation tree. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
+Each DSH session owns one long-lived process and `InteractiveShell`. Its namespace survives between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
 
 Whole cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
 
@@ -19,7 +19,7 @@ Streaming cells use `partial_python.Executor` in one owner task. They share the 
 
 Wire protocol: JSON-lines on the inherited control channel (fd 7 under DSH, fd 3 standalone). stdout/stderr stay free for native writes.
 
-Every frame but `call_state`, `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
+Every frame but `call_state`, `result` and `shutdown` carries `shell` — the session whose shell it addresses, defaulting to "main". The host starts a separate process for each session, including delegated subagents.
 
   host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","returns","params":[...]}]}
                   {"t":"exec","id":N,"shell":S,"code":"...","tools":[...]}
@@ -221,7 +221,7 @@ _redundant_imports: ContextVar = ContextVar("dsh_codeact_redundant_imports", def
 
 # Which Session the currently running cell belongs to.
 #
-# Several shells share this process — one per agent, so a fan-out of subagents costs no extra interpreters and shares `sys.modules`. But `sys.stdout`, `sys.displayhook` and `sys.modules["__dsh__.tools"]` are all process-wide, so concurrent cells would steal each other's output, values and tool catalogue. Routing each of them through this ContextVar is what keeps them apart: `run_cell_async` runs in its own task, and contextvars follow the task.
+# Route process-wide stdout, displayhook and tools through the current cell. ContextVars also follow tasks created by the cell, preserving their ownership after it returns.
 _current_session: ContextVar = ContextVar("dsh_codeact_session", default=None)
 
 
@@ -285,7 +285,7 @@ class Bridge:
         self._pending[call_id] = future
         if timeout is not None:
             self._timeouts[call_id] = (timeout, False)
-        # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
+        # Keep the originating shell on bridged calls, including calls from detached tasks: create_task snapshots this ContextVar.
         session = _current_session.get()
 
         # `_send` is async (it yields to the loop while the fd-3 buffer drains), but `call` stays sync so the binding can `return await bridge.call(...)` and hand the cell the Future itself to await — `await` on a coroutine that returned a Future would hand the cell a pending Future instead of its resolved value. A `call` frame is tiny, so fire it as a task: it runs immediately and only yields if the buffer is full, never blocking the caller. If `_send` itself raises (e.g. json.dumps hitting a raising __str__), fail the call instead of hanging the awaiter — the future's done callback then pops `_pending`.
@@ -389,7 +389,7 @@ def bound_tools() -> dict:
 class ToolsModule(types.ModuleType):
     """`__dsh__.tools` — the bridged tool surface of the CALLING shell.
 
-    `sys.modules` is process-global, so there is exactly ONE of these no matter how many shells are live — yet each agent sees a different catalogue (a subagent's `toolFilter` narrows it, and restrictions move tools in and out between cells). So the bindings live on the Session and every lookup routes through the ContextVar; putting them in `__dict__` would hand every shell the last writer's catalogue."""
+    Bindings live on the Session and each lookup routes through the current cell, so restrictions and tool changes take effect without replacing the imported module."""
 
     # A class attribute, not an instance one: normal lookup finds it before `__getattr__` ever runs, and the `__setattr__` guard below cannot touch the class body. `ToolCallError` is a harness-provided exception type the model is told to catch, not a tool binding.
     ToolCallError = ToolCallError
@@ -410,11 +410,9 @@ class ToolsModule(types.ModuleType):
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
 
     def __setattr__(self, name, value):
-        # One ToolsModule per process, shared by every agent — a write here would shadow that name
-        # for all of them, permanently and invisibly to `dir()`, which keeps reporting the tool it
-        # no longer reaches. The old per-call `Namespace` made this a local mistake.
+        # A write would shadow the tool invisibly to dir(), which still reports the harness catalogue.
         if not (name.startswith("__") and name.endswith("__")):
-            raise AttributeError("__dsh__.tools belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+            raise AttributeError("__dsh__.tools belongs to the harness — bind your own name instead of writing to it")
         super().__setattr__(name, value)
 
     def __dir__(self):
@@ -625,11 +623,9 @@ class McpModule(types.ModuleType):
         return members[name]
 
     def __setattr__(self, name, value):
-        # One module per server for the whole PROCESS, so a write here would shadow that name for
-        # every other agent in it — permanently, and invisibly to `dir()`, which keeps reporting
-        # the tool it no longer reaches. The old per-call `Namespace` made this a local mistake.
+        # A write would shadow the tool invisibly to dir(), which still reports the harness catalogue.
         if not (name.startswith("__") and name.endswith("__")):
-            raise AttributeError(f"{self.__name__.removeprefix('__dsh__.tools.')} belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+            raise AttributeError(f"{self.__name__.removeprefix('__dsh__.tools.')} belongs to the harness — bind your own name instead of writing to it")
         super().__setattr__(name, value)
 
     def __dir__(self):
@@ -756,9 +752,9 @@ class RoutedDisplayHook:
 ROUTED_DISPLAYHOOK = RoutedDisplayHook()
 PROXY_STDOUT, PROXY_STDERR = StreamProxy(0), StreamProxy(1)
 
-SHARED_DOC = """`__dsh__.shared` — a namespace every agent in this process can reach.
+SHARED_DOC = """`__dsh__.shared` — a persistent namespace local to this session.
 
-Shells are isolated: a subagent cannot see the parent's variables, and two subagents cannot see each other's. This module is the deliberate exception — one module object in the process-global `sys.modules`, so anything set on it is visible to all of them as a live Python object, with no serialization and no token cost. Set an attribute to publish, read one to consume."""
+Other sessions, including delegated subagents, have separate interpreters. Pass data through tool arguments, results, or files when delegating work."""
 
 
 class Capped(io.TextIOBase):
@@ -794,9 +790,7 @@ class Capped(io.TextIOBase):
 
 
 class Session:
-    """One IPython shell whose namespace persists across cells.
-
-    One of these per agent. They share the process — and therefore `sys.modules`, the event loop and the installed packages — but not their globals."""
+    """One IPython shell whose namespace persists across cells in a DSH session."""
 
     def __init__(self, bridge: Bridge, specs, shell_id: str) -> None:
         self.shell_id = shell_id
@@ -826,7 +820,7 @@ class Session:
         # `InteractiveShell.__init__` points `sys.displayhook` at its OWN hook, so the newest shell would otherwise capture every shell's values.
         sys.stdout, sys.stderr = PROXY_STDOUT, PROXY_STDERR
         sys.displayhook = ROUTED_DISPLAYHOOK
-        # Installing the routed hook is not enough on its own: IPython wraps every cell in `display_trap`, which swaps `sys.displayhook` for THIS shell's own hook for the duration. Two cells in flight interleave those swaps, and a trailing expression evaluated while a sibling's trap is the active one is filled into the SIBLING's `ExecutionResult` — the value is then overwritten by that sibling's own, and the first cell reports no return value at all. Measured: with a bridged `await` in both cells, the parent's repr came back empty every time while the child's was fine, and a cell run alone was unaffected.
+        # IPython wraps every cell in display_trap, temporarily replacing sys.displayhook. Route that hook too so expression results retain their cell ownership.
         #
         # Pointing both ends of the trap at the routed hook makes it a no-op — `set` short-circuits on `is not self.hook`, `unset` restores what was already there — so `sys.displayhook` stays routed and the ContextVar decides, which is the whole point of `RoutedDisplayHook`.
         self.shell.display_trap.hook = ROUTED_DISPLAYHOOK
@@ -923,7 +917,7 @@ class Session:
                 )
             stdout, stderr = captured
             failed = result.error_before_exec or result.error_in_exec
-            # `run_cell_async` catches the cancellation and reports it as a failed cell, so the `except CancelledError` around this never sees one. Say plainly what happened instead of handing the model a CancelledError traceback it might read as a bug in its own code. In-flight tool calls are deliberately NOT failed here. The cell's own awaits already unwind on the CancelledError; anything still pending belongs to a task the model detached with `create_task`, which is the whole point of a persistent kernel — interrupting cell 5 must not kill a subagent launched in cell 2. Abandoned futures settle when the host replies, and `settle` drops late or duplicate replies safely.
+            # `run_cell_async` catches the cancellation and reports it as a failed cell, so the `except CancelledError` around this never sees one. Say plainly what happened instead of handing the model a CancelledError traceback it might read as a bug in its own code. In-flight tool calls are deliberately NOT failed here. The cell's own awaits already unwind on the CancelledError; anything still pending belongs to a task the model detached with `create_task`, which is the whole point of a persistent kernel — interrupting cell 5 must not cancel a task launched in cell 2. Abandoned futures settle when the host replies, and `settle` drops late or duplicate replies safely.
             if isinstance(result.error_in_exec, asyncio.CancelledError):
                 error = "InterruptedError: the harness cancelled this cell. State is intact; the cell did not finish."
             else:
@@ -963,7 +957,7 @@ class Kernel:
         self._bridge = Bridge(self._send)
         # One frame at a time: `call` frames fire as tasks beside the `done`/`ready` frames this loop awaits, and a sender that yields mid-frame (buffer full) must not let another write into the gap — the host's `readline` would see two spliced frames and drop both.
         self._send_lock = asyncio.Lock()
-        # One Session per agent, one in-flight task per Session. Keyed by the shell id the host assigns; a fan-out of subagents lands here as N entries sharing this process, its event loop and its packages.
+        # One in-flight task per shell identity supplied by the host.
         self._sessions: dict = {}
         self._tasks: dict = {}
         self._cleanups: set = set()

@@ -66,6 +66,7 @@ for (const streaming of [false, true]) {
   let child, pending, timeout
   const createChild = () => host.ctx.agents.create({ sessionId: `isolated-child-${streaming}`, agentOptions: { provider: 'fixture', model: 'controlled' },
     meta: { cwd: process.cwd(), parentSession: host.agent.id } })
+  const sdk = async agent => (await host.ctx.systemPrompt.assemble({ agent, scope: agent })).sections.find(section => section.name === 'py-codeact:sdk').text
   const run = async (agent, code) => {
     const before = agent.session.snapshotEvents().length
     sources.set(agent.id, code)
@@ -86,8 +87,18 @@ for (const streaming of [false, true]) {
     server.listen(0, '127.0.0.1')
     await once(server, 'listening')
     child = await createChild()
-    const parentPid = pid(await run(host.agent, 'import os\nowner = "parent"\nprint(f"pid={os.getpid()}")\n'))
-    const childPid = pid(await run(child.agent, 'import os\nowner = "child"\nprint(f"pid={os.getpid()}")\n'))
+    assert.match(await sdk(host.agent), /The session runs in its own Python interpreter\./)
+    const parentOutput = await run(host.agent, 'import os, sys\nowner = "parent"\nprint(f"pid={os.getpid()}")\nprint(f"prefix={sys.prefix}")\n')
+    assert.match(await sdk(child.agent), /The session runs in its own Python interpreter\./, 'a new child must not advertise the parent environment')
+    const childOutput = await run(child.agent, 'import os, sys\nowner = "child"\nprint(f"pid={os.getpid()}")\nprint(f"prefix={sys.prefix}")\n')
+    const parentPid = pid(parentOutput), childPid = pid(childOutput)
+    const parentEnv = parentOutput.match(/prefix=([^\n]+)/)[1], childEnv = childOutput.match(/prefix=([^\n]+)/)[1]
+    assert.notEqual(parentEnv, childEnv)
+    for (const [agent, own, other] of [[host.agent, parentEnv, childEnv], [child.agent, childEnv, parentEnv]]) {
+      const prompt = await sdk(agent)
+      assert.ok(prompt.includes(own), 'the prompt must identify this session environment')
+      assert.ok(!prompt.includes(other), 'the prompt must not identify another session environment')
+    }
     assert.ok(parentPid > 0 && childPid > 0)
     assert.notEqual(parentPid, childPid, 'an unrestricted child must own a separate process')
     let peer = await block()
@@ -100,6 +111,7 @@ for (const streaming of [false, true]) {
     peer = await block()
     host.agent.cancel({ kind: 'user' })
     await pending
+    assert.match(await sdk(host.agent), /The session runs in its own Python interpreter\./, 'a dead interpreter must not advertise its deleted environment')
     assert.match(await run(child.agent, 'print(owner, os.getpid())\n'), new RegExp(`child ${childPid}`), 'a parent hard kill must preserve the child interpreter')
     const restarted = await run(host.agent, 'import os\nprint("owner" in globals())\nprint(f"pid={os.getpid()}")\n')
     assert.match(restarted, /False/)
@@ -109,6 +121,7 @@ for (const streaming of [false, true]) {
     child = undefined
     assert.match(await run(host.agent, 'print(owner)\n'), /restored/, 'disposing another session must preserve this interpreter')
     child = await createChild()
+    assert.match(await sdk(child.agent), /The session runs in its own Python interpreter\./, 'a disposed interpreter must not leak into its replacement prompt')
     const recreated = await run(child.agent, 'import os\nprint("owner" in globals())\nprint(f"pid={os.getpid()}")\n')
     assert.match(recreated, /False/, 'reusing a disposed session identity starts fresh')
     assert.notEqual(pid(recreated), childPid)

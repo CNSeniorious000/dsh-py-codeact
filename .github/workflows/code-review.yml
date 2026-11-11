@@ -17,20 +17,42 @@ permissions:
   actions: write
   id-token: write
 
-concurrency:
-  # Keep the active review consuming SSE while later events wait to reconcile its saved session.
-  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
-  queue: max
-
 jobs:
+  authorize:
+    # The review group holds 100 pending runs and cancels the next one, so a stream of comments the action would
+    # skip must never take a slot there: it could push a new head's review out of the queue.
+    runs-on: ubuntu-latest
+    outputs:
+      writer: ${{ steps.check.outputs.writer }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SENDER: ${{ github.event.sender.login }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            issue_comment|pull_request_review|pull_request_review_comment)
+              permission=$(gh api "repos/${{ github.repository }}/collaborators/$SENDER/permission" --jq .permission 2>/dev/null || echo none)
+              case "$permission" in admin|write|maintain) echo writer=true ;; *) echo writer=false ;; esac ;;
+            # A same-repository push or pull request already required write access.
+            *) echo writer=true ;;
+          esac >> "$GITHUB_OUTPUT"
+
   review:
+    needs: authorize
     # Same-repository PRs, plus pushes to main so merged work is reviewed too; the App's own PRs wait until they leave draft.
     if: >
+      needs.authorize.outputs.writer == 'true' && (
       github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      || (github.event.issue.pull_request != null && github.event.issue.state == 'open' && github.event.sender.type != 'Bot')
+      || (github.event.issue.pull_request != null && github.event.issue.state == 'open')
       || (github.event.pull_request.state == 'open' && github.event.pull_request.head.repo.full_name == github.repository
-          && (github.event.action != 'ready_for_review' || github.event.pull_request.user.type == 'Bot')
-          && (github.event_name == 'pull_request_target' || github.event.sender.type != 'Bot'))
+          && (github.event.action != 'ready_for_review' || github.event.pull_request.user.type == 'Bot')))
+    concurrency:
+      # Keep the active review consuming SSE while later events wait to reconcile its saved session.
+      group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+      queue: max
     runs-on: ubuntu-latest
     steps:
       - uses: promplate/code-review@main

@@ -53,6 +53,7 @@ jobs:
       # Keep the active review consuming SSE while later events wait to reconcile its saved session.
       group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
       queue: max
+    cache-mode: write
     runs-on: ubuntu-latest
     steps:
       - uses: promplate/code-review@main

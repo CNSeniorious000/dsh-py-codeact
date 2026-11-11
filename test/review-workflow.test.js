@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 
-const workflow = readFileSync(new URL('../.github/workflows/code-review.yml', import.meta.url), 'utf8')
+const workflow = readFileSync(new URL('../.github/workflows/agent.yml', import.meta.url), 'utf8')
 const concurrency = workflow.match(/^ {4}concurrency:\n((?: {6}.*\n)+)/m)[1]
 const group = concurrency.match(/^ {6}group: (.+)$/m)[1]
 const queueFor = (event) => group.replace(/\$\{\{ (.+?) \}\}/g, (_match, expression) => runInNewContext(expression, { github: { event, ref: 'refs/heads/main' } }))

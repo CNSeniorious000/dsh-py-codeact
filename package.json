@@ -36,8 +36,8 @@
     "!**/__pycache__"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/client-render.js && node --test test/settings.test.js && node test/execution-policy.js && node test/review-regressions.js && node test/renderer-loading.js",
-    "test:streaming": "node --test test/code-deltas.test.js test/python-streams.test.js test/streaming-recovery.test.js && node test/streaming.js && node test/streaming-lifecycle.js && node test/streaming-settings.js"
+    "test": "node test/smoke.js && node test/client-render.js && node --test test/settings.test.js test/subcall-scheduler.test.js && node test/execution-policy.js && node test/review-regressions.js && node test/renderer-loading.js",
+    "test:streaming": "node --test test/code-deltas.test.js test/python-streams.test.js test/streaming-recovery.test.js test/subcall-scheduler.test.js && node test/streaming.js && node test/streaming-lifecycle.js && node test/streaming-settings.js"
   },
   "dsh": {
     "bundle": {

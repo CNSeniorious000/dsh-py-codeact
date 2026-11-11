@@ -187,6 +187,8 @@ The key is the literal name `python`; a custom `toolName` falls back to the gene
 
 ## SUBTOOL rows come free
 
+Python subcalls follow DSH's tool concurrency contract. On DSH 0.2.2+, only tools whose `isConcurrencySafe` returns `true` can overlap, up to 10 per cell; omitted declarations are exclusive. Pre-execute and post-execute policy stays ordered, and results commit in submission order. Earlier hosts expose only whole-invocation execution, so their Python subcalls run serially. `asyncio.gather()` submits independent calls while the host controls execution order.
+
 Each bridged call appends the same two session events Code Mode uses:
 
 ```js

@@ -53,6 +53,42 @@ if (!tools.renderToolsSdkPy) {
     const failedTerminal = await run('python', { code: 'await finish_turn(fail=True)', description: 'Verify failed completion is discarded' })
     assert.match(failedTerminal.value, /terminal tool failed/)
     assert.equal(failedTerminal.concludesTurn, undefined, 'failed nested tools must not conclude the turn')
+    let active = 0, peak = 0, policyActive = false
+    const schedule = []
+    ctx.tools.register(tools.defineTool({ name: 'schedule_probe', description: 'Observe tool scheduling.',
+      parameters: { id: { type: 'number', required: true }, parallel: { type: 'boolean', required: true } },
+      output: { schema: { type: 'number' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
+      isConcurrencySafe: ({ parallel }) => parallel,
+      async execute({ id }) {
+        active++; peak = Math.max(peak, active); schedule.push(`start:${id}`)
+        await new Promise(resolve => setTimeout(resolve, 20))
+        schedule.push(`end:${id}`); active--
+        return id
+      } }))
+    const policy = async (exec, next, stage) => {
+      if (exec.name !== 'schedule_probe') return next()
+      assert.equal(policyActive, false, 'pre/post policy stages must not overlap')
+      policyActive = true
+      schedule.push(`${stage}:${exec.arguments.id}`)
+      await new Promise(resolve => setTimeout(resolve, 2))
+      policyActive = false
+      return next()
+    }
+    ctx.on('tools/pre-execute', (exec, next) => policy(exec, next, 'pre'))
+    ctx.on('tools/post-execute', (exec, _result, next) => policy(exec, next, 'post'))
+    const parallelCalls = (count, parallel) => `from __dsh__.tools import schedule_probe\nimport asyncio\nawait asyncio.gather(*(schedule_probe(id=i, parallel=${parallel}) for i in range(${count})))`
+    assert.equal((await run('python', { code: parallelCalls(2, 'False'), description: 'Serialize exclusive tools' })).isError, false)
+    assert.equal(peak, 1)
+    assert.deepEqual(schedule, ['pre:0', 'start:0', 'end:0', 'post:0', 'pre:1', 'start:1', 'end:1', 'post:1'])
+    peak = 0; schedule.length = 0
+    assert.equal((await run('python', { code: parallelCalls(12, 'True'), description: 'Bound safe concurrency' })).isError, false)
+    assert.ok(peak > 1 && peak <= 10, `unexpected concurrency ${peak}`)
+    assert.deepEqual(schedule.filter(stage => stage.startsWith('post:')), Array.from({ length: 12 }, (_, id) => `post:${id}`))
+    schedule.length = 0
+    await run('python', { code: 'await asyncio.gather(schedule_probe(id=0, parallel=True), schedule_probe(id=1, parallel=False), schedule_probe(id=2, parallel=True))', description: 'Preserve exclusive barriers' })
+    assert.ok(schedule.indexOf('post:0') < schedule.indexOf('pre:1'))
+    assert.ok(schedule.indexOf('post:1') < schedule.indexOf('pre:2'))
+    console.log('  ok   Python gathers honor exclusive barriers, bounded safe concurrency, and ordered policy')
     const resolve = () => ctx.tools.resolve({ agent, signal: AbortSignal.timeout(30000) })
     const allowed = await resolve()
     const sdk = sections.find(({ name }) => name === 'py-codeact:sdk')

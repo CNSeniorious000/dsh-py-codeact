@@ -5,6 +5,7 @@
     "": {
       "name": "dsh-py-codeact",
       "dependencies": {
+        "@unicode/unicode-15.0.0": "2.1.0",
         "zod": "^4.0.0",
       },
       "devDependencies": {
@@ -154,6 +155,8 @@
     "@koromix/koffi-win32-x64": ["@koromix/koffi-win32-x64@3.1.1", "", { "os": "win32", "cpu": "x64" }, "sha512-KqHPmvj6QILhNyI/To8QSihHsijeVGIYYPBOUnXEpcnH2LuLbargY4Hd6dDeTN3Z90uUUxN+1FWz1UnhVzFOiA=="],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
+
+    "@unicode/unicode-15.0.0": ["@unicode/unicode-15.0.0@2.1.0", "", {}, "sha512-+41aWxdo9REQqi/ttFP+9kGVFCuUnADLl5RLti0Xkh7kI/r6BeDlTQNwF0WZpXv6C7BmxMmdXfXd9cCy9lnpAA=="],
 
     "koffi": ["koffi@3.1.1", "", { "optionalDependencies": { "@koromix/koffi-darwin-arm64": "3.1.1", "@koromix/koffi-darwin-x64": "3.1.1", "@koromix/koffi-freebsd-arm64": "3.1.1", "@koromix/koffi-freebsd-ia32": "3.1.1", "@koromix/koffi-freebsd-x64": "3.1.1", "@koromix/koffi-linux-arm64": "3.1.1", "@koromix/koffi-linux-ia32": "3.1.1", "@koromix/koffi-linux-loong64": "3.1.1", "@koromix/koffi-linux-riscv64": "3.1.1", "@koromix/koffi-linux-x64": "3.1.1", "@koromix/koffi-openbsd-ia32": "3.1.1", "@koromix/koffi-openbsd-x64": "3.1.1", "@koromix/koffi-win32-arm64": "3.1.1", "@koromix/koffi-win32-ia32": "3.1.1", "@koromix/koffi-win32-x64": "3.1.1" } }, "sha512-mRX6AMeeKCxSOeOopqAcLAl5jcNvge7NAG8l7rF/8gGJATI0tdHFYjteIdE0mGOtWdsrJOij+PjnP8Q9c1gwgA=="],
 

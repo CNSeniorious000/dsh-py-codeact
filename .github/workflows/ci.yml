@@ -59,7 +59,16 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 12.18.0
-      - run: bun run test:web
+      - run: bun run test:web "${{ runner.temp }}/codeact-web"
+      - uses: actions/upload-artifact@v7.0.2
+        if: failure()
+        with:
+          name: web-failure
+          path: |
+            ${{ runner.temp }}/codeact-web/*/host.log
+            ${{ runner.temp }}/codeact-web/*/browser.txt
+            ${{ runner.temp }}/codeact-web/*/failure.png
+            ${{ runner.temp }}/codeact-web/*/settled.json
 
   legacy:
     name: smoke (dsh 0.2.1-rc.2, ${{ matrix.os }})

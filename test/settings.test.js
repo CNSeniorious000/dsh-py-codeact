@@ -2,8 +2,34 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { createScope } from '@deepseek-ai/dsh-scope'
-import { apply as applyCodeAct } from '../lib/index.js'
+import codeAct, { apply as applyCodeAct } from '../lib/index.js'
+import Tools from '@deepseek-ai/dsh-tools'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import settings, { Config, apply, readStreaming } from '../lib/settings.js'
+
+for (const missing of ['sandboxPolicy', 'subprocess']) test(`execution follows the ${missing} provider lifetime`, async () => {
+  const ctx = new Context()
+  const provide = (name) => ctx.plugin({ name: `fixture-${name}`, apply(child) { child.provide(name, {}) } })
+  let mounted
+  try {
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(Tools)
+    await provide(missing === 'subprocess' ? 'sandboxPolicy' : 'subprocess')
+    mounted = ctx.plugin(codeAct, { mode: 'both', streaming: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.equal(ctx.tools.get('python'), undefined)
+    const provider = await provide(missing)
+    await mounted
+    assert.ok(ctx.tools.get('python'))
+    await provider.dispose()
+    assert.equal(ctx.tools.get('python'), undefined)
+    await provide(missing)
+    for (let tries = 0; !ctx.tools.get('python'); tries++) {
+      assert.ok(tries < 100, 'execution did not reactivate after provider replacement')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+  } finally { await mounted?.dispose(); await ctx.fiber.dispose() }
+})
 
 test('streaming settings validate the profile preference and preserve explicit overrides', () => {
   assert.equal(Config({}).streaming.get(), false)

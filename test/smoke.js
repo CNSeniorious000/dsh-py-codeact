@@ -775,7 +775,7 @@ console.log('prompt:')
     execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
     const unsupportedNames = ['\u{323B0}', '\u{105C0}', '\u1C89', 'x\u30FB', 'name\n']
     const compatible = renderToolsSection([{ name: 'versions', parameters: { properties: {
-      '𠀀': { type: 'string' }, ...Object.fromEntries(unsupportedNames.map(name => [name, { type: 'string' }])),
+      '𠀀': { type: 'string' }, ...Object.fromEntries(unsupportedNames.map((name) => [name, { type: 'string' }])),
     } } }])
     assert.ok(compatible.includes('\n    𠀀: str = ...,'), 'supported supplementary-plane names remain spellable')
     for (const name of unsupportedNames) {

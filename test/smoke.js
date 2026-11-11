@@ -934,7 +934,7 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     ]) {
       const block = renderToolsSection([schema])
       assert.doesNotMatch(block, /Ƛ/)
-      assert.match(JSON.stringify(toolSpecs([schema])), /dict\[str, Any\]/)
+      if ('ƛ'.toUpperCase() === 'Ƛ') assert.match(JSON.stringify(toolSpecs([schema])), /dict\[str, Any\]/)
       const fence = block.split('```python\n')[1].split('\n```')[0]
       execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
     }

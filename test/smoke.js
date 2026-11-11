@@ -877,6 +877,15 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     assert.ok(rendered.includes('Expand { { {step}}} at run time.'), 'parameter-description runs must split every opener')
     assert.ok(!rendered.includes('{{'), 'no prompt-variable opener may remain')
   })
+  await checkDoc('object member literals survive prompt interpolation', async () => {
+    const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
+      window: { type: 'object', properties: { mode: { type: 'string', const: '{{missing}}' }, choice: { type: 'string', enum: ['{{{three}}}', '{{{{four}}}}'] } } },
+    } } }])
+    renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
+    const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
+    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
+    for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}']) assert.ok(values.includes(value), 'Python literals must retain their original values')
+  })
   docs.dispose()
 }
 

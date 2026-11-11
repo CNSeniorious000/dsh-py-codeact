@@ -4,6 +4,7 @@ import { runInNewContext } from 'node:vm'
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 const component = ({ children }) => children
+function elements(node) { return node && typeof node === 'object' ? [node, ...[node.props?.children].flat(Infinity).flatMap(elements)] : [] }
 
 function loadClient(ui, useState = () => [false, () => {}]) {
   let loaded
@@ -33,7 +34,10 @@ for (const icons of [
   let view
   client.apply({ inject() {}, slots: {
     inject(_name, callback) { callback() },
-    register(_slot, render) { view = render },
+    register(slot, render) {
+      assert.equal(slot.locale, 'conversation')
+      view = (props) => render({ t: (key) => `en:${key}`, ...props })
+    },
   } })
   assert.equal(typeof view, 'function')
   const row = view({ toolName: 'python', block: { argsRaw: JSON.stringify({ code: 'print(1)' }) }, inspect() {} })
@@ -48,6 +52,35 @@ for (const icons of [
   const emptySource = JSON.stringify(descriptionOnly.type(descriptionOnly.props))
   assert.match(emptySource, /Describe first/)
   assert.doesNotMatch(emptySource, /"lang":"python"/, 'a description-only native reader must not display raw JSON as Python')
+  const legacy = view({ t: (key) => key, toolName: 'python', block: { kind: 'tool', content: [{ type: 'text', text: '1' }] }, inspect() {} })
+  const legacyText = JSON.stringify(legacy.type(legacy.props))
+  assert.match(legacyText, /"OUT"/)
+  assert.match(legacyText, /"Inspect"/)
+  assert.doesNotMatch(legacyText, /row\.(output|inspect)/)
+  for (const locale of ['en', 'zh']) {
+    for (const [state, fields, status] of [
+      ['running', {}, 'row.running'],
+      ['error', { kind: 'tool', isError: true }, 'row.failed'],
+      ['stopped', { kind: 'tool', error: { code: 'interrupted' } }, 'row.stopped'],
+      ['ok', { kind: 'tool' }, null],
+    ]) {
+      const raw = JSON.stringify({ code: 'print(1)', description: 'Keep the model description' })
+      const rendered = view({ t: (key) => `${locale}:${key}`, toolName: 'python', block: { argsRaw: raw, call: { argsRaw: raw }, content: [{ type: 'text', text: '1' }], ...fields }, inspect() {} })
+      const tree = rendered.type(rendered.props), nodes = elements(tree), json = JSON.stringify(tree)
+      assert.equal(tree.props['data-state'], state)
+      assert.ok(json.includes('CodeAct'))
+      if (state !== 'error') assert.ok(json.includes('Keep the model description'))
+      if (status) assert.ok(json.includes(`${locale}:${status}`))
+      if (state !== 'running') assert.ok(json.includes(`${locale}:row.output`))
+      assert.ok(json.includes(`${locale}:row.inspect`))
+      const code = nodes.find((node) => node.props?.lang === 'python').props
+      assert.equal(code.copyLabel, `${locale}:copy`)
+      assert.equal(code.copiedLabel, `${locale}:copied`)
+      assert.equal(code.toolbarLabels.codeLabel, `${locale}:codeBlock.title`)
+      assert.equal(code.toolbarLabels.wrapLabel, `${locale}:codeBlock.wrap`)
+      assert.equal(code.toolbarLabels.unwrapLabel, `${locale}:codeBlock.unwrap`)
+    }
+  }
   console.log(`client render: ${icons.join(' + ')} ok`)
 }
 
@@ -62,6 +95,7 @@ const client = loadClient(ui, (initial) => {
 })
 let snapshot = { status: 'ready', writable: true, value: {} }, finish, fail
 const writes = [], views = new Map(), slots = new Map()
+let dictionaries, language = 'en'
 const form = {
   getSnapshot: () => snapshot,
   set(field, value) { writes.push([field, value]); return new Promise((resolve, reject) => { finish = resolve; fail = reject }) },
@@ -69,6 +103,7 @@ const form = {
 const ctx = {
   effect: (callback) => callback(),
   inject(_services, callback) { callback(ctx) },
+  locale: { register(namespace, locales) { assert.equal(namespace, 'pyCodeAct'); dictionaries = locales; return () => {} } },
   slots: {
     inject(_name, callback) { return callback() },
     register(slot, view) { slots.set(slot.name, slot); views.set(slot.name, view); return () => views.delete(slot.name) },
@@ -80,11 +115,12 @@ const ctx = {
 }
 client.apply(ctx)
 assert.ok(views.has('tool.call.toolview'))
+assert.equal(slots.get('plugins.bundle.config').locale, 'pyCodeAct')
+assert.deepEqual(Object.keys(dictionaries.en).sort(), Object.keys(dictionaries.zh).sort())
 const injected = slots.get('plugins.bundle.config').inject()
 assert.equal(injected.hooks.settings, form)
-const settings = views.get('plugins.bundle.config')({ view: 'page', useSettings: (select) => select(injected.hooks.settings.getSnapshot()), setStreaming: injected.setStreaming })
+const settings = views.get('plugins.bundle.config')({ view: 'page', useSettings: (select) => select(injected.hooks.settings.getSnapshot()), setStreaming: injected.setStreaming, t: (key) => dictionaries[language][key] })
 function render() { cursor = 0; return settings.type(settings.props) }
-function elements(node) { return node && typeof node === 'object' ? [node, ...[node.props?.children].flat(Infinity).flatMap(elements)] : [] }
 const toggle = () => elements(render()).find((node) => node.type === ui.Switch)
 assert.equal(toggle().props.checked, false)
 assert.equal(toggle().props.disabled, false)
@@ -102,12 +138,22 @@ finish(false)
 await rejected
 assert.equal(toggle().props.checked, true)
 assert.match(elements(render()).find((node) => node.props?.role === 'alert').props.children.join(), /not saved/)
+language = 'zh'
+assert.equal(toggle().props.label, '流式执行')
+assert.equal(elements(render()).find((node) => node.props?.role === 'alert').props.children.join(), '设置未保存，请重试。')
+language = 'en'
 const failed = toggle().props.onChange(false)
 fail(new Error('offline'))
 await failed
 assert.match(elements(render()).find((node) => node.props?.role === 'alert').props.children.join(), /Could not save/)
+language = 'zh'
+assert.equal(elements(render()).find((node) => node.props?.role === 'alert').props.children.join(), '无法保存设置，请重试。')
 snapshot = { ...snapshot, writable: false }
 assert.equal(toggle().props.disabled, true)
+assert.equal(elements(render()).find((node) => node.props?.role === 'status').props.children.join(), '这些设置为只读。')
 snapshot = { ...snapshot, writable: true, status: 'unavailable' }
 assert.equal(toggle().props.disabled, true)
+assert.equal(elements(render()).find((node) => node.props?.role === 'status').props.children.join(), 'CodeAct 设置不可用。')
+snapshot = { ...snapshot, status: 'loading' }
+assert.equal(elements(render()).find((node) => node.props?.role === 'status').props.children.join(), '正在加载设置…')
 console.log('client settings: accepted values, pending writes, refusals, errors and unavailable forms ok')

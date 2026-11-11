@@ -879,15 +879,16 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     assert.ok(rendered.includes('Expand { { {step}}} at run time.'), 'parameter-description runs must split every opener')
     assert.ok(!rendered.includes('{{'), 'no prompt-variable opener may remain')
   })
-  await checkDoc('folded literal types survive prompt interpolation', async () => {
+  await checkDoc('folded parameter names and literal types survive prompt interpolation', async () => {
     const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
       'a b': { type: 'string', const: '{{missing}}' },
       'c d': { type: 'string', enum: ['{{{three}}}', '{{{{four}}}}'] },
+      '{{key}}': { type: 'string' },
     }, required: ['a b'] } }])
     renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
-    assert.ok(!block.includes('{{'), 'folded types must not introduce prompt variables')
+    assert.ok(!block.includes('{{'), 'folded parameters must not introduce prompt variables')
     const literals = [...block.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(([value]) => JSON.parse(value))
-    for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}']) assert.ok(literals.includes(value), 'escaped literals must preserve their values')
+    for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}', '{{key}}']) assert.ok(literals.includes(value), 'escaped names and literals must preserve their values')
   })
   docs.dispose()
 }

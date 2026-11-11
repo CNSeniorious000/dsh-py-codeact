@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { defineTool, ToolBatchExecutionError } from '@deepseek-ai/dsh-tools'
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
 import { createHost } from './streaming-fixture.js'
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -193,8 +194,13 @@ await scenario('nested-policy-denial', {
 let cancellationEffect
 const controller = new AbortController()
 await scenario('cancel-while-awaiting-source', {
-  async *stream() {
-    yield delta('{"code":"' + encode("from __dsh__.tools import probe\nawait probe(value='before-cancel')\n"))
+  async *stream(_request, attempt) {
+    if (attempt > 1) {
+      yield delta(JSON.stringify({ code: "await probe(value=str(kept))\n", description: 'Inspect interrupted state' }), 'inspect-cancelled-source')
+      yield finish()
+      return
+    }
+    yield delta('{"code":"' + encode("from __dsh__.tools import probe\nimport sys\nkept = 41\nprint('early stdout' + 'x' * 4200 + 'OUTPUT-TAIL')\nprint('early stderr', file=sys.stderr)\nawait probe(value='before-cancel')\n"))
     await cancellationEffect('before-cancel')
     controller.abort(new Error('cancelled by fixture'))
     yield delta(encode("await probe(value='never')\n"))
@@ -203,17 +209,40 @@ await scenario('cancel-while-awaiting-source', {
   cancellationEffect = observed
   await assert.rejects(host.run({ signal: controller.signal }), /cancelled by fixture/)
   assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
+  const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+  assert.ok(notice.data.source.outcome.length <= 4000, 'recovery metadata remains bounded')
+  const restored = Session.create('restored-interruption', JSON.parse(JSON.stringify(host.events)), { ...host.session.header, id: 'restored-interruption' })
+  const saved = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
+  assert.deepEqual(saved.content, notice.data.content, 'restored history must retain the complete accepted output')
+  const content = saved.content.map(block => block.text ?? '').join('\n')
+  assert.match(content, /<stdout>early stdout/)
+  assert.match(content, /OUTPUT-TAIL/)
+  assert.match(content, /<stderr>early stderr/)
+  assert.match(content, /InterruptedError|KeyboardInterrupt/)
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must retain earlier state without replaying the interrupted source')
 })
 
-for (const phase of ['admission', 'execution']) {
+for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution'], [false, 'execution'], [true, 'execution', 'inner'], [false, 'execution', 'inner'], [true, 'execution', 'outer'], [true, 'execution', 'both'], [true, 'execution', 'block']]) {
   const waiting = Promise.withResolvers(), release = Promise.withResolvers()
   let flushes = 0
-  await scenario(`structured-cancellation-during-${phase}`, {
+  await scenario(`${streaming ? 'streaming' : 'whole-cell'}-cancellation-during-${phase}${policy ? `-${policy}-policy` : ''}`, {
+    streaming,
     setup({ ctx }) {
       if (phase === 'admission') ctx.on('session/flush', async () => { if (++flushes === 1) { waiting.resolve(); await release.promise } })
+      const names = policy === 'both' ? ['python_stream', 'python'] : [streaming && policy === 'inner' ? 'python_stream' : 'python']
+      if (policy) ctx.on('tools/post-execute', (exec, _result, next) => !names.includes(exec.name) ? next()
+        : policy === 'block' ? { kind: 'block', feedback: [{ type: 'text', text: 'BLOCKED' }] } : { kind: 'accept', content: [{ type: 'text', text: 'REDACTED' }] })
     },
-    async *stream() {
-      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nimport asyncio\nawait probe(value='before-cancel')\nawait asyncio.sleep(30)\n", description: 'Handle structured cancellation' }))
+    async *stream(_request, attempt) {
+      const body = "    await probe(value='before-cancel')\n    await asyncio.sleep(30)\n    await probe(value='never')\n"
+      const scope = streaming
+        ? "from contextlib import asynccontextmanager\n@asynccontextmanager\nasync def scope():\n    try:\n        yield\n    finally:\n        print('cleanup after interrupt')\nasync with scope():\n" + body
+        : "try:\n" + body + "finally:\n    print('cleanup after interrupt')\n"
+      const code = attempt === 1
+        ? "from __dsh__.tools import probe\nimport asyncio, sys\nkept = 41\nprint('stdout before interrupt')\nprint('stderr before interrupt', file=sys.stderr)\n" + scope
+        : "await probe(value=str(kept))\n"
+      yield delta(JSON.stringify({ code, description: 'Handle structured cancellation' }), attempt === 1 ? 'python-1' : 'inspect-cancelled-cell')
       yield finish()
     },
   }, async ({ host, effects, observed }) => {
@@ -237,10 +266,95 @@ for (const phase of ['admission', 'execution']) {
       } else {
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
         assert.equal(result.data.message.isError, true)
-        assert.match(JSON.stringify(result.data.message.content), /InterruptedError:.*cancelled.*Earlier effects remain/)
-        assert.match(notice.data.source.outcome, /aborted/)
+        const content = result.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+        if (policy) {
+          assert.match(content, policy === 'block' ? /BLOCKED/ : /^REDACTED$/)
+          assert.doesNotMatch(JSON.stringify(['inner', 'both'].includes(policy) ? [notice, result] : result), /stdout before interrupt|stderr before interrupt|cleanup after interrupt/)
+        } else {
+          assert.match(content, /<stdout>\s*stdout before interrupt/)
+          assert.match(content, /<stderr>stderr before interrupt/)
+          assert.match(content, /cleanup after interrupt/)
+          assert.match(content, /InterruptedError|KeyboardInterrupt/)
+        }
+        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
+        await host.run({ signal: AbortSignal.timeout(15000) })
+        assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must neither replay prior effects nor execute the cancelled suffix')
       }
     } finally { release.resolve() }
+  })
+}
+
+for (const [streaming, policy] of [[false, 'accept'], [true, 'accept'], [false, 'content'], [true, 'value']]) {
+  const waiting = Promise.withResolvers(), release = Promise.withResolvers(), marker = 'Context accepted during late cancellation'
+  await scenario(`${streaming ? 'streaming' : 'whole-cell'}-cancel-during-${policy}-policy`, {
+    streaming,
+    setup({ ctx }) {
+      ctx.on('tools/post-execute', async (exec, result, next) => {
+        if (exec.name !== 'python') return next()
+        assert.equal(result.isError, false, 'cancellation must arrive after the successful execution reaches policy')
+        waiting.resolve()
+        await release.promise
+        return { kind: 'accept', ...(policy === 'content' ? { content: [{ type: 'text', text: 'REDACTED' }] } : policy === 'value' ? { value: 'REDACTED' } : {}),
+          additionalContexts: [createUserMessage({ source: { kind: 'streaming-test' }, content: [{ type: 'text', text: marker }] })] }
+      })
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\nprint('completed before cancellation')\n", description: 'Cancel while an output policy waits' }))
+      yield finish()
+    },
+  }, async ({ host, effects }) => {
+    const running = host.run({ signal: AbortSignal.timeout(15000) })
+    try {
+      await Promise.race([waiting.promise, running.then(() => { throw new Error('Turn finished before reaching the output policy') })])
+      host.agent.cancel({ kind: 'user' })
+      release.resolve()
+      assert.equal((await running).kind, 'aborted')
+      const result = host.events.findLast(event => event.type === 'tool/result').data.message
+      assert.equal(result.isError, true)
+      const content = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+      assert.match(content, policy === 'accept' ? /completed before cancellation/ : /REDACTED/)
+      if (policy !== 'accept') assert.doesNotMatch(content, /completed before cancellation/)
+      assert.match(content, /InterruptedError|KeyboardInterrupt/)
+      const inserted = host.events.filter(event => event.type === 'agent/inbox/spliced').flatMap(event => event.data.inserted ?? [])
+      assert.equal(inserted.filter(message => JSON.stringify(message).includes(marker)).length, 1)
+      assert.deepEqual(effects.map(({ value }) => value), ['once'])
+    } finally { release.resolve(); await running.catch(() => {}) }
+  })
+}
+
+for (const redacted of [false, true]) {
+  const waiting = Promise.withResolvers(), joining = Promise.withResolvers(), release = Promise.withResolvers()
+  let flushes = 0
+  await scenario(`cancel-during-result-flush${redacted ? '-redacted' : ''}`, {
+    setup({ ctx }) {
+      ctx.on('session/flush', async () => { if (++flushes === 2) { waiting.resolve(); await release.promise } })
+      ctx.on('tools/execute', (exec, next) => { if (exec.name === 'python') joining.resolve(); return next() })
+      ctx.on('tools/post-execute', (exec, result, next) => {
+        if (exec.name !== 'python_stream') return next()
+        assert.equal(result.isError, false, 'the inner result must succeed before its persistence is interrupted')
+        return redacted ? { kind: 'accept', content: [{ type: 'text', text: 'REDACTED' }] } : next()
+      })
+    },
+    async *stream() {
+      yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\nprint('output awaiting persistence')\n", description: 'Cancel while persisting a successful result' }))
+      yield finish()
+    },
+  }, async ({ host, effects }) => {
+    const running = host.run({ signal: AbortSignal.timeout(15000) })
+    try {
+      await Promise.race([Promise.all([waiting.promise, joining.promise]), running.then(() => { throw new Error('Turn finished before the result-flush gate') })])
+      host.agent.cancel({ kind: 'user' })
+      release.resolve()
+      assert.equal((await running).kind, 'aborted')
+      const result = host.events.findLast(event => event.type === 'tool/result').data.message
+      assert.equal(result.isError, true)
+      const content = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+      assert.match(content, redacted ? /REDACTED/ : /output awaiting persistence/)
+      assert.match(content, /InterruptedError|KeyboardInterrupt/)
+      const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+      if (redacted) assert.doesNotMatch(JSON.stringify([notice, result]), /output awaiting persistence/)
+      assert.deepEqual(effects.map(({ value }) => value), ['once'])
+    } finally { release.resolve(); await running.catch(() => {}) }
   })
 }
 

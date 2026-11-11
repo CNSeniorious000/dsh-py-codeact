@@ -773,6 +773,15 @@ console.log('prompt:')
     assert.match(unicode, /# spell as dict keys: .*ﬁ.*ｘ/, 'an NFKC-unstable one folds even though Python calls it an identifier')
     const fence = unicode.slice(unicode.indexOf('```python') + 10, unicode.lastIndexOf('```'))
     execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+    const unsupportedNames = ['\u{323B0}', '\u{105C0}', '\u1C89', 'x\u30FB', 'name\n']
+    const compatible = renderToolsSection([{ name: 'versions', parameters: { properties: {
+      '𠀀': { type: 'string' }, ...Object.fromEntries(unsupportedNames.map(name => [name, { type: 'string' }])),
+    } } }])
+    assert.ok(compatible.includes('\n    𠀀: str = ...,'), 'supported supplementary-plane names remain spellable')
+    for (const name of unsupportedNames) {
+      assert.ok(!compatible.includes(`\n    ${name}:`), 'new host Unicode tables must not expand the Python 3.12 identifier set')
+      assert.ok(compatible.includes(JSON.stringify(name)), 'newer names remain accessible as dictionary keys')
+    }
     console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1

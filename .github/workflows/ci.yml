@@ -45,8 +45,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: crate-ci/typos@v1.52.2
 
-  host-executor:
-    name: executor + streaming (dsh 0.2.2-rc.1, ${{ matrix.os }})
+  legacy:
+    name: smoke (dsh 0.2.1-rc.2, ${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu, macos]
@@ -59,10 +59,26 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 26
-      - name: Install matching host packages
+      - name: Install exact legacy host packages
         run: |
-          bun -e 'const p = await Bun.file("package.json").json(); for (const name of new Set([...Object.keys(p.devDependencies), ...Object.keys(p.peerDependencies)])) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.2-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.1.0"; p.devDependencies["@deepseek-ai/schemastery"] = "3.19.0"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          bun -e 'const p = await Bun.file("package.json").json(); delete p.devDependencies["@deepseek-ai/dsh-tool-executor-ptc"]; for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/cordis"] = "4.0.5"; p.devDependencies["@deepseek-ai/schemastery"] = "3.18.5"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
           rm bun.lock
           bun install
-      - run: node test/host-executor.js && node test/renderer-loading.js
+      - run: bun run test
+
+  streaming:
+    name: streaming (dsh 0.2.2-rc.1, ${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu, macos]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - run: bun install --frozen-lockfile
       - run: bun run test:streaming

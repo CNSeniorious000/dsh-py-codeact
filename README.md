@@ -301,7 +301,7 @@ Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged 
 
 ## Test
 
-`bun run test` covers the minimum supported host. `bun run test:streaming` requires a matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams. CI installs each host set separately.
+`bun run test` covers the installed host, including its registry API. The committed development dependencies use DSH 0.2.2; CI also installs the exact minimum supported 0.2.1-rc.2 host set separately. `bun run test:streaming` requires the matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
 
 ```sh
 node test/smoke.js

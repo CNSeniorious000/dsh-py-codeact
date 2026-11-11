@@ -12,7 +12,8 @@
     {
       "matchDatasources": ["npm"],
       "matchDepTypes": ["devDependencies"],
-      "matchPackageNames": ["@deepseek-ai/dsh-*"],
+      "matchPackageNames": ["@deepseek-ai/dsh-*", "@deepseek-ai/cordis", "@deepseek-ai/schemastery"],
+      "groupName": "DSH development host",
       "ignoreUnstable": false
     }
   ]

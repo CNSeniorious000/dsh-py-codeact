@@ -4,14 +4,15 @@ import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 // Test the published integration surface: registry DSH, a packed plugin, and its actual browser client.
 const repository = fileURLToPath(new URL('../', import.meta.url)), version = '0.2.2-rc.1'
-const requestedDirectory = process.argv[2] ? resolve(process.argv[2]) : await mkdtemp(join(tmpdir(), 'codeact-web-'))
+// Linux confinement replaces /tmp, so the packed worker and its interpreter must remain outside it.
+const requestedDirectory = process.argv[2] ? resolve(process.argv[2]) : await mkdtemp(join(homedir(), '.codeact-web-'))
 await mkdir(requestedDirectory, { recursive: true })
 const directory = await realpath(requestedDirectory)
 const marker = join(directory, '.codeact-web')

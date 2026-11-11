@@ -16,7 +16,8 @@ export async function apply(ctx) {
   let requests = 0
   ctx.on('session/event', (session, event) => {
     if (event.type === 'turn/end') return writeFile(join(directory, 'settled.json'), JSON.stringify({ sessionId: session.id, reason: event.data.reason }))
-    if (event.type === 'tool/call') return writeFile(join(directory, 'parent-ready'), '')
+    if (event.type === 'tool/call') return writeFile(join(directory, 'parent-ready'), JSON.stringify({ seq: event.seq }))
+    if (event.type === 'tool/ptc-dispatch-start' && event.data.name === 'fixture_probe') return record('probe-starts.jsonl', { seq: event.seq, callId: event.data.subCallId })
     if (event.type.startsWith('approval/')) return record('approvals.jsonl', { type: event.type, ...event.data })
     if (['tool/ptc-dispatch-start', 'tool/ptc-dispatch'].includes(event.type) && event.data.name === 'bash') return record('bash.jsonl', { type: event.type, ...event.data })
   })

@@ -899,6 +899,32 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
     for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}']) assert.ok(values.includes(value), 'Python literals must retain their original values')
   })
+  await checkDoc('nested object fields use the Python 3.12 identifier floor', async () => {
+    for (const name of ['\u{323B0}', 'a\u200cb']) {
+      const unsafe = { type: 'object', properties: { [name]: { type: 'string' }, ordinary: { type: 'integer' } }, required: [name], additionalProperties: false }
+      const schema = { name: 'read', parameters: { properties: { window: unsafe, rows: { type: 'array', items: unsafe }, literal: { type: 'string', const: name } } },
+        output: { type: 'object', properties: { result: unsafe, alternatives: { oneOf: [unsafe, { type: 'null' }] } } } }
+      const block = renderToolsSection([schema])
+      const { specs, declarations } = toolSpecs([schema])
+      assert.equal(specs[0].params[0].type, 'dict[str, Any]')
+      assert.equal(specs[0].params[1].type, 'list[dict[str, Any]]')
+      assert.match(declarations, /result: NotRequired\[dict\[str, Any\]\]/)
+      assert.match(declarations, /alternatives: NotRequired\[dict\[str, Any\] \| None\]/)
+      const fence = block.split('```python\n')[1].split('\n```')[0]
+      execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
+      assert.ok(fence.includes(name), 'literal values retain Unicode characters even when they cannot be identifiers')
+      assert.ok(schema.parameters.properties.window.properties[name], 'projection leaves the original argument keys intact')
+    }
+  })
+  await checkDoc('Unicode parameters and wrapper names retain named object types', async () => {
+    const schema = { name: '工具', parameters: { properties: { 路径: { type: 'object', properties: { 文件: { type: 'string' } }, required: ['文件'] } } } }
+    const { specs, declarations } = toolSpecs([schema])
+    assert.equal(specs[0].params[0].type, '工具Args路径')
+    assert.match(declarations, /class 工具Args路径\(TypedDict\):\n {4}文件: str/)
+    assert.doesNotMatch(declarations, /class 工具Args\(TypedDict\)/, 'the wrapper is consumed, while its nested type stays declared')
+    const fence = renderToolsSection([schema]).split('```python\n')[1].split('\n```')[0]
+    execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<sdk>", "exec")'], { input: fence })
+  })
   await checkDoc('folded parameter names and literal types survive prompt interpolation', async () => {
     const block = renderToolsSection([{ name: 'workflow', parameters: { properties: {
       'a b': { type: 'string', const: '{{missing}}' },

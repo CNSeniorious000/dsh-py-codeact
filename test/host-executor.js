@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter, once } from 'node:events'
 import { Context, Service } from '@deepseek-ai/cordis'
 import * as tools from '@deepseek-ai/dsh-tools'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
@@ -140,6 +141,53 @@ results`, description: 'Exclude scheduler queue time from bridge deadlines' })
       assert.match(stale.value, /ToolCallError|unknown|not found|not available/i, JSON.stringify(stale))
     } finally { blocked.dispose() }
     console.log('  ok   new host schemas, exclusive guard, nested dispatch, and persistent Python state')
+
+    const progress = new EventEmitter(), gate = Promise.withResolvers(), settlement = Promise.withResolvers()
+    let callSignal, cancelling = false
+    ctx.tools.register(tools.defineTool({ name: 'review_probe', description: 'Observe bridge settlement.', parameters: { path: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute({ path }, exec) {
+        if (cancelling) {
+          callSignal = exec.signal
+          const aborted = once(exec.signal, 'abort')
+          progress.emit('started')
+          await aborted
+          await settlement.promise
+          throw new Error('approval cancelled')
+        }
+        if (path === 'reply') progress.emit('reply')
+        return 'full result'
+      } }))
+    const releaseLog = ctx.on('tools/ptc-dispatch-log', async (dispatch, next) => {
+      if (dispatch.name === 'review_probe') await gate.promise
+      return next()
+    })
+    const reply = once(progress, 'reply', { signal: AbortSignal.timeout(30000) })
+    let finished = false
+    const flight = run('python', { code: 'from __dsh__.tools import review_probe\nawait review_probe(path="first")\nawait review_probe(path="reply")', description: 'Keep replies independent of slow logs' }).then(result => { finished = true; return result })
+    try {
+      await reply
+      assert.equal(finished, false, 'the Python reply advances while durable logging is blocked')
+      gate.resolve()
+      assert.match((await flight).value, /full result/)
+      assert.equal(events.filter(event => event.type === 'tool/ptc-dispatch' && event.data.name === 'review_probe').length, 2, 'all logs settle before the cell closes')
+    } finally { gate.resolve(); releaseLog(); await flight }
+    console.log('  ok   slow logs preserve Python replies and drain before cell completion')
+
+    cancelling = true
+    const started = once(progress, 'started', { signal: AbortSignal.timeout(30000) })
+    const cell = run('python', { code: 'await review_probe(path="waiting")', description: 'Drain cancellation during policy changes' })
+    try {
+      await started
+      let retired = false
+      const closing = ctx.parallel('session/event', session, { type: 'sandbox/mode' }).then(() => { retired = true })
+      assert.equal(callSignal.aborted, true, 'policy changes cancel bridged approvals immediately')
+      assert.equal(retired, false, 'retirement waits for the dispatch to settle')
+      settlement.resolve()
+      await Promise.all([closing, cell])
+      assert.equal(events.findLast(event => event.type === 'tool/ptc-dispatch').data.isError, true)
+    } finally { settlement.resolve() }
+    console.log('  ok   policy retirement cancels active calls and joins their settlement')
   } finally {
     await ctx.parallel('dispose')
   }

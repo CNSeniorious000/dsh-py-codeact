@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
+import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { SessionStore } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import { ToolsService, defineTool } from '@deepseek-ai/dsh-tools'
@@ -60,6 +61,8 @@ class DelayedProjections extends SessionProjectionRegistry {
   }
 }
 try {
+  await ctx.plugin(LocalSubprocess)
+  await ctx.plugin(class Policy extends Service { constructor(ctx) { super(ctx, 'sandboxPolicy') } })
   await ctx.plugin(DelayedProjections)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })

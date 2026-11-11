@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
+import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { defineTool, ToolsService } from '@deepseek-ai/dsh-tools'
 import { SessionStore } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
@@ -18,6 +19,8 @@ async function bounded(operation) {
 for (const missing of ['sessions', 'sessionProjections', 'llm']) {
   const ctx = new Context()
   try {
+    await ctx.plugin(LocalSubprocess)
+    await ctx.plugin(class Policy extends Service { constructor(ctx) { super(ctx, 'sandboxPolicy') } })
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolsService)
     for (const [name, service] of [['sessions', SessionStore], ['sessionProjections', SessionProjectionRegistry], ['llm', LlmRuntime]]) if (name !== missing) await ctx.plugin(service)

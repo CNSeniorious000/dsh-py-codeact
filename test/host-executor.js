@@ -3,6 +3,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import * as tools from '@deepseek-ai/dsh-tools'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { apply } from '../lib/index.js'
+import { apply as installSettings } from '../lib/settings.js'
 
 // Older hosts are covered by dispatch.js; this exercises the real registry and policy pipeline after their API split.
 if (!tools.renderToolsSdkPy) {
@@ -21,6 +22,8 @@ if (!tools.renderToolsSdkPy) {
   }
   new Policy()
   new tools.ToolsService(ctx)
+  let respectToolConcurrency = false
+  installSettings(ctx, { respectToolConcurrency: { get: () => respectToolConcurrency } })
   const session = { id: 'executor-test', header: { version: 4, cwd: process.cwd() }, append: (type, data) => events.push({ type, data }), deriveMessages: () => [] }
   const agent = { id: session.id, session }
   ctx.tools.register(tools.defineTool({ name: 'probe', description: 'Return the input plus one.', parameters: { value: { type: 'number', required: true } },
@@ -53,7 +56,7 @@ if (!tools.renderToolsSdkPy) {
     const failedTerminal = await run('python', { code: 'await finish_turn(fail=True)', description: 'Verify failed completion is discarded' })
     assert.match(failedTerminal.value, /terminal tool failed/)
     assert.equal(failedTerminal.concludesTurn, undefined, 'failed nested tools must not conclude the turn')
-    let active = 0, peak = 0, policyActive = false, delay = 20
+    let active = 0, peak = 0, policyActive = false, delays = []
     const schedule = []
     ctx.tools.register(tools.defineTool({ name: 'schedule_probe', description: 'Observe tool scheduling.',
       parameters: { id: { type: 'number', required: true }, parallel: { type: 'boolean', required: true } },
@@ -61,12 +64,13 @@ if (!tools.renderToolsSdkPy) {
       isConcurrencySafe: ({ parallel }) => parallel,
       async execute({ id }) {
         active++; peak = Math.max(peak, active); schedule.push(`start:${id}`)
-        await new Promise(resolve => setTimeout(resolve, delay))
+        await new Promise(resolve => setTimeout(resolve, delays[id] ?? 20))
         schedule.push(`end:${id}`); active--
         return id
       } }))
     const policy = async (exec, next, stage) => {
       if (exec.name !== 'schedule_probe') return next()
+      if (!respectToolConcurrency) return next()
       assert.equal(policyActive, false, 'pre/post policy stages must not overlap')
       policyActive = true
       schedule.push(`${stage}:${exec.arguments.id}`)
@@ -77,6 +81,19 @@ if (!tools.renderToolsSdkPy) {
     ctx.on('tools/pre-execute', (exec, next) => policy(exec, next, 'pre'))
     ctx.on('tools/post-execute', (exec, _result, next) => policy(exec, next, 'post'))
     const parallelCalls = (count, parallel) => `from __dsh__.tools import schedule_probe\nimport asyncio\nawait asyncio.gather(*(schedule_probe(id=i, parallel=${parallel}) for i in range(${count})))`
+    delays = [80, 10]
+    const immediate = await run('python', { code: `from __dsh__.tools import schedule_probe
+import asyncio
+completed = []
+async def record(i):
+    completed.append(await schedule_probe(id=i, parallel=False))
+await asyncio.gather(record(0), record(1))
+completed`, description: 'Keep immediate dispatch as the default' })
+    assert.equal(immediate.isError, false, JSON.stringify(immediate))
+    assert.match(immediate.value, /\[1, 0\]/)
+    assert.equal(peak, 2, 'undeclared-safe calls overlap by default')
+    respectToolConcurrency = true
+    peak = 0; schedule.length = 0; delays = []
     assert.equal((await run('python', { code: parallelCalls(2, 'False'), description: 'Serialize exclusive tools' })).isError, false)
     assert.equal(peak, 1)
     assert.deepEqual(schedule, ['pre:0', 'start:0', 'end:0', 'post:0', 'pre:1', 'start:1', 'end:1', 'post:1'])
@@ -89,7 +106,7 @@ if (!tools.renderToolsSdkPy) {
     assert.ok(schedule.indexOf('post:0') < schedule.indexOf('pre:1'))
     assert.ok(schedule.indexOf('post:1') < schedule.indexOf('pre:2'))
     console.log('  ok   Python gathers honor exclusive barriers, bounded safe concurrency, and ordered policy')
-    delay = 150
+    delays = [150, 150]
     const queued = await run('python', { code: `old_timeout = schedule_probe.__globals__['TOOL_CALL_TIMEOUT']
 schedule_probe.__globals__['TOOL_CALL_TIMEOUT'] = 0.25
 try:
@@ -99,7 +116,7 @@ finally:
 results`, description: 'Exclude scheduler queue time from bridge deadlines' })
     assert.equal(queued.isError, false, JSON.stringify(queued))
     assert.match(queued.value, /\[0, 1\]/)
-    delay = 20
+    delays = []
     console.log('  ok   queued calls retain their full execution timeout')
     const resolve = () => ctx.tools.resolve({ agent, signal: AbortSignal.timeout(30000) })
     const allowed = await resolve()

@@ -187,6 +187,12 @@ The key is the literal name `python`; a custom `toolName` falls back to the gene
 
 ## SUBTOOL rows come free
 
+Python subcalls dispatch immediately by default, so independent calls submitted with `asyncio.gather()` can overlap and return as they finish.
+
+Enable **Follow tool concurrency policy** in DSH Web's **Plugins → dsh-py-codeact** settings to follow official PTC scheduling. On DSH 0.2.2+, only tools whose `isConcurrencySafe` returns `true` can overlap, up to 10 per cell; omitted declarations are exclusive. Pre-execute and post-execute policy stays ordered, and results commit in submission order. Earlier hosts expose only whole-invocation execution, so this option serializes all Python subcalls. Queue time is excluded from each call's execution timeout.
+
+This option is off by default and applies from the next cell without resetting the Python namespace. Set `respectToolConcurrency: true` or `false` on the preset's plugin row to override the profile preference.
+
 Each bridged call appends the same two session events Code Mode uses:
 
 ```js

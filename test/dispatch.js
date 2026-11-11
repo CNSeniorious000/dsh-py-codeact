@@ -43,7 +43,8 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       },
     },
   }
-  apply(ctx, { mode: 'both' })
+  const config = { mode: 'both' }
+  apply(ctx, config)
   const parent = {}, signal = AbortSignal.timeout(30000)
   try {
     const created = listeners.get('agent/created')
@@ -83,6 +84,26 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       assert.notEqual(calls.at(-1).signal, signal)
       assert.equal(calls.at(-1).signal.aborted, true, 'the cell cancels its sub-calls once it settles')
       console.log(`  ok   format ${version ?? 'legacy'} bridge ${outcome}`)
+    }
+    if (version === 4) {
+      outcome = 'success'
+      const execute = ctx.tools.execute
+      let active = 0, peak = 0
+      ctx.tools.execute = async (call) => {
+        active++; peak = Math.max(peak, active)
+        try { await new Promise(resolve => setTimeout(resolve, 20)); return await execute(call) }
+        finally { active-- }
+      }
+      for (const enabled of [undefined, true, false]) {
+        config.respectToolConcurrency = enabled
+        peak = 0
+        const result = await python.execute({ code: 'import asyncio\nawait asyncio.gather(read(file_path="a"), read(file_path="b"))', description: 'Check legacy concurrency preference' },
+          { callId: 'legacy-gather', rootCallId: 'legacy-gather', token: parent, agent, signal, deferContext() {} })
+        assert.match(result, /\['file contents', 'file contents'\]/)
+        assert.equal(peak, enabled ? 1 : 2)
+      }
+      ctx.tools.execute = execute
+      console.log('  ok   legacy concurrency policy is opt-in and can be disabled again')
     }
     let shaped = 0
     ctx.waterfall = async (_scope, name, dispatch, next) => {

@@ -119,9 +119,12 @@ assert.equal(slots.get('plugins.bundle.config').locale, 'pyCodeAct')
 assert.deepEqual(Object.keys(dictionaries.en).sort(), Object.keys(dictionaries.zh).sort())
 const injected = slots.get('plugins.bundle.config').inject()
 assert.equal(injected.hooks.settings, form)
-const settings = views.get('plugins.bundle.config')({ view: 'page', useSettings: (select) => select(injected.hooks.settings.getSnapshot()), setStreaming: injected.setStreaming, t: (key) => dictionaries[language][key] })
+const settings = views.get('plugins.bundle.config')({ view: 'page', useSettings: (select) => select(injected.hooks.settings.getSnapshot()), setSetting: injected.setSetting, t: (key) => dictionaries[language][key] })
 function render() { cursor = 0; return settings.type(settings.props) }
 const toggle = () => elements(render()).find((node) => node.type === ui.Switch)
+const concurrencyToggle = () => elements(render()).filter((node) => node.type === ui.Switch)[1]
+assert.equal(concurrencyToggle().props.checked, false)
+assert.match(JSON.stringify(render()), /official PTC/)
 assert.equal(toggle().props.checked, false)
 assert.equal(toggle().props.disabled, false)
 const changing = toggle().props.onChange(true)
@@ -133,6 +136,13 @@ finish(true)
 await changing
 assert.equal(toggle().props.checked, true)
 assert.equal(toggle().props.disabled, false)
+const concurrencyChange = concurrencyToggle().props.onChange(true)
+assert.deepEqual(writes.at(-1), ['respectToolConcurrency', true])
+assert.equal(concurrencyToggle().props.checked, false)
+snapshot = { ...snapshot, value: { streaming: true, respectToolConcurrency: true } }
+finish(true)
+await concurrencyChange
+assert.equal(concurrencyToggle().props.checked, true)
 const rejected = toggle().props.onChange(false)
 finish(false)
 await rejected

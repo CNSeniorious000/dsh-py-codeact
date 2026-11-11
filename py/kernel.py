@@ -19,7 +19,7 @@ Streaming cells use `partial_python.Executor` in one owner task. They share the 
 
 Wire protocol: JSON-lines on the inherited control channel (fd 7 under DSH, fd 3 standalone). stdout/stderr stay free for native writes.
 
-Every frame but `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
+Every frame but `call_state`, `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
 
   host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","returns","params":[...]}]}
                   {"t":"exec","id":N,"shell":S,"code":"...","tools":[...]}
@@ -27,6 +27,7 @@ Every frame but `result` and `shutdown` carries `shell` — the agent whose shel
                   {"t":"stream_append","id":N,"shell":S,"text":"..."}
                   {"t":"stream_finish","id":N,"shell":S,"source":"..."}
                   {"t":"stream_abort","id":N,"shell":S,"message":"..."}
+                  {"t":"call_state","id":N,"phase":"queued"|"started"}
                   {"t":"result","id":N,"ok":true,"value":<json>}
                   {"t":"result","id":N,"ok":false,"tool":"read","message":"..."}
                   {"t":"interrupt","shell":S} | {"t":"dispose","shell":S} | {"t":"shutdown"}
@@ -264,20 +265,26 @@ def format_import_hint(keys):
 # ── tool bridge ──────────────────────────────────────────────────────────────
 
 
+TOOL_CALL_TIMEOUT = 660
+
+
 class Bridge:
     """Outbound tool dispatch: one pending future per in-flight call."""
 
     def __init__(self, send) -> None:
         self._send = send
         self._pending: dict = {}
+        self._timeouts: dict[int, tuple[asyncio.Timeout, bool]] = {}
         self._next = 0
         self._sends: set = set()  # hold fire-and-forget send tasks so the GC cannot drop a `call` frame mid-flight
 
-    def call(self, name: str, args):
+    def call(self, name: str, args, timeout: asyncio.Timeout | None = None):
         self._next += 1
         call_id = self._next
         future = asyncio.get_running_loop().create_future()
         self._pending[call_id] = future
+        if timeout is not None:
+            self._timeouts[call_id] = (timeout, False)
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
 
@@ -296,8 +303,27 @@ class Bridge:
         self._sends.add(send)
 
         # One done callback for both jobs. Popping `_pending` is the leak safety net: if the host never replies, or `_send` raised and we failed the future ourselves, or a `wait_for` timeout cancelled it, the entry still leaves. Cancelling `send` is the side-effect one: a cancelled or timed-out call whose frame has not gone out yet must not reach the host at all, or the tool runs and its side effects land after the cell already reported the call as cancelled. A frame mid-write is past that point — `_send` holds the lock and shields the drain wait, so it finishes the line rather than splicing the next frame onto a stump.
-        future.add_done_callback(lambda _: (self._pending.pop(call_id, None), send.cancel()))
+        def finish(_):
+            self._pending.pop(call_id, None)
+            self._timeouts.pop(call_id, None)
+            send.cancel()
+
+        future.add_done_callback(finish)
         return future
+
+    def progress(self, call_id, phase) -> None:
+        future = self._pending.get(call_id)
+        state = self._timeouts.get(call_id)
+        if future is None or future.done() or state is None:
+            return
+        timeout, started = state
+        if timeout.expired() or started:
+            return
+        if phase == "queued":
+            timeout.reschedule(None)
+        elif phase == "started":
+            timeout.reschedule(asyncio.get_running_loop().time() + TOOL_CALL_TIMEOUT)
+            self._timeouts[call_id] = (timeout, True)
 
     def settle(self, call_id, ok, value, tool, message) -> None:
         future = self._pending.pop(call_id, None)
@@ -317,8 +343,10 @@ def _make_binding(bridge: Bridge, spec):
     renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
 
     async def call(**kwargs):
-        # A per-call timeout is the orphan-future safety net: if the host never sends a result for this `call_id`, the await raises `TimeoutError` instead of hanging forever, and the done callback registered in `Bridge.call` drops the entry from `_pending`. It must sit ABOVE the 600s delegation budget the prompt teaches (`ask(desc, prompt, timeout=600)`), or the kernel kills a legitimate in-flight subagent while the host is still running it — the side effects land, the late result is dropped, and the model retries and duplicates them.
-        return await asyncio.wait_for(bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs), 660)
+        # Keep an orphan-result deadline above the documented 600s delegation budget. An explicit
+        # host queue receipt suspends it until execution starts; caller/cell cancellation still applies.
+        async with asyncio.timeout(TOOL_CALL_TIMEOUT) as timeout:
+            return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs, timeout)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
@@ -1215,6 +1243,8 @@ class Kernel:
             else:
                 state.closed = True
                 state.queue.put_nowait(None)
+        elif kind == "call_state":
+            self._bridge.progress(frame.get("id"), frame.get("phase"))
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":

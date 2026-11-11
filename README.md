@@ -17,22 +17,22 @@ df.groupby("region").revenue.sum().nlargest(3)
 
 `python` is the only tool the model can call directly. Everything else lives in `__dsh__.tools`, so the action space really is one tool — the CodeAct shape.
 
-Cells run through `InteractiveShell.run_cell_async`, so magics, `transform_cell`, top-level `await`, execution history, and IPython's traceback formatter all come for free. The shell setup and the LLM-specific touches below follow [`CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`](https://github.com/CNSeniorious000/temporary-mcp-servers/blob/main/ipython-mcp.py).
+By default, cells run through `InteractiveShell.run_cell_async`, so magics, `transform_cell`, top-level `await`, execution history, and IPython's traceback formatter all come for free. The shell setup and the LLM-specific touches below follow [`CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`](https://github.com/CNSeniorious000/temporary-mcp-servers/blob/main/ipython-mcp.py).
 
 ## How it differs from dsh's built-in Code Mode
 
-Same idea, opposite state model.
+Both offer programmatic tool calling. This plugin keeps IPython as the model’s action space.
 
 | | Code Mode (`run_code`) | this plugin (`python`) |
 |---|---|---|
 | Language | TypeScript (or Python via a backend) | Python, in IPython |
-| State between calls | none — one fresh worker per run | **persists** for the session |
-| Layer | a `CodeRuntime` seam provider | an ordinary tool plugin |
+| State between calls | runtime-dependent; persistent execution is supported | **persists** for the session |
+| Layer | a `PtcRuntime` seam provider | an ordinary tool plugin |
 | Tool surface | a generated `tools` global | the `__dsh__.tools` module |
 | Exclusivity | `tools.mode: code`, enforced by the registry | `mode: code`, via prompt assembly + a guard |
 | Result | program logs + return value | tagged stdout / return / traceback / note |
 
-**It is deliberately not a `CodeRuntime` backend.** That seam's contract states *"no state survives between runs"*, and Code Mode's own Agent Note records a persistent REPL kernel as rejected-for-MVP, because cross-call state would be invisible to the session log. A persistent kernel cannot conform — so it owns its own process instead of implementing that interface.
+DSH 0.2.1 supports persistent PTC execution (`persistent-in-memory`). This plugin remains an ordinary tool because it provides an IPython-specific interaction model, including magics, history and introspection; persistence alone no longer requires a separate tool.
 
 That tradeoff is real and inherited: the interpreter's live state cannot be reconstructed from a session replay. What IS in the log is every cell's source and every bridged tool call, which is enough to audit what happened.
 
@@ -187,6 +187,12 @@ The key is the literal name `python`; a custom `toolName` falls back to the gene
 
 ## SUBTOOL rows come free
 
+Python subcalls dispatch immediately by default, so independent calls submitted with `asyncio.gather()` can overlap and return as they finish.
+
+Enable **Follow tool concurrency policy** in DSH Web's **Plugins → dsh-py-codeact** settings to follow official PTC scheduling. On DSH 0.2.2+, only tools whose `isConcurrencySafe` returns `true` can overlap, up to 10 per cell; omitted declarations are exclusive. Pre-execute and post-execute policy stays ordered, and results commit in submission order. Earlier hosts expose only whole-invocation execution, so this option serializes all Python subcalls. Queue time is excluded from each call's execution timeout.
+
+This option is off by default and applies from the next cell without resetting the Python namespace. Set `respectToolConcurrency: true` or `false` on the preset's plugin row to override the profile preference.
+
 Each bridged call appends the same two session events Code Mode uses:
 
 ```js
@@ -196,9 +202,11 @@ session.append('tool/code-dispatch',       { ...same, isError, content })
 
 They pair by `subCallId` (`<parent>:py:<n>`), and the settle event carries `tool/result`'s own vocabulary (`content` + `isError`) — so the trajectory UI renders them through the exact code path it uses for native calls, as `SUBTOOL` rows under the `python` call. No client change.
 
+Both events have to land inside one open turn: the v3/v4 read path rejects a `tool/ptc-dispatch` found outside one and refuses to load the session at all. So nothing is left in flight when a cell ends. The cell owns an `AbortController` — the signal every sub-call of it runs under — and `execute` aborts that and then waits for whatever is still outstanding before it releases the shell's slot. A call parked on an approval is answered `cancelled` rather than performed hours later inside no turn, and its settle is still logged, in the same turn as its `-start`. Code Mode's `run_code` holds its run open the same way, which is what makes this contract hold there too.
+
 Both types are in `KNOWN_SESSION_EVENT_TYPES`, so reusing them is supported. Note that an out-of-repo plugin cannot invent a *new* event type: the persistence read path refuses a log containing a type outside that set unless the event is marked `ignorable`, and a registration surface for downstream events is explicitly deferred upstream.
 
-Sub-dispatches carry the outer execution's `parent` token, so they re-enter the complete `pre-execute → guards → execute → post-execute → result` pipeline. The sandbox and approval stack still gate every tool call made from inside a cell.
+Sub-dispatches carry the outer execution's `parent` token, so they re-enter the complete `pre-execute → guards → execute → post-execute → result` pipeline. The sandbox and approval stack still gate every tool call made from inside a cell. Settled sub-calls also use the public `tools/ptc-dispatch-log` waterfall and preserve result metadata and structured errors.
 
 ## What the model gets
 
@@ -208,6 +216,30 @@ Sub-dispatches carry the outer execution's `parent` token, so they re-enter the 
 - **Readable reprs.** `objprint` + IPython's `pretty` for objects whose own `__repr__` is `object.__repr__` — an agent reading values needs structure, not `<Foo object at 0x…>`.
 - **Tagged observations.** `<stdout>`, `<stderr>`, `<return>`, `<traceback>`, `<note>` — with four things possibly present at once, the model needs to know which is which. A plain successful value stays bare.
 - **Introspection over prompt text.** `read?` for one tool's full description, `dir(__dsh__.tools)` for the list — `mcp` rather than the hundred flat names under it, matching what the block printed — then `dir(mcp)` and `dir(mcp.<server>)` for those, and `%whos` for its own bindings. `__all__` is left alone: it is what `import *` binds, not what the model is shown — so it carries every flat name the listings drop, and `ToolCallError`, which no listing shows because it is not a tool but which `except ToolCallError` needs after an `import *`. What it introspects matches what the block showed it: the listing carries `mcp` rather than the hundred flat names under it, and an optional parameter renders `= ...` there as it does here — `inspect.signature` uses `repr`, and `repr(...)` is `Ellipsis`, which is what `read?` used to say.
+
+## Streaming execution
+
+In DSH Web's **Plugins** page, open **dsh-py-codeact** and enable **Streaming execution** to execute stable Python statements while the model generates its tool arguments. Both modes use the same CodeAct preset and `python` tool. The switch applies from the next model step without restarting the Python namespace; an active cell keeps its execution mode. Streaming requires DSH 0.2.2 or later, `mode: code`, and session persistence. It is off by default.
+
+Leave `streaming` unset on the preset's plugin row to follow this profile preference. An explicit `true` or `false` overrides it for that preset:
+
+```yaml
+- name: dsh-py-codeact
+  config:
+    streaming: true
+```
+
+The live preference belongs to the profile's `py-codeact-settings` entry, installed by the [bundle patch](cordis.patch.yml). The execution row retains ordinary configuration lifecycle rules; editing its explicit override can remount the plugin and discard interpreter state.
+
+The plugin reads the same `agent/assistant-stream` events as the WebUI. [partial-python](https://github.com/promplate/partial-python) executes each stable statement once in the existing namespace; the final tool invocation joins that execution. Streaming execution uses the host's public plugin APIs. Source admission passes through the normal tool policy pipeline and is persisted before execution; bridged tools retain the step's tool set, sandbox policy, and approval checks. Streaming admission authorizes code that is still arriving, so retain whole-cell mode when approval must inspect the complete program.
+
+Early admission uses the internal `<toolName>_stream` capability (`python_stream` by default). Tool-name policies must cover this capability as well as the final `python` call; approving the final call cannot undo earlier effects. Durable context notices record admission and its accepted outcome, so a restart can report effects even when no complete assistant tool call was committed.
+
+Streaming uses raw Python with top-level `await`. Use `print(...)` for output and `help(...)` for introspection; IPython magics, shell escapes, history updates, and automatic final-expression echo are unavailable. Stable statements inside `if`, `with`, and `async with` may run before the block closes. Loops, `try`, function definitions, and other unsupported compound kinds wait for their complete statement. Open contexts span source generation: time spent waiting for tokens counts toward `asyncio.timeout()`, and locks or transactions may stay open longer.
+
+Truncation, malformed arguments, disconnects, and cancellation abort pending source and unwind open contexts before the step settles. Earlier effects remain; the plugin never reruns the source to recover or automatically retries a model attempt after execution starts. CPU-bound code still uses the kernel's interrupt escalation. A restored admission with no conclusive result is reported to the model as an unknown outcome, not as proof that nothing ran; interpreter memory is not restored.
+
+One streamed Python call is supported per response. Other direct tools remain unavailable in exclusive CodeAct mode. The generated tool description and SDK instructions explain these rules to the model. A configured `python` or `command` interpreter must supply [`partial-python~=0.1.0`](https://github.com/promplate/partial-python) as well as IPython and objprint; the default `uv` setup installs them from the worker's PEP 723 metadata.
 
 ## Cancellation
 
@@ -225,13 +257,17 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 
   The interpreter is then spawned **directly**, never behind `uv run --script`. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an `[the interpreter was restarted]` notice nothing actually caused. `alive` is likewise tracked from the exit event rather than read off `proc.killed`, which Node sets on any `kill()` call, including a signal the process survived.
 - **Containment, not a security boundary.** A separate process with a curated environment, but model code can `import os`. Treat a session on this preset as shell access.
-- **One interpreter per conversation tree, one shell per agent.** A subagent reuses the parent's process — sharing its event loop, `sys.modules`, installed packages and `__dsh__.shared` — but gets its own globals and its own tool catalogue. Costs an `init` frame, not another interpreter.
+- **One shell per agent.** Under `danger-full-access`, a subagent can reuse its parent's process — sharing its event loop, `sys.modules`, installed packages and `__dsh__.shared` — while keeping its own globals and tool catalogue. Confined sessions use separate interpreters.
 - **`__dsh__.shared`** is the one deliberate crack in that isolation: a module every agent in the process can read and write, for handing live objects across a fan-out with no serialization and no tokens.
 - Shells close with their session; the process goes when the last agent pointing at it does.
 
 ## Environment
 
 By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM` — not the empty environment the worker-thread runtime uses. CPython running IPython needs a profile dir and a `PATH` for shell escapes; the point is excluding ambient credentials, which an allowlist does just as well. `inheritEnv: true` passes the whole harness environment.
+
+Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
+
+Changing a session’s sandbox mode or effective working directory retires its existing kernel, so variables and open handles are lost. Pending bridged calls are cancelled and drained before a replacement starts. Confined kernels are not shared across session identities. Unrestricted parent/child sessions with the same working directory may still share one process.
 
 `COLUMNS`/`LINES` are pinned inside the kernel: with no TTY, `get_terminal_size()` falls back to 80×24 and wraps tracebacks and pretty output far narrower than the harness renders at.
 
@@ -241,17 +277,31 @@ By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `L
 dsh plugin --profile <name> add dsh-py-codeact
 ```
 
-Then add the row from `example/agent.cordis.yml` to a preset you own.
+On DSH 0.2.2 and other hosts with the split tool-executor API, the Python SDK renderer is **required**. Install it alongside the plugin, using the exact version of your DSH host (for example, `0.2.2-rc.1`):
+
+```sh
+dsh plugin --profile <name> add dsh-py-codeact @deepseek-ai/dsh-tool-executor-ptc@<dsh-version>
+```
+
+The renderer peer is optional in package metadata only to preserve legacy hosts, which export the renderer from `dsh-tools` and cannot satisfy the new executor's host peers. Split-API hosts must provide it; a missing renderer produces an explicit installation error. Other import failures retain their original diagnostic.
+
+On DSH 0.2.2, add the row from `example/agent.cordis.yml` to an owned `@deepseek-ai/dsh-agent-preset` declaration's `config.plugins` through a profile bundle patch. Inspect the existing composition first and retain its realms, tools, sandbox, and approval providers. The registry accepts declarative plugin rows; it does not scan preset directories or provide `copy()`.
+
+Headless is preset-free. Insert the row directly into its profile overlay and disable the existing `tool-executor-native` row; each scope allows one executor. Keep the normal headless services. Streaming additionally needs `sessions`, `sessionProjections`, and `llm`; the plugin follows those services' lifecycle and waits for persistence before executing source.
 
 The kernel provisions its own Python from the PEP 723 header in `py/kernel.py`, so `uv` is the only prerequisite beyond dsh itself; the first cell pays for that resolve and later ones are warm.
 
-**For the card, also list the package in the profile's `dsh.profile.bundles`** (`~/.dsh/profiles/<name>/package.json`). The browser bundle is served only for packages named by an *enabled Loader entry*, and a preset's rows are per-session — they are not in the profile's entry list at boot, so a preset-only mount never gets its card. This package's own `cordis.patch.yml` therefore inserts one profile-level row carrying `uiOnly: true`, which makes the host half a no-op there: mounting it at profile level would register `python` globally and apply exclusive mode's guard to every preset. Never edit a shipped preset — copy it first (`ctx.agentPresets.copy('standard', 'py-codeact')`) and mount-validate the result with `standingKeyFor('py-codeact')`.
+**For the card, also list the package in the profile's `dsh.profile.bundles`** (`~/.dsh/profiles/<name>/package.json`). The browser bundle is served only for packages named by an enabled Loader entry. This package's `cordis.patch.yml` inserts a profile-level row with `uiOnly: true` to load the card without registering an executor globally. Keep execution in the selected preset's composition; only preset-free hosts such as headless should mount the executor at profile level.
 
 ## Verified end to end
 
 Against `Macaron V1 Venti` on a real dsh session. Given a plain task — "read this CSV and tell me which region earned most", with no mention of Python or the module — the model imported from `__dsh__.tools`, ran the cell, and answered with a table. The request carried exactly one tool schema (`python`); all 33 others were reachable only from inside the cell, and the bridged `read` appears as a `SUBTOOL` row under the `python` call in the trajectory tab. A `headless` run completes and exits in ~11s.
 
+Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged effects occurred before provider completion, each ran once, a second call reused the namespace, and the persisted session restored its recovery notice. The same task in whole-cell mode produced effects only after generation finished.
+
 ## Test
+
+`bun run test` covers the minimum supported host. `bun run test:streaming` requires a matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams. CI installs each host set separately.
 
 ```sh
 node test/smoke.js

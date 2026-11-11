@@ -2,24 +2,32 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "ipython~=9.17.0",
+#     "ipython~=9.18.1",
 #     "objprint~=0.3.0",
+#     "partial-python~=0.1.0",
 # ]
 # # Checked with `TY_UV=scripts ty check py/kernel.py` — that prefix is what hands ty this script's venv. A `ty.toml` would be found and then silently ignored for PEP 723 scripts (astral-sh/ty#4083), so any ty config has to live here.
 # ///
 
 """Persistent IPython kernel for the dsh CodeAct REPL tool.
 
-One long-lived process per conversation tree, holding one `InteractiveShell` per agent. A namespace survives between cells — that is the whole point, and the reason this cannot be a `CodeRuntime` backend (that seam mandates "no state survives between runs").
+Each agent has one `InteractiveShell`; only unrestricted sessions may share a long-lived process across a conversation tree. Namespaces survive between cells, retaining IPython magics, history and introspection. DSH also supports persistent PTC runtimes; this kernel is exposed through an ordinary tool plugin.
 
-Cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
+Whole cells run through `InteractiveShell.run_cell_async`, which carries magics, top-level `await`, `store_history` (`_`, `Out[n]`), and IPython's own traceback formatter. Structure and the LLM-specific touches (redundant-import hints, objprint reprs) follow `CNSeniorious000/temporary-mcp-servers:ipython-mcp.py`.
 
-Wire protocol: JSON-lines on fd 3. stdout/stderr stay free for native writes.
+Streaming cells use `partial_python.Executor` in one owner task. They share the namespace but bypass IPython transformations, history and expression echo. Only a matching successful source finish supplies EOF.
 
-Every frame but `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
+Wire protocol: JSON-lines on the inherited control channel (fd 7 under DSH, fd 3 standalone). stdout/stderr stay free for native writes.
+
+Every frame but `call_state`, `result` and `shutdown` carries `shell` — the agent whose shell it addresses, defaulting to "main". One process holds one shell per agent, so a fan-out of subagents shares this interpreter, its event loop and its packages while keeping separate globals.
 
   host  -> child  {"t":"init","shell":S,"tools":[{"name","doc","returns","params":[...]}]}
                   {"t":"exec","id":N,"shell":S,"code":"...","tools":[...]}
+                  {"t":"stream_start","id":N,"shell":S,"tools":[...]}
+                  {"t":"stream_append","id":N,"shell":S,"text":"..."}
+                  {"t":"stream_finish","id":N,"shell":S,"source":"..."}
+                  {"t":"stream_abort","id":N,"shell":S,"message":"..."}
+                  {"t":"call_state","id":N,"phase":"queued"|"started"}
                   {"t":"result","id":N,"ok":true,"value":<json>}
                   {"t":"result","id":N,"ok":false,"tool":"read","message":"..."}
                   {"t":"interrupt","shell":S} | {"t":"dispose","shell":S} | {"t":"shutdown"}
@@ -44,16 +52,20 @@ if _inherited := os.environ.get("DSH_CODEACT_INHERIT_SITE"):
 
 # These sit below the two blocks above on purpose: COLUMNS/LINES must be set before IPython reads the terminal size, and the inherited site-packages must be on the path before IPython is imported at all.
 import asyncio
+import atexit
 import contextlib
 import inspect
 import io
 import json
 import keyword
-import select
+import shutil
+import subprocess
 import sys
+import tempfile
 import traceback
 import types
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass, field
 from dis import get_instructions
 from functools import lru_cache, wraps
 from inspect import isclass
@@ -64,7 +76,8 @@ from IPython.lib.pretty import pretty
 from objprint import ObjPrint
 from traitlets.config import Config
 
-PROTOCOL_FD = 3
+# DSH's managed subprocess control channel uses fd 7; standalone launches retain fd 3.
+PROTOCOL_FD = 7 if os.environ.pop("DSH_SUBPROCESS_CONTROL", None) == "pipe" else 3
 
 # Wire default for the `shell` field. The JS host holds its own copy of this literal — the seam is the one place the two languages must agree by hand.
 DEFAULT_SHELL = "main"
@@ -75,6 +88,79 @@ REAL_STDERR = sys.stderr
 # `uv pip install <pkg>` inside a cell has to know WHICH environment to install into. The harness spawns us with an allowlisted environment that deliberately drops VIRTUAL_ENV, and without it uv refuses outright — while IPython's `!cmd` does not fail on a non-zero exit, so the cell reports success and the import fails a cell later, with nothing connecting the two.
 if sys.prefix != sys.base_prefix:
     os.environ.setdefault("VIRTUAL_ENV", sys.prefix)
+
+# The host deletes this throwaway venv when it disposes the kernel, but a harness that is signalled or crashes never reaches that point — while the kernel it leaves behind still exits cleanly on EOF, which is the last moment anyone owns the directory. `DSH_CODEACT_INHERIT_SITE` is set on exactly the path where the host built one, and the name prefix keeps this off a venv that is not ours (`config.python`, `ephemeralEnv: false`).
+if os.environ.get("DSH_CODEACT_INHERIT_SITE") and Path(sys.prefix).name.startswith("dsh-py-codeact-"):
+    atexit.register(shutil.rmtree, sys.prefix, ignore_errors=True)
+
+# ── the execution fence can take the terminal away ───────────────────────────
+# A pty is a device node, and creating one opens `/dev/ptmx` for WRITING. `read-only` and `workspace-write` fence this
+# process with `(allow default) (deny file-write*)` plus the workspace and temp roots, so that open returns EPERM and
+# `pty.openpty()` degrades through the legacy `/dev/pty*` scan to the misleading `OSError: out of pty devices`. `!cmd` has
+# no use for a terminal — but IPython's default `system` is `system_piped`, and `system_piped` spawns through pexpect,
+# whose entire design is "the child runs on a pty". So every `!cmd` cell dies before its command starts, pointing at
+# IPython rather than at the fence. Probe once here and, when there is no pty to be had, hand each shell a pipe runner.
+
+
+def _pty_available() -> bool:
+    try:
+        master, slave = os.openpty()
+    # Windows has no `os.openpty` at all, and under a fence the open itself fails — neither may abort the import.
+    except (AttributeError, OSError):
+        return False
+    os.close(master)
+    os.close(slave)
+    return True
+
+
+PTY_AVAILABLE = _pty_available()
+
+
+def _pipe_system(shell):
+    """`system_piped` without the terminal: the same `{var}` expansion, merged streams, `_exit_code` and raise contract, but the child runs on pipes, so its output streams into the cell instead of vanishing into a pty this process cannot open. Returning None matters — `!cmd` is the cell's transformed expression, and any non-None return would be echoed back as the cell's value."""
+
+    def system(cmd: str) -> None:
+        # A backgrounded child inherits the pipe, so the read loop below would block until IT exits — the same reason IPython's own `system_piped` refuses these.
+        if cmd.rstrip().endswith("&"):
+            raise OSError("Background processes not supported.")
+        with subprocess.Popen(shell.var_expand(cmd, depth=1), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+            output = process.stdout
+            assert output is not None  # stdout=PIPE always supplies the stream.
+            for chunk in iter(lambda: output.read(8192), ""):
+                sys.stdout.write(chunk)
+            sys.stdout.flush()
+            returncode = process.wait()
+        shell.user_ns["_exit_code"] = returncode
+        if shell.system_raise_on_error and returncode != 0:
+            raise subprocess.CalledProcessError(returncode, cmd)
+
+    return system
+
+
+# `uv`'s cache defaults to `~/.cache/uv`, outside every writable root above, so a fenced `!uv pip install` dies at `Could not acquire lock … Operation not permitted` before resolving a single package. Point it somewhere writable when the default is not — but this runs at import, so every step of it has to be fail-soft: `tempfile.gettempdir()` is not a getter, it PROBES candidates by creating a file and raises `FileNotFoundError` when none is usable, which in a read-only session kills the kernel before it can say why. Read `TMPDIR` for the fallback's home instead: both it and `/tmp` are writable roots, the host forwards `TMPDIR` deliberately, and reading it needs no probe. Do NOT hang it off `sys.prefix` — with an explicit `command` that is the user's own venv and we would create a cache inside their project. Name it into the host's own pid-tagged namespace (`dsh-py-codeact-<harness pid>-…`, the one its venvs already use) so the sweep the host runs on a cold start reclaims it; a plain name would sit in the OS temp dir forever, since that sweep only ever matches a pid-tagged entry. That sweep sits behind the same early return as the venv, so a kernel configured with an explicit `command` is never swept — the OS temp cleanup is what bounds it there.
+
+
+def _writable_directory(directory: Path) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, probe = tempfile.mkstemp(dir=directory)
+    except OSError:
+        return False
+    os.close(descriptor)
+    Path(probe).unlink()
+    return True
+
+
+def _uv_cache_directory() -> Path:
+    """Where `uv` puts its cache when left alone: `UV_CACHE_DIR` is handled by the caller, then the XDG cache dir, then `~/.cache`."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uv"
+
+
+if "UV_CACHE_DIR" not in os.environ and not _writable_directory(_uv_cache_directory()):
+    _uv_cache = Path(os.environ.get("TMPDIR") or "/tmp") / f"dsh-py-codeact-{os.getppid()}-uv-cache"
+    # Nothing is writable in a read-only session, and an install there is a contradiction anyway — leave uv's own error rather than failing at import.
+    if _writable_directory(_uv_cache):
+        os.environ["UV_CACHE_DIR"] = str(_uv_cache)
 
 # Cap one cell's captured output. The host caps the whole result again; this only stops a runaway loop from exhausting memory before the host sees it.
 MAX_STREAM_BYTES = 1 << 20
@@ -179,23 +265,65 @@ def format_import_hint(keys):
 # ── tool bridge ──────────────────────────────────────────────────────────────
 
 
+TOOL_CALL_TIMEOUT = 660
+
+
 class Bridge:
     """Outbound tool dispatch: one pending future per in-flight call."""
 
     def __init__(self, send) -> None:
         self._send = send
         self._pending: dict = {}
+        self._timeouts: dict[int, tuple[asyncio.Timeout, bool]] = {}
         self._next = 0
+        self._sends: set = set()  # hold fire-and-forget send tasks so the GC cannot drop a `call` frame mid-flight
 
-    def call(self, name: str, args):
+    def call(self, name: str, args, timeout: asyncio.Timeout | None = None):
         self._next += 1
         call_id = self._next
         future = asyncio.get_running_loop().create_future()
         self._pending[call_id] = future
+        if timeout is not None:
+            self._timeouts[call_id] = (timeout, False)
         # There is ONE Bridge for the whole process, so the frame has to say which shell is calling or the host cannot tell a parent's in-flight call from a subagent's. The ContextVar already routes stdout, the displayhook and `__dsh__.tools` the same way, and `create_task` snapshots it — so a task the model detached keeps naming the shell that created it.
         session = _current_session.get()
-        self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+
+        # `_send` is async (it yields to the loop while the fd-3 buffer drains), but `call` stays sync so the binding can `return await bridge.call(...)` and hand the cell the Future itself to await — `await` on a coroutine that returned a Future would hand the cell a pending Future instead of its resolved value. A `call` frame is tiny, so fire it as a task: it runs immediately and only yields if the buffer is full, never blocking the caller. If `_send` itself raises (e.g. json.dumps hitting a raising __str__), fail the call instead of hanging the awaiter — the future's done callback then pops `_pending`.
+        async def _send_call():
+            try:
+                await self._send({"t": "call", "id": call_id, "shell": None if session is None else session.shell_id, "name": name, "args": args})
+            except Exception as exc:  # noqa: BLE001 - _send is host-provided; any failure must not leak the future
+                if not future.done():
+                    future.set_exception(exc)
+
+        context = copy_context()
+        context.run(_current_session.set, None)  # Protocol writes must finish even when their owning session closes.
+        send = asyncio.create_task(_send_call(), context=context)
+        send.add_done_callback(self._sends.discard)
+        self._sends.add(send)
+
+        # One done callback for both jobs. Popping `_pending` is the leak safety net: if the host never replies, or `_send` raised and we failed the future ourselves, or a `wait_for` timeout cancelled it, the entry still leaves. Cancelling `send` is the side-effect one: a cancelled or timed-out call whose frame has not gone out yet must not reach the host at all, or the tool runs and its side effects land after the cell already reported the call as cancelled. A frame mid-write is past that point — `_send` holds the lock and shields the drain wait, so it finishes the line rather than splicing the next frame onto a stump.
+        def finish(_):
+            self._pending.pop(call_id, None)
+            self._timeouts.pop(call_id, None)
+            send.cancel()
+
+        future.add_done_callback(finish)
         return future
+
+    def progress(self, call_id, phase) -> None:
+        future = self._pending.get(call_id)
+        state = self._timeouts.get(call_id)
+        if future is None or future.done() or state is None:
+            return
+        timeout, started = state
+        if timeout.expired() or started:
+            return
+        if phase == "queued":
+            timeout.reschedule(None)
+        elif phase == "started":
+            timeout.reschedule(asyncio.get_running_loop().time() + TOOL_CALL_TIMEOUT)
+            self._timeouts[call_id] = (timeout, True)
 
     def settle(self, call_id, ok, value, tool, message) -> None:
         future = self._pending.pop(call_id, None)
@@ -215,7 +343,10 @@ def _make_binding(bridge: Bridge, spec):
     renames = {p["name"]: p["raw"] for p in spec.get("params") or [] if p.get("raw")}
 
     async def call(**kwargs):
-        return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs)
+        # Keep an orphan-result deadline above the documented 600s delegation budget. An explicit
+        # host queue receipt suspends it until execution starts; caller/cell cancellation still applies.
+        async with asyncio.timeout(TOOL_CALL_TIMEOUT) as timeout:
+            return await bridge.call(name, {renames.get(key, key): value for key, value in kwargs.items()} if renames else kwargs, timeout)
 
     call.__name__ = name if name.isidentifier() else "call"
     call.__qualname__ = f"__dsh__.tools.{name}"
@@ -260,10 +391,12 @@ class ToolsModule(types.ModuleType):
 
     `sys.modules` is process-global, so there is exactly ONE of these no matter how many shells are live — yet each agent sees a different catalogue (a subagent's `toolFilter` narrows it, and restrictions move tools in and out between cells). So the bindings live on the Session and every lookup routes through the ContextVar; putting them in `__dict__` would hand every shell the last writer's catalogue."""
 
+    # A class attribute, not an instance one: normal lookup finds it before `__getattr__` ever runs, and the `__setattr__` guard below cannot touch the class body. `ToolCallError` is a harness-provided exception type the model is told to catch, not a tool binding.
+    ToolCallError = ToolCallError
+
     def __init__(self) -> None:
         super().__init__("__dsh__.tools", "Harness tools, bridged into this session as awaitables.")
         self.__path__ = []  # a package, so `__dsh__.tools.mcp` resolves under it
-        self.ToolCallError = ToolCallError
 
     def __getattr__(self, name):  # only reached when the attribute is absent
         if name.startswith("__"):
@@ -275,6 +408,14 @@ class ToolsModule(types.ModuleType):
         # the trajectory at the one moment the model is guaranteed to be reading it.
         available = ", ".join(sorted(listed_tools())) or "(none)"
         raise AttributeError(f"no such tool: {name!r}. Available: {available}")
+
+    def __setattr__(self, name, value):
+        # One ToolsModule per process, shared by every agent — a write here would shadow that name
+        # for all of them, permanently and invisibly to `dir()`, which keeps reporting the tool it
+        # no longer reaches. The old per-call `Namespace` made this a local mistake.
+        if not (name.startswith("__") and name.endswith("__")):
+            raise AttributeError("__dsh__.tools belongs to the harness and is shared by every agent in this process — bind your own name instead of writing to it")
+        super().__setattr__(name, value)
 
     def __dir__(self):
         return sorted(listed_tools())
@@ -400,8 +541,9 @@ def alias(members: dict) -> None:
     `setdefault`, so a name that already exists keeps its own value: a server exposing `a-b` beside
     `a_b` gets no alias for `a-b`, and both stay reachable under their own spellings.
     """
-    for raw in [name for name in members if spellable(name) is not None]:
-        members.setdefault(spellable(raw), members[raw])
+    for raw in list(members):  # a snapshot: `setdefault` below adds the folds mid-loop
+        if (fold := spellable(raw)) is not None:
+            members.setdefault(fold, members[raw])
 
 
 def canonical(server: str, servers: dict) -> str:
@@ -438,8 +580,12 @@ def mcp_members(module_name: str) -> dict:
 
     Deliberately not a method: a non-dunder attribute on the class would shadow a tool or a server
     of that name, and a raw MCP name is the server's to choose — `_private` is a legal one.
+
+    Reads the `mcp_servers` tree cached on the Session by `rebind`, so an attribute access does not
+    rebuild the whole tree (O(n)) when nothing has changed.
     """
-    servers = mcp_servers({name: call for name, call in bound_tools().items() if servable(name) is not None})
+    session = _current_session.get()
+    servers = session.mcp_tree if session is not None else {}  # no session → no bound tools → no tree
     if module_name == MCP_MODULE:
         # Keyed by the FOLDED name so a hyphenated server and its fold resolve to one module object,
         # not two: `listed` tells an alias from a real neighbour by identity, and two objects would
@@ -519,7 +665,7 @@ def mcp_server_module(server: str) -> McpModule:
     return module
 
 
-def install_mcp_modules(bindings: dict) -> None:
+def install_mcp_modules(servers: dict[str, dict]) -> None:
     """Register a module per visible MCP server.
 
     Eager, because the deep import form never reaches `mcp_members`: `from __dsh__.tools.mcp.x
@@ -529,19 +675,27 @@ def install_mcp_modules(bindings: dict) -> None:
     `sys.modules` only ever gains entries: a server another shell can see costs this one an unused
     module, while removing it would break an import that shell is mid-conversation with. What a
     shell can actually reach is decided by `mcp_members`, not by what is registered.
+
+    Takes the grouped tree from `build_bindings` so `rebind` does not rebuild it a second time.
     """
-    for server in mcp_servers(bindings):
+    for server in servers:
         mcp_server_module(server)
 
 
-def build_bindings(bridge: Bridge, specs) -> dict:
-    """Project one agent's visible tools into awaitables for its shell."""
+def build_bindings(bridge: Bridge, specs) -> tuple[dict, dict[str, dict]]:
+    """Project one agent's visible tools into awaitables for its shell.
+
+    Returns `(bindings, mcp_servers)` so `rebind` can hand the grouped tree to
+    `install_mcp_modules` and cache it for `mcp_members` without rebuilding it.
+    """
     # A tool named `ToolCallError` would be shadowed by the module's own attributes, and one named `_rebind` used to overwrite a bound method outright. dsh's own SDK renderer refuses `_`-leading tool names for exactly this collision class.
     # `mcp` joins them, and unconditionally: it used to be bound and then overwritten by the namespace, so the tool was uncallable anyway — but only when an MCP server happened to be mounted. A name that means the namespace in one catalogue and a tool in the next is worse than one that always means the same thing.
-    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"ToolCallError", "mcp"}
+    reserved = set(vars(ToolsModule)) | set(vars(types.ModuleType)) | {"mcp"}
     flat = {spec["name"]: _make_binding(bridge, spec) for spec in specs if not spec["name"].startswith("_") and spec["name"] not in reserved}
     # `mcp` only when something is under it: an empty namespace in `dir()` reads as a broken mount.
-    return {**flat, "mcp": MCP_ROOT} if mcp_servers(flat) else flat
+    servers = mcp_servers(flat)
+    bindings = {**flat, "mcp": MCP_ROOT} if servers else flat
+    return bindings, servers
 
 
 def install_bridge_modules() -> ToolsModule:
@@ -611,7 +765,7 @@ class Capped(io.TextIOBase):
     """Byte-capped StringIO stand-in for one cell's stdout or stderr."""
 
     def __init__(self, limit: int) -> None:
-        self.parts: list = []
+        self.parts: list[bytes] = []
         self.size = 0
         self.limit = limit
         self.truncated = False
@@ -623,11 +777,11 @@ class Capped(io.TextIOBase):
                 room = self.limit - self.size
                 if room > 0:
                     # "ignore", not "replace": slicing encoded bytes at the cap can land mid-character, and "replace" would hand the model a U+FFFD. Dropping the partial character is honest.
-                    self.parts.append(chunk[:room].decode("utf-8", "ignore"))
+                    self.parts.append(chunk[:room])
                     self.size += room
                 self.truncated = True
             else:
-                self.parts.append(s)
+                self.parts.append(chunk)
                 self.size += len(chunk)
         return len(s)
 
@@ -635,7 +789,7 @@ class Capped(io.TextIOBase):
         return True
 
     def text(self) -> str:
-        body = "".join(self.parts)
+        body = b"".join(self.parts).decode("utf-8", "ignore")
         return f"{body}\n[dsh-py-codeact] output truncated at {self.limit} bytes" if self.truncated else body
 
 
@@ -646,11 +800,25 @@ class Session:
 
     def __init__(self, bridge: Bridge, specs, shell_id: str) -> None:
         self.shell_id = shell_id
+        self.tasks: set = set()
+        self.closing = False
+        self.closed = False
         namespace = HintingNamespace()
         # `:memory:` because a bare `InteractiveShell` writes every cell into the USER's own `~/.ipython/profile_default/history.sqlite` — measured at 87 MB / 47k cells here, shared with their interactive ipython, contended by every kernel process at once, and growing with nothing to prune it. Model cell sources have no business in that file; the session log is the audit record. `_ih`, `_` and `Out[n]` all still work, which is what `repr` is built from.
         history = Config()
         history.HistoryAccessor.hist_file = ":memory:"
-        self.shell = InteractiveShell(user_ns=namespace, config=history)
+        self.shell = InteractiveShell(user_ns=namespace, config=history, ipython_dir=os.environ.get("IPYTHONDIR"))
+        # No pty means no pexpect (see PTY_AVAILABLE), so `!cmd` gets the pipe runner. An unfenced host keeps `system_piped`, whose pexpect path gives cells colors and interactivity that pipes cannot.
+        if not PTY_AVAILABLE:
+            self.shell.system = _pipe_system(self.shell)
+        # The specs last bound, so an identical catalogue (the common case — a restriction that
+        # did not change anything, or the same tools re-sent) skips `rebind` and its per-tool
+        # callable + signature rebuild. `None` means "nothing bound yet"; `==` on the parsed
+        # structures still catches a catalogue the host re-serialised, which identity would miss.
+        self._last_specs: list | None = None
+        # The grouped `mcp_servers` tree from the last `rebind`, cached so `mcp_members` reads it
+        # (O(1) lookup) instead of rebuilding it on every attribute access.
+        self.mcp_tree: dict[str, dict] = {}
         self.rebind(bridge, specs)
         self.sinks: list = [None, None]  # the Capped buffers of the cell in flight
         install_bridge_modules()
@@ -677,11 +845,11 @@ class Session:
             with contextlib.redirect_stdout(REAL_STDERR), contextlib.redirect_stderr(REAL_STDERR):
                 return original(*args, **kwargs)
 
-        self.shell._showtraceback = wrapper  # noqa: SLF001  # ty: ignore[invalid-assignment]
+        self.shell._showtraceback = wrapper  # noqa: SLF001
 
         # Keep the display hook's bookkeeping — it binds `_`/`Out[n]` and fills `result.result`, which is where `repr` comes from — but drop its `Out[1]: …` echo. That echo goes to stdout, so the model would see every returned value twice, once in <stdout> and once in <return>.
-        self.shell.displayhook.write_output_prompt = lambda: None  # ty: ignore[invalid-assignment]
-        self.shell.displayhook.write_format_data = lambda *_args, **_kwargs: None  # ty: ignore[invalid-assignment]
+        self.shell.displayhook.write_output_prompt = lambda: None
+        self.shell.displayhook.write_format_data = lambda *_args, **_kwargs: None
         # The instructions tell the model to end every cell on the value worth seeing, so `Out[n]` pins one live object per cell — at the default 1000 that is the last 1000 dataframes. Still reachable as `_`/`Out[n]`, just bounded.
         self.shell.displayhook.cache_size = 100
 
@@ -704,9 +872,23 @@ class Session:
         The one place the `sys.modules` registration lives, so `build_bindings` stays the pure
         projection its name promises and no caller can produce bindings the import machinery
         cannot follow.
+
+        Skipped when the specs equal the last bound set: `build_bindings` rebuilds
+        every tool callable + `inspect.Signature` per exec, and the common case is a catalogue that
+        never changed between cells. `==` on the parsed structures catches a catalogue the host
+        re-serialised, which object identity would miss.
         """
-        self.bindings = build_bindings(bridge, specs)
-        install_mcp_modules(self.bindings)
+        if specs == self._last_specs:
+            return
+        self.bindings, servers = build_bindings(bridge, specs)
+        install_mcp_modules(servers)
+        # `mcp_members` reads a servable-filtered tree: a true-dunder raw name (e.g. `__odd__`) is
+        # reachable via the flat name and the deep import, never via `mcp.<server>.<tool>`, so the
+        # server it sits under is absent from `dir(mcp)`. `install_mcp_modules` takes the unfiltered
+        # tree so the server module is still registered for the deep import form.
+        self.mcp_tree = mcp_servers({name: call for name, call in self.bindings.items() if servable(name) is not None})
+        # Recorded only once the build above has succeeded: a memo written before a raising spec would make a retry with the same specs early-return and silently serve the stale catalogue.
+        self._last_specs = specs
 
     def format_exc(self) -> str:
         """IPython's own traceback, rendered without ANSI colors."""
@@ -763,27 +945,138 @@ class Session:
 # ── kernel loop ──────────────────────────────────────────────────────────────
 
 
+@dataclass
+class SourceStream:
+    id: int
+    queue: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
+    parts: list[str] = field(default_factory=list)
+    size: int = 0
+    closed: bool = False
+    error: str | None = None
+    started: bool = False
+    replied: bool = False
+
+
 class Kernel:
     def __init__(self) -> None:
         self._out = os.fdopen(PROTOCOL_FD, "wb", buffering=0)
         self._bridge = Bridge(self._send)
+        # One frame at a time: `call` frames fire as tasks beside the `done`/`ready` frames this loop awaits, and a sender that yields mid-frame (buffer full) must not let another write into the gap — the host's `readline` would see two spliced frames and drop both.
+        self._send_lock = asyncio.Lock()
         # One Session per agent, one in-flight task per Session. Keyed by the shell id the host assigns; a fan-out of subagents lands here as N entries sharing this process, its event loop and its packages.
         self._sessions: dict = {}
         self._tasks: dict = {}
+        self._cleanups: set = set()
+        self._closing: dict = {}
+        self._deferred: dict = {}
+        self._streams: dict[str, SourceStream] = {}
+        self._last_stream_ids: dict[str, int] = {}
 
-    def _send(self, frame: dict) -> None:
-        # fd 3 is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
+    async def _send(self, frame: dict) -> None:
+        # The control descriptor is NON-BLOCKING: `asyncio.connect_read_pipe` sets O_NONBLOCK on it, and Node's `stdio[3]: 'pipe'` is one duplex socketpair, so the read and write ends are the same descriptor. A raw `write()` therefore stops at the socket send buffer (8 KiB on macOS) and reports how far it got — ignoring that return value truncated the frame mid-JSON, silently, and the next frame was concatenated onto the stump. The host then dropped one unparsable blob and the session wedged for good. `default=str` so the natural CodeAct idiom just works: the model globs with `pathlib` and passes the `Path` straight into a tool. Coercing here beats making every call site write `str(p)` — and beats a `TypeError` raised mid-frame, which is what used to happen. Same for `datetime`, `Decimal`, `UUID`, numpy scalars.
         # `errors="replace"` is load-bearing, not tidiness: a lone surrogate — routine from `surrogateescape` decoding, or any `Path` on a non-UTF-8 filename — passes `json.dumps` and then raises `UnicodeEncodeError` here. This send is what answers an exec, so a raise means no `done` frame ever arrives and the turn hangs forever. A U+FFFD in one string beats a wedged session.
         payload = memoryview((json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8", errors="replace"))
-        while payload:
-            try:
-                written = self._out.write(payload)
-            except BlockingIOError:
-                written = None
-            if written is None:  # the buffer is full; wait for the host to drain it
-                select.select([], [PROTOCOL_FD], [])
-                continue
-            payload = payload[written:]
+        loop = asyncio.get_running_loop()
+        async with self._send_lock:
+            cancelled = False
+            while payload:
+                try:
+                    written = self._out.write(payload)
+                except BlockingIOError:
+                    written = None
+                if written is None:  # the buffer is full; wait for the host to drain it — a bare `sleep(0)` would hot-spin a core until it does
+                    drained = loop.create_future()
+                    loop.add_writer(PROTOCOL_FD, self._writable, drained)
+                    try:
+                        await asyncio.shield(drained)
+                    except asyncio.CancelledError:
+                        # A cancel must not abandon a half-written frame: the next send splices onto the stump, the host drops both lines, and the aborted exec's `done` never arrives — the 5s `hardInterruptMs` backstop then SIGKILLs the whole kernel. Finish this frame first, then let the cancel through; the host answers a `done` once, so the replacement frame `_exec` sends next is ignored, not fatal.
+                        cancelled = True
+                    finally:
+                        loop.remove_writer(PROTOCOL_FD)  # a no-op when the callback already removed it; cancels a queued-but-unrun one
+                    continue
+                payload = payload[written:]
+            if cancelled:
+                raise asyncio.CancelledError
+
+    @staticmethod
+    def _writable(drained) -> None:
+        # Remove INSIDE the callback: a level-triggered selector re-fires a still-registered writer on every poll, and the future's done callbacks are `call_soon`-scheduled — the sender's `finally` above runs two loop batches later, by which time a re-fire would `set_result` on the already-done future.
+        asyncio.get_running_loop().remove_writer(PROTOCOL_FD)
+        drained.set_result(None)
+
+    @staticmethod
+    def _task_factory(loop, coro, **kwargs):
+        context = kwargs.get("context")
+        session = context.get(_current_session, _current_session.get()) if context is not None else _current_session.get()
+        if session is not None and session.closed:
+            coro.close()
+            raise RuntimeError("Session is closed")
+        if context is not None and _current_session not in context and session is not None:
+            context = context.copy()
+            context.run(_current_session.set, session)
+            kwargs["context"] = context
+        task = asyncio.Task(coro, loop=loop, **kwargs)
+        if session is not None:
+            session.tasks.add(task)
+            task.add_done_callback(session.tasks.discard)
+        return task
+
+    async def _dispose(self, shell, session, tasks) -> None:
+        # Finalizers may spawn helpers (gather, wait_for, async resource cleanup). Give those
+        # helpers the same deadline instead of cancelling them before they can release resources.
+        deadline = asyncio.get_running_loop().time() + 2
+        while tasks:
+            await asyncio.wait(tasks, timeout=max(0, deadline - asyncio.get_running_loop().time()))
+            tasks = {task for task in session.tasks | tasks if not task.done()}
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+        # A timer can retain this session after its last task ends. Only the cleanup window may spawn helpers.
+        session.closed = True
+
+        def release(task=None) -> None:
+            tasks.discard(task)
+            if not tasks and self._sessions.get(shell) is session:
+                self._sessions.pop(shell, None)
+                self._tasks.pop(shell, None)
+
+        if tasks:
+            # The deadline ends the wait, not ownership. Release the namespace when the last remaining task exits.
+            for task in tasks:
+                task.cancel()
+                task.add_done_callback(release)
+            print(f"[dsh-py-codeact] session {shell!r} retained {len(tasks)} task(s) after cancellation", file=REAL_STDERR)
+        else:
+            release()
+
+    async def _after_cleanup(self, shell, cleanup) -> None:
+        try:
+            await cleanup
+            while self._deferred.get(shell):
+                cleanup = self._closing.get(shell)
+                if cleanup is not None and not cleanup.done():
+                    await cleanup
+                    continue
+                # Leave unprocessed frames visible to cancellation while a ready/done write is blocked.
+                await self._handle(self._deferred[shell].pop(0), replay=True)
+        finally:
+            self._deferred.pop(shell, None)
+
+    async def _cancel_deferred(self, shell, *, dispose=False) -> None:
+        frames = self._deferred.get(shell, [])
+        if shell in self._deferred:
+            self._deferred[shell] = [] if dispose else [frame for frame in frames if frame.get("t") != "exec" and not str(frame.get("t")).startswith("stream_")]
+        for frame in frames:
+            if frame.get("t") == "stream_start" and isinstance(exec_id := frame.get("id"), int):
+                self._last_stream_ids[shell] = max(exec_id, self._last_stream_ids.get(shell, 0))
+            if frame.get("t") in ("exec", "stream_start"):
+                await self._send(
+                    {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "InterruptedError: deferred cell cancelled", "repr": None, "note": None}
+                )
+
+    def _busy(self, shell) -> bool:
+        running = self._tasks.get(shell)
+        return running is not None and not running.done()
 
     def _session_for(self, shell, specs=None) -> Session:
         session = self._sessions.get(shell)
@@ -813,31 +1106,163 @@ class Kernel:
                 "repr": None,
                 "note": None,
             }
-        self._send(frame)
+        await self._send(frame)
 
-    def _handle(self, frame: dict) -> None:
+    def _abort_stream(self, shell, message: str) -> None:
+        state = self._streams.get(shell)
+        if state is None:
+            return
+        if state.error is not None:
+            return  # Repeated abort frames must not cancel an asynchronous finalizer again.
+        state.error = message
+        state.closed = True
+        state.queue.put_nowait(None)
+        # Cancelling a task before its first step skips its finally block and the done frame.
+        # Let an unstarted owner observe the error itself instead.
+        if state.started and self._busy(shell):
+            self._tasks[shell].cancel()
+
+    async def _exec_stream(self, exec_id, shell, state: SourceStream) -> None:
+        from partial_python import Executor
+
+        state.started = True
+        session = self._session_for(shell)
+        redundant = []
+        session_token = _current_session.set(session)
+        hint_token = _redundant_imports.set(redundant)
+
+        async def chunks():
+            while True:
+                if state.error is not None:
+                    raise RuntimeError(state.error)
+                delta = await state.queue.get()
+                if state.error is not None:
+                    raise RuntimeError(state.error)
+                if delta is None:
+                    return
+                yield delta
+
+        try:
+            # One owner and capture for the logical cell: parser flushes must not reset
+            # task-local tool routing, output, or the lifetime of detached Python tasks.
+            error = None
+            with session._capture() as captured:  # noqa: SLF001 — the kernel owns the Session capture lifecycle
+                try:
+                    async with contextlib.aclosing(Executor(session.shell.user_ns).stream(chunks())) as events:
+                        async for _ in events:
+                            pass
+                except BaseException as exc:  # noqa: BLE001 — user code must produce a done frame even for SystemExit
+                    error = state.error or (
+                        "InterruptedError: the harness cancelled this streaming cell. Earlier effects remain."
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                    )
+            stdout, stderr = captured
+            frame = {"t": "done", "id": exec_id, "shell": shell, "ok": error is None, "stdout": stdout, "stderr": stderr, "repr": None, "error": error, "note": format_import_hint(redundant)}
+        finally:
+            _redundant_imports.reset(hint_token)
+            _current_session.reset(session_token)
+            if self._streams.get(shell) is state:
+                self._streams.pop(shell, None)
+        state.replied = True
+        await self._send(frame)
+
+    async def _handle(self, frame: dict, *, replay=False) -> None:
         kind = frame.get("t")
         shell = frame.get("shell") or DEFAULT_SHELL
-        if kind == "exec":
-            running = self._tasks.get(shell)
-            if running is not None and not running.done():
+        if not replay and kind in ("init", "exec", "stream_start", "stream_append", "stream_finish", "stream_abort"):
+            cleanup = self._closing.get(shell)
+            if shell in self._deferred or (cleanup is not None and not cleanup.done()):
+                # Keep new frames behind the replay even after cleanup finishes.
+                # Replay in arrival order after cleanup; the host may send exec immediately
+                # after init without waiting for ready. Keep reading finalizers' tool results.
+                if shell not in self._deferred:
+                    self._deferred[shell] = []
+                    pending = asyncio.create_task(self._after_cleanup(shell, cleanup))
+                    self._cleanups.add(pending)
+                    pending.add_done_callback(self._cleanups.discard)
+                self._deferred[shell].append(frame)
+                return
+        if kind in ("exec", "stream_start"):
+            if kind == "stream_start":
+                exec_id = frame.get("id")
+                if type(exec_id) is not int or exec_id <= self._last_stream_ids.get(shell, 0):
+                    return  # Host execution ids increase per shell; retain one replay watermark.
+            if self._busy(shell) or (shell in self._sessions and self._sessions[shell].closing):
                 # Answer BEFORE rebinding: a rejected exec must not swap the tool table under the cell that is still running, or a binding it captured (`from __dsh__.tools import read`) can change identity — or vanish — between its start and its next await. The check is per shell: another agent's cell running is not a conflict.
-                self._send(
+                await self._send(
                     {"t": "done", "id": frame.get("id"), "shell": shell, "ok": False, "stdout": "", "stderr": "", "error": "kernel busy: a previous cell is still running", "repr": None, "note": None}
                 )
                 return
             specs = frame.get("tools")
             self._session_for(shell, specs if isinstance(specs, list) else None)
-            self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
+            if kind == "exec":
+                self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
+            else:
+                exec_id = frame.get("id")
+                assert isinstance(exec_id, int)  # Validated before the busy/rebind checks.
+                state = SourceStream(exec_id)
+                self._streams[shell] = state
+                self._last_stream_ids[shell] = exec_id
+                task = self._tasks[shell] = asyncio.create_task(self._exec_stream(exec_id, shell, state))
+
+                def stream_finished(done, state: SourceStream = state):
+                    error = None
+                    if done.cancelled() and not state.started:
+                        error = "InterruptedError: streaming cell cancelled before execution"
+                    elif not done.cancelled() and (exc := done.exception()) is not None:
+                        error = f"KernelError: streaming execution failed internally: {type(exc).__name__}: {exc}"
+                    if error is not None and not state.replied:
+                        state.replied = True
+                        if self._streams.get(shell) is state:
+                            self._streams.pop(shell, None)
+                        reply = asyncio.create_task(self._send({"t": "done", "id": exec_id, "shell": shell, "ok": False, "stdout": "", "stderr": "", "repr": None, "note": None, "error": error}))
+                        self._cleanups.add(reply)
+                        reply.add_done_callback(self._cleanups.discard)
+
+                task.add_done_callback(stream_finished)
+        elif kind in ("stream_append", "stream_finish", "stream_abort"):
+            state = self._streams.get(shell)
+            if state is None or state.id != frame.get("id"):
+                return  # Late frames from a finished/aborted source cannot affect the next cell.
+            if kind == "stream_abort":
+                self._abort_stream(shell, frame.get("message") or "SourceError: generation did not complete")
+            elif state.closed:
+                self._abort_stream(shell, "SourceProtocolError: source already closed")
+            elif kind == "stream_append":
+                text = frame.get("text")
+                size = len(text.encode("utf-8", errors="surrogatepass")) if isinstance(text, str) else 0
+                if not isinstance(text, str) or state.size + size > 2 << 20:
+                    self._abort_stream(shell, "SourceProtocolError: invalid or oversized source delta")
+                elif text:
+                    state.parts.append(text)
+                    state.size += size
+                    state.queue.put_nowait(text)
+            elif frame.get("source") != "".join(state.parts):
+                self._abort_stream(shell, "SourceProtocolError: final source differs from accepted deltas")
+            else:
+                state.closed = True
+                state.queue.put_nowait(None)
+        elif kind == "call_state":
+            self._bridge.progress(frame.get("id"), frame.get("phase"))
         elif kind == "result":
             self._bridge.settle(frame.get("id"), bool(frame.get("ok")), frame.get("value"), frame.get("tool"), frame.get("message"))
         elif kind == "interrupt":
-            running = self._tasks.get(shell)
-            if running is not None and not running.done():
-                running.cancel()
+            await self._cancel_deferred(shell)
+            # Disposal already cancelled the old cell; interrupting its replacement must not cancel that finalizer again.
+            if shell in self._sessions and self._sessions[shell].closing:
+                return
+            # A synchronous CPU-bound cell (`while True: pass`) blocks the event loop inside `exec`, so this interrupt frame sits unread and `task.cancel()` can't fire until the next `await` yields back to the loop.
+            if shell in self._streams:
+                self._abort_stream(shell, "InterruptedError: the harness cancelled this streaming cell. Earlier effects remain.")
+            elif self._busy(shell):
+                self._tasks[shell].cancel()
         elif kind == "init":
-            self._session_for(shell, frame.get("tools") or [])
-            self._send(
+            # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.
+            specs = frame.get("tools")
+            if isinstance(specs, list) and not self._busy(shell) and not (shell in self._sessions and self._sessions[shell].closing):
+                self._session_for(shell, specs)
+            await self._send(
                 {
                     "t": "ready",
                     "shell": shell,
@@ -851,12 +1276,27 @@ class Kernel:
                 }
             )
         elif kind == "dispose":
-            # The agent is gone; drop its shell so its globals can be collected.
-            self._tasks.pop(shell, None)
-            self._sessions.pop(shell, None)
+            session = self._sessions.get(shell)
+            if session is not None and not session.closing:
+                session.closing = True
+                # Cancel before yielding: a buffered exec may otherwise run before asynchronous cleanup starts.
+                tasks = set(session.tasks)
+                if running := self._tasks.get(shell):
+                    tasks.add(running)
+                for task in tasks:
+                    task.cancel()
+                # Keep reading result frames while cancellation finalizers await bridged calls.
+                cleanup = asyncio.create_task(self._dispose(shell, session, tasks))
+                self._closing[shell] = cleanup
+                # A replacement may register its cleanup before this task's done callbacks run.
+                cleanup.add_done_callback(lambda done: self._closing.pop(shell, None) if self._closing.get(shell) is done else None)
+                self._cleanups.add(cleanup)
+                cleanup.add_done_callback(self._cleanups.discard)
+            await self._cancel_deferred(shell, dispose=True)
 
     async def serve(self) -> None:
         loop = asyncio.get_running_loop()
+        loop.set_task_factory(self._task_factory)
         # The default 64 KiB line limit is far below a real frame: a catalogue of ~40 tools serialises past 80 KB, and a cell carrying a file body is unbounded by nature. Overrunning it raises out of `readline` and takes every shell's namespace with it.
         reader = asyncio.StreamReader(limit=1 << 24)
         await loop.connect_read_pipe(
@@ -864,9 +1304,14 @@ class Kernel:
             os.fdopen(PROTOCOL_FD, "rb", buffering=0),
         )
         while True:
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except ValueError:
+                # a line over the 16 MiB limit overflows the buffer; it is already drained, so skipping is safe — but say so: the host's exec never gets its `done` and the turn hangs, and a silent drop hides why
+                print("[dsh-py-codeact] dropped a frame over the 16 MiB line limit", file=REAL_STDERR)
+                continue
             if not line:
-                return  # host closed fd 3
+                return  # host closed the control channel
             try:
                 frame = json.loads(line)
             except ValueError:
@@ -876,10 +1321,13 @@ class Kernel:
             if frame.get("t") == "shutdown":
                 return
             try:
-                self._handle(frame)
-            except Exception:  # noqa: BLE001 — one malformed frame must not take the interpreter down
+                await self._handle(frame)
+            except Exception:
                 # `_handle` runs directly in this loop: an exception here unwinds out of `asyncio.run` and takes the interpreter — and the whole session's state — with it. One malformed frame is not worth that; a `result` whose `id` is unhashable used to do exactly it.
                 print(f"[dsh-py-codeact] dropped a frame that raised: {traceback.format_exc()}", file=REAL_STDERR)
+                # A failed initialization has no ready frame. Exit so the host rejects startup instead of waiting forever.
+                if frame.get("t") == "init":
+                    raise
 
 
 if __name__ == "__main__":

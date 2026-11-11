@@ -3,9 +3,11 @@
  */
 
 import assert from 'node:assert/strict'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { PythonKernel } from '../lib/kernel.js'
-import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs } from '../lib/index.js'
+import { renderToolsSection, needsRestartNotice, specsKey, mcpPayload, toolSpecs, toolCallReply, HAND_WRITTEN_PROSE, apply } from '../lib/index.js'
 import { execFileSync } from 'node:child_process'
+import './dispatch.js'
 
 const calls = []
 const kernel = new PythonKernel({
@@ -41,6 +43,19 @@ const check = async (label, code, verify, specs, omitSpecs = false) => {
 }
 
 console.log('kernel:')
+
+try {
+  const reply = toolCallReply({
+    isError: true,
+    error: { message: 'authoritative failure', info: { name: 'HarnessError', code: 'E_CANONICAL' } },
+    content: [{ type: 'text', text: 'rewritten model-facing failure' }],
+  })
+  assert.deepEqual(reply, { ok: false, message: 'authoritative failure' })
+  console.log('  ok   a failed tool call uses the authoritative error message')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a failed tool call uses the authoritative error message\n       ${error.message}`)
+}
 
 await check('persists state across cells (bind)', 'counter = 40', (r) => {
   assert.equal(r.ok, true)
@@ -393,7 +408,7 @@ console.log('prompt:')
   const pythonBlock = (text) => text.split('```python\n')[1]?.split('```')[0] ?? ''
   const parses = (code) => {
     try {
-      execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
+      execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
       return true
     } catch { return false }
   }
@@ -422,7 +437,7 @@ console.log('prompt:')
     // A hyphen is the ONE unspellable shape with a spelling: the kernel binds the fold alongside the
     // raw name, so the block shows a callable signature instead of pointing at `getattr`.
     const rendered = renderToolsSection([{ name: 'mcp__srv__do-thing', parameters: {} }])
-    assert.match(rendered, /# mcp\.srv\.do_thing\(\) -> Any/, 'a hyphenated tool is shown under a spelling Python takes')
+    assert.match(rendered, /async def do_thing\(\) -> Any/, 'a hyphenated tool is shown under a spelling Python takes')
     assert.ok(!rendered.includes('getattr'), 'and needs no getattr route at all')
     assert.ok(!rendered.includes('mcp__srv__do-thing'), 'and is not also offered under the flat name the block no longer shows')
     // ...unless another server already owns the folded spelling, in which case neither is renamed.
@@ -431,7 +446,7 @@ console.log('prompt:')
     assert.match(collided, /getattr\(getattr\(mcp, "a-b"\), "from_hyphen"\)/, 'and the server it could not rename keeps the two-level getattr route')
     // A server whose own name carries one folds the same way, at both levels.
     const oddOnly = renderToolsSection([{ name: 'mcp__odd-srv__thing', parameters: {} }])
-    assert.match(oddOnly, /# __dsh__\.tools\.mcp\.odd_srv\n# mcp\.odd_srv\.thing\(\) -> Any/, 'so does a server whose own name has one')
+    assert.match(oddOnly, /# __dsh__\.tools\.mcp\.odd_srv\nasync def thing\(\) -> Any/, 'so does a server whose own name has one')
     assert.match(oddOnly, /import ToolCallError, mcp\n/, 'and `mcp` is imported even when every server name had to be folded')
     assert.match(renderToolsSection([{ name: 'class', parameters: {} }]), /getattr\(__dsh__\.tools, "class"\)/, 'a keyword-named native tool keeps the top-level route')
     // `mcp` is the namespace's name. A native tool wearing it used to be rendered too, so the
@@ -460,7 +475,7 @@ console.log('prompt:')
     // The Protocol stubs are rendered Python too, and reach `Any` by the same routes a top-level
     // signature does — the import used to be derived from the signatures alone.
     const stubAny = renderToolsSection([{ name: 'mcp__cal__list', parameters: {} }])
-    assert.match(stubAny, /# __dsh__\.tools\.mcp\.cal\n# mcp\.cal\.list\(\) -> Any/, 'including under a server module')
+    assert.match(stubAny, /# __dsh__\.tools\.mcp\.cal\nasync def list\(\) -> Any/, 'including under a server module')
     assert.match(stubAny, /from typing import Any\n/, 'which has to import `Any` like any other use of it')
     console.log('  ok   renders each tool\'s real return type')
   } catch (error) {
@@ -478,8 +493,8 @@ console.log('prompt:')
     ])
     // Nothing spends the name any more: every tool is a module-level function, so `self` is an
     // ordinary keyword parameter everywhere and the collision this once guarded cannot occur.
-    assert.match(rendered, /# mcp\.srv\.list\(\n# {5}\*,\n# {5}self: str,\n# \) -> Any/, 'a `self` parameter renders as itself')
-    assert.match(rendered, /# mcp\.srv\.other\(\n# {5}\*,\n# {5}q: str,\n# \) -> Any/, 'and its siblings are unaffected')
+    assert.match(rendered, /async def list\(\n {4}\*,\n {4}self: str,\n\) -> Any/, 'a `self` parameter renders as itself')
+    assert.match(rendered, /async def other\(\n {4}\*,\n {4}q: str,\n\) -> Any/, 'and its siblings are unaffected')
     assert.match(rendered, /async def read\(\n {4}\*,\n {4}self: str,\n\) -> Any:/, 'at the top level too')
     console.log('  ok   a parameter named `self` is just a parameter now')
   } catch (error) {
@@ -630,10 +645,10 @@ console.log('prompt:')
     failures += 1
     console.log(`  FAIL a parameter object is named, and the wrapper it came from is dropped\n       ${error.message}`)
   }
-  // Only `mcp` is bound at the top level, so a server's tools are shown the way the call site spells
-  // them — as comments. Rendered as bare `async def`s they claimed a top-level name they do not have
-  // AND took it: a native `read` plus two servers exposing a raw `read` left the last stub shadowing
-  // the imported function, so running the block broke the tool its first section had just declared.
+  // A native `read` and two servers exposing a raw `read` put three definitions of one name in the
+  // listing. Nothing disambiguates them as Python — the last one would win if this were run — and
+  // that is fine, because it is read, not run: each sits under the header that gives its call path,
+  // and the signatures differ, which is the whole content of this section.
   try {
     const rendered = renderToolsSection([
       { name: 'read', parameters: { properties: { file_path: { type: 'string' } }, required: ['file_path'] }, output: { type: 'string' } },
@@ -641,13 +656,13 @@ console.log('prompt:')
       { name: 'mcp__beta__read', parameters: { properties: { b: { type: 'integer' } }, required: ['b'] }, output: { type: 'string' } },
     ])
     assert.match(rendered, /^async def read\(\n {4}\*,\n {4}file_path: str,\n\) -> str:$/m, 'the one name that IS bound is the only definition')
-    assert.match(rendered, /^# mcp\.alpha\.read\(\n# {5}\*,\n# {5}a: str,\n# \) -> str:$/m, 'a server tool is spelled the way it is called')
-    assert.match(rendered, /^# mcp\.beta\.read\(\n# {5}\*,\n# {5}b: int,\n# \) -> str:$/m, 'and a second server sharing the raw name keeps its own')
-    assert.equal(rendered.split('\n').filter((l) => /^async def read\(/.test(l)).length, 1, 'exactly one definition binds that name')
-    console.log('  ok   a raw MCP name never shadows the tool it collides with')
+    assert.match(rendered, /^# __dsh__\.tools\.mcp\.alpha\nasync def read\(\n {4}\*,\n {4}a: str,\n\) -> str:$/m, 'a server tool renders as a def, under the header that carries its call path')
+    assert.match(rendered, /^# __dsh__\.tools\.mcp\.beta\nasync def read\(\n {4}\*,\n {4}b: int,\n\) -> str:$/m, 'and a second server sharing the raw name keeps its own')
+    assert.equal(rendered.split('\n').filter((l) => /^async def read\(/.test(l)).length, 3, 'each collides in the listing, and each is still listed')
+    console.log('  ok   a raw MCP name is listed under its own header, collision and all')
   } catch (error) {
     failures += 1
-    console.log(`  FAIL a raw MCP name never shadows the tool it collides with\n       ${error.message}`)
+    console.log(`  FAIL a raw MCP name is listed under its own header, collision and all\n       ${error.message}`)
   }
   // dsh's MCP client wraps every result as `{ content, structuredContent? }`. That wrapper is
   // transport, not API: `content`'s text duplicates the payload and an image in it is re-attached
@@ -666,12 +681,12 @@ console.log('prompt:')
       { name: 'mcp__review__search', parameters: { properties: { q: { type: 'string' } }, required: ['q'] }, output: envelope(payload) },
       { name: 'mcp__email__ping', parameters: { properties: {} }, output: envelope(undefined) },
     ])
-    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\n# mcp\.review\.search\(\n# {5}\*,\n# {5}q: str,\n# \) -> McpReviewSearchOutput/, 'a declared payload names its own type')
+    assert.match(rendered, /# __dsh__\.tools\.mcp\.review\nasync def search\(\n {4}\*,\n {4}q: str,\n\) -> McpReviewSearchOutput/, 'a declared payload names its own type')
     assert.match(rendered, /class McpReviewSearchOutput\(TypedDict\):\n {4}merchants: list\[str\]\n {4}total: NotRequired\[int\]/, 'and that type is the payload, not the wrapper')
     assert.ok(!rendered.includes('structuredContent'), 'the wrapper is never named — the cell does not receive it')
     // No declared payload means the client has only the text blocks to hand over, so `str` is the
     // whole truth. Not every server declares an output schema; this is the common case in the wild.
-    assert.match(rendered, /# mcp\.email\.ping\(\) -> str/, 'an envelope with no payload resolves to its text')
+    assert.match(rendered, /async def ping\(\) -> str/, 'an envelope with no payload resolves to its text')
     console.log('  ok   an MCP envelope is unwrapped, in the annotation and at run time')
   } catch (error) {
     failures += 1
@@ -742,6 +757,20 @@ console.log('prompt:')
     // that takes the whole fenced block down, for every tool in it.
     const own = renderToolsSection([{ name: 'edit', parameters: { properties: { kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' } }, required: [] } }])
     assert.match(own, /\n {4}kwargs: str = \.\.\.,\n {4}_kwargs: str = \.\.\.,\n {4}\*\*__kwargs: Any {2}# spell as dict keys: "a b"\n/, 'a tool that owns the overflow name makes it step aside')
+    // Python's identifier rule is XID, not ASCII, and the kernel's own `inspect.Parameter('路径')`
+    // accepts it — so refusing it here made the block the poorer of the two readings, for exactly the
+    // catalogues most likely to carry such a name.
+    const unicode = renderToolsSection([{ name: 'odd', parameters: { properties: {
+      '路径': { type: 'string' }, 'Ω': { type: 'integer' }, 'ﬁ': { type: 'string' }, 'ｘ': { type: 'string' },
+    }, required: ['路径'] } }])
+    assert.match(unicode, /\n {4}路径: str,\n/, 'an NFKC-stable non-ASCII name is spelled')
+    assert.match(unicode, /\n {4}Ω: int = \.\.\.,\n/, 'and so is a Greek one')
+    // Both of these pass `str.isidentifier()`. Source is NFKC-normalised BEFORE it is tokenised, so
+    // `def f(*, ﬁ=1)` declares `fi` and `f(ｘ=1)` binds `x`: spelled, they would send a key the tool
+    // never declared, and the call would fail as if the tool were broken.
+    assert.match(unicode, /# spell as dict keys: .*ﬁ.*ｘ/, 'an NFKC-unstable one folds even though Python calls it an identifier')
+    const fence = unicode.slice(unicode.indexOf('```python') + 10, unicode.lastIndexOf('```'))
+    execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
     console.log('  ok   a parameter name is normalised, and only the rest costs the signature')
   } catch (error) {
     failures += 1
@@ -839,7 +868,33 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     }, required: ['file_path'] } }])
     assert.match(block, /async def read\(\n {4}\*,\n {4}file_path: str,  # Path to read, resolved by the filesystem backend\.\n {4}offset: int = \.\.\.,  # Line to start at\. One-based\.\n\) -> Any:\n {4}"""\n {4}Read a file\.\n {4}Second line\.\n {4}"""/, 'both halves, in the shape a Python reader expects')
   })
+  await checkDoc('all prompt-opening brace runs in tool prose stay literal', async () => {
+    const block = renderToolsSection([{ name: 'workflow', description: 'Keep {one}; split {{two}}, {{{three}}}, and {{{{four}}}}.', parameters: { properties: {
+      plan: { type: 'string', description: 'Expand {{{step}}} at run time.' },
+    }, required: ['plan'] } }])
+    const rendered = renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
+    assert.ok(rendered.includes('Keep {one}; split { {two}}, { { {three}}}, and { { { {four}}}}.'), 'tool-description runs must split every opener')
+    assert.ok(rendered.includes('Expand { { {step}}} at run time.'), 'parameter-description runs must split every opener')
+    assert.ok(!rendered.includes('{{'), 'no prompt-variable opener may remain')
+  })
   docs.dispose()
+}
+
+// The escape above covers prose that arrives from a tool catalogue. The sections this plugin WRITES
+// reach `renderPrompt` verbatim, so the same `{{` costs the whole preset — `interpolate` throws during
+// assembly and no session on it starts. `apply` asserts them brace-free at mount; this puts each one
+// through the real renderer, which is the failure itself rather than a restatement of the check.
+console.log('the prose this plugin writes survives assembly:')
+for (const { label, text } of HAND_WRITTEN_PROSE) {
+  try {
+    // No variables, because these sections are not supposed to reference any: an unknown name throws
+    // here exactly as a malformed one does, which is the second half of what mount is protecting.
+    renderPrompt({ sections: [{ name: `py-codeact:${label}`, text }], contexts: [], tools: [], variables: {} })
+    console.log(`  ok   ${label}`)
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL ${label}\n       ${error.message}`)
+  }
 }
 
 // The block is Python the model copies from, and now it carries PROSE — so a description is no longer
@@ -854,7 +909,7 @@ try {
     { name: 'after', description: 'Must still be here.', parameters: {} },
   ])
   const fence = hostile.slice(hostile.indexOf('```python') + 10, hostile.lastIndexOf('```'))
-  execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
   assert.match(fence, /async def after\(\) -> Any:/, 'the tool after the hostile ones still renders')
   console.log('  ok   a triple quote or trailing backslash costs fidelity, never the block')
 } catch (error) {
@@ -862,6 +917,51 @@ try {
   console.log(`  FAIL a triple quote or trailing backslash costs fidelity, never the block\n       ${error.message}`)
 }
 
+
+// This set is a COPY of Python's, and a copy goes stale: a release that adds a hard keyword would have
+// the block emit `def f(*, <kw>: str)` — a SyntaxError that takes every tool in the fence down, not just
+// the one that named it. So the guard is not a count written in a comment. The list comes from the
+// interpreter that is about to compile the block, which is the only version whose opinion matters here.
+console.log('the keyword set is the running interpreter\'s, not a number in a comment:')
+try {
+  const listed = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import json, keyword; print(json.dumps(keyword.kwlist + keyword.softkwlist))'], { encoding: 'utf8' }))
+  const properties = Object.fromEntries(listed.map((kw) => [kw, { type: 'string' }]))
+  const block = renderToolsSection([{ name: 'kw', parameters: { type: 'object', properties, required: [] }, output: { type: 'string' } }])
+  const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  console.log(`  ok   all ${listed.length} of this interpreter's keywords survive the block`)
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL all of this interpreter's keywords survive the block\n       ${error.message}`)
+}
+// CPython applies universal-newline translation to source, so a lone `\r` inside a description is a
+// real line break to the tokenizer even though nothing in JS treats it as one. In a trailing `# `
+// comment that break ends the comment and the rest of the description becomes live code — the same
+// failure class as the triple quote above, reached without a single character that looks dangerous.
+console.log('a carriage return in a description is not a line break the block honours:')
+try {
+  const cr = renderToolsSection([{ name: 'read', description: 'One.\rTwo.', parameters: { properties: {
+    file_path: { type: 'string', description: 'Path.\rinjected = 1' },
+  }, required: ['file_path'] } }])
+  const fence = cr.slice(cr.indexOf('```python') + 10, cr.lastIndexOf('```'))
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
+  assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
+  // Narrower than `str.splitlines()` on purpose. `\v`, `\f`, `\x85`, `\u2028` and `\u2029` all split a
+  // Python STRING, and PCRE's `\R` matches them too — but none of them ends a `#` comment as far as the
+  // tokenizer is concerned, checked by compiling `# comment<ch>x = 1` for each. Splitting on them would
+  // take a description apart at a character that never needed it, for no safety in return.
+  const wide = renderToolsSection([{ name: 'read', parameters: { properties: {
+    file_path: { type: 'string', description: 'Kept\u2028together\vhere' },
+  }, required: ['file_path'] } }])
+  const wideFence = wide.slice(wide.indexOf('```python') + 10, wide.lastIndexOf('```'))
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
+  assert.match(wideFence, /file_path: str,  # Kept\u2028together\vhere\n/, 'a terminator Python does not honour stays in the description')
+  console.log('  ok   a lone \\r cannot end the comment it sits in')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a lone \\r cannot end the comment it sits in\n       ${error.message}`)
+}
 console.log('mcp namespace:')
 {
   const seen = []
@@ -1139,6 +1239,40 @@ console.log('shells:')
     await running
   })
 
+  await checkShell('disposing a shell cancels its detached tasks and runs finalizers', async () => {
+    assert.equal((await cell('survivor = asyncio.create_task(asyncio.sleep(3600))', 'parent')).ok, true)
+    const setup = await cell('import asyncio\nimport __dsh__.shared as S\nS.cleaned = False\nasync def release():\n    await asyncio.sleep(0.05)\n    S.cleaned = True\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.gather(release())\nS.background = asyncio.create_task(background())\nawait asyncio.sleep(0)', 'child')
+    assert.equal(setup.ok, true)
+    assert.equal((await cell('S.background.done()', 'parent')).repr, 'False')
+    shells.closeShell('child')
+    await shells.start([{ name: 'replacement', params: [] }], 'child')
+    const reopened = await cell('import __dsh__.tools as T; sorted(dir(T))', 'child')
+    assert.equal(reopened.ok, true, JSON.stringify(reopened))
+    assert.equal(reopened.repr, "['replacement']")
+    const result = await cell('async with asyncio.timeout(3):\n    while not S.background.done():\n        await asyncio.sleep(0.01)\n(S.background.cancelled(), S.cleaned)', 'parent')
+    assert.equal(result.ok, true)
+    assert.equal(result.repr, '(True, True)')
+    assert.equal((await cell('survivor.done()', 'parent')).repr, 'False')
+    await cell('survivor.cancel()\nawait asyncio.gather(survivor, return_exceptions=True)', 'parent')
+  })
+
+  for (const action of ['interrupt', 'dispose']) {
+    await checkShell(`${action} cancels a replacement cell queued behind cleanup`, async () => {
+      await shells.start(childTools, 'queued')
+      assert.equal((await cell('import asyncio, contextvars\nimport __dsh__.shared as S\nS.effect = False\nasync def background():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.sleep(0.2)\nS.queued_task = asyncio.create_task(background(), context=contextvars.Context())\nawait asyncio.sleep(0)', 'queued')).ok, true)
+      shells.closeShell('queued')
+      await shells.start(childTools, 'queued')
+      const abort = new AbortController()
+      const pending = shells.exec('import __dsh__.shared as S; S.effect = True', abort.signal, undefined, 'queued')
+      await new Promise(resolve => setTimeout(resolve, 30))
+      if (action === 'interrupt') abort.abort()
+      else shells.closeShell('queued')
+      assert.equal((await pending).ok, false)
+      const state = await cell('await asyncio.sleep(0.3)\n(S.effect, S.queued_task.cancelled())', 'parent')
+      assert.equal(state.repr, '(False, True)')
+    })
+  }
+
   await checkShell('closing one shell leaves the others running', async () => {
     shells.closeShell('child')
     assert.equal((await cell('secret', 'parent')).repr, `'parent-only'`)
@@ -1163,6 +1297,18 @@ console.log('restart detection:')
     ['reopening again after a notice stays quiet', session(cell(), notice()), false],
     ['…but a cell run after the notice earns a new one', session(cell(), notice(), cell()), true],
     ['another plugin\'s notice does not count as ours', session(cell(), { ...notice(), source: { kind: 'plugin', plugin: 'other' } }), true],
+    // The v4 line writes the producer-owned `plugin:<name>` kind instead of the released wrapper.
+    // Either vocabulary counts as "already told", or a migrated session would earn a duplicate.
+    ['a v4 producer-kind notice counts as ours', session(cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact', form: 'notice', summary: 'x' } }), false],
+    ['another producer\'s v4 kind does not count as ours', session(cell(), { ...notice(), source: { kind: 'plugin:other', form: 'notice', summary: 'x' } }), true],
+    // Only `form:'notice'` marks a notice. The image re-attach carries the SAME plugin source with
+    // no form; counting it made history `python cell → image context` hide the restart notice —
+    // the image overwrote the last-notice position and the model was never told the interpreter died.
+    ['an image re-attach under our source is not a notice', session(cell(), { ...notice(), source: { kind: 'plugin', plugin: 'dsh-py-codeact' } }), true],
+    ['a v4 image re-attach under our source is not a notice', session(cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact' } }), true],
+    ['an image re-attach cannot hide an earlier real notice', session(cell(), notice(), cell(), { ...notice(), source: { kind: 'plugin:dsh-py-codeact' } }), true],
+    // The bare `plugin` kind is a third spelling no emitter here writes; it must not pass as ours.
+    ['a bare plugin kind does not count as ours', session(cell(), { ...notice(), source: { kind: 'dsh-py-codeact', form: 'notice', summary: 'x' } }), true],
   ]
   for (const [label, s, expected] of cases) {
     try {
@@ -1216,7 +1362,7 @@ console.log('the rendered block is a program:')
     assert.match(ran.repr ?? '', /ReadArgsWindow/, 'and a parameter object resolves to the class the block declared')
     // Executing the block must not bind a server's tools: only `mcp` is, and a bare definition
     // under a server header would shadow whatever native tool shares that raw name.
-    assert.match(ran.repr ?? '', /\[\]/, 'and no server tool leaked into the namespace the block runs in')
+    assert.match(ran.repr ?? '', /\['by_self', 'search'\]/, 'and a server tool binds like any other definition, which is why this runs in its own shell')
     console.log('  ok   it imports, declares and annotates without raising')
   } catch (error) {
     failures += 1
@@ -1226,5 +1372,55 @@ console.log('the rendered block is a program:')
 }
 
 kernel.dispose()
+
+console.log('orchestration section conditional on delegation tool:')
+{
+  const makeCtx = (schemas) => {
+    const sections = []
+    const assembly = { scope: 'global' }
+    return {
+      on() {}, effect(fn) { fn() },
+      tools: { sdkSchemas: () => schemas, guard() {}, register() {} },
+      systemPrompt: { section(opts) { sections.push({ ...opts, _assembly: assembly }) } },
+      _sections: sections,
+    }
+  }
+  const bg = { type: 'object', properties: { kind: { const: 'background' }, id: { type: 'string' } }, required: ['kind', 'id'] }
+  const fg = { type: 'object', properties: { kind: { const: 'foreground' }, output: { type: 'array' } }, required: ['kind', 'output'] }
+  const cont = { type: 'object', properties: { kind: { const: 'continuable' }, id: { type: 'string' } }, required: ['kind', 'id'] }
+  const fullUnion = { name: 'delegate', parameters: { properties: {} }, output: { oneOf: [bg, fg, cont] } }
+  const twoOfThree = { name: 'delegate', parameters: { properties: {} }, output: { oneOf: [bg, fg] } }
+
+  try {
+    const withAll = makeCtx([fullUnion])
+    apply(withAll, { mode: 'code' })
+    const got = withAll._sections.find(s => {
+      const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
+      return text?.includes('Orchestrating')
+    })
+    assert.ok(got, 'three-branch delegation tool triggers orchestration section')
+    const text = typeof got.text === 'function' ? got.text(got._assembly) : got.text
+    assert.match(text, /asyncio\.gather/, 'and the section contains gather examples')
+    console.log('  ok   three-branch delegation tool triggers orchestration')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL three-branch delegation tool triggers orchestration\n       ${error.message}`)
+  }
+
+  try {
+    const without = makeCtx([twoOfThree])
+    apply(without, { mode: 'code' })
+    const none = without._sections.find(s => {
+      const text = typeof s.text === 'function' ? s.text(s._assembly) : s.text
+      return text?.includes('Orchestrating')
+    })
+    assert.ok(!none, 'two-branch schema does not trigger orchestration section')
+    console.log('  ok   two-branch schema does not trigger orchestration')
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL two-branch schema does not trigger orchestration\n       ${error.message}`)
+  }
+}
+
 console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`)
 process.exit(failures === 0 ? 0 : 1)

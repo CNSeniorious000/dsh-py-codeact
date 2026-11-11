@@ -35,19 +35,45 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       - run: bun install --frozen-lockfile
 
+      # Keep the minimum supported host executable, including its managed subprocess/control channel.
+      - name: Smoke exact dsh 0.2.1-rc.2 host set
+        run: |
+          # The Linux sandbox replaces /tmp; keep the test source visible inside it.
+          compat_dir="$(mktemp -d "$RUNNER_TEMP/dsh-py-codeact-compat.XXXXXX")"
+          trap 'rm -rf "$compat_dir"' EXIT
+          git archive HEAD | tar -x -C "$compat_dir"
+          cd "$compat_dir"
+          bun -e 'const p = await Bun.file("package.json").json(); for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/dsh-subprocess"] = "0.2.1-rc.2"; p.devDependencies["@deepseek-ai/cordis"] = "4.0.5"; p.devDependencies["@deepseek-ai/schemastery"] = "3.18.5"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          rm -f bun.lock
+          bun install
+          bun run test
+          TY_UV=scripts uvx ty check py/kernel.py
+
+      - name: Check streaming on dsh 0.2.2-rc.1
+        run: |
+          stream_dir="$(mktemp -d "$RUNNER_TEMP/dsh-py-codeact-stream.XXXXXX")"
+          trap 'rm -rf "$stream_dir"' EXIT
+          git archive HEAD | tar -x -C "$stream_dir"
+          cd "$stream_dir"
+          bun -e 'const p = await Bun.file("package.json").json(); for (const name of new Set([...Object.keys(p.devDependencies), ...Object.keys(p.peerDependencies)])) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = "0.2.2-rc.1"; p.devDependencies["@deepseek-ai/cordis"] = "4.1.0"; await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n")'
+          rm bun.lock
+          bun install
+          bun run test:streaming
+          uv run --script test/streaming-kernel.py
+
       # What ships is what CI already gates on, run again here: a release must not be the one
       # artifact nobody checked. The suite spawns the real kernel, hence uv above.
-      - run: node test/smoke.js
+      - run: bun run test
       - run: uvx ruff check py/
       - run: TY_UV=scripts uvx ty check py/kernel.py
 

@@ -86,6 +86,7 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       console.log(`  ok   format ${version ?? 'legacy'} bridge ${outcome}`)
     }
     if (version === 4) {
+      outcome = 'success'
       const execute = ctx.tools.execute
       let active = 0, peak = 0
       ctx.tools.execute = async (call) => {
@@ -96,8 +97,9 @@ for (const [version, eventType] of [[undefined, 'tool/code-dispatch'], [2, 'tool
       for (const enabled of [undefined, true, false]) {
         config.respectToolConcurrency = enabled
         peak = 0
-        await python.execute({ code: 'import asyncio\nawait asyncio.gather(read(file_path="a"), read(file_path="b"))', description: 'Check legacy concurrency preference' },
+        const result = await python.execute({ code: 'import asyncio\nawait asyncio.gather(read(file_path="a"), read(file_path="b"))', description: 'Check legacy concurrency preference' },
           { callId: 'legacy-gather', rootCallId: 'legacy-gather', token: parent, agent, signal, deferContext() {} })
+        assert.match(result, /\['file contents', 'file contents'\]/)
         assert.equal(peak, enabled ? 1 : 2)
       }
       ctx.tools.execute = execute

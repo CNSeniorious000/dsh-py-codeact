@@ -18,8 +18,8 @@ permissions:
   id-token: write
 
 concurrency:
-  # Comments and reviews from bots cannot steer a review, yet their runs would evict a review that waits for a runner when queued after it.
-  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}${{ github.event.sender.type == 'Bot' && github.event_name != 'pull_request_target' && format('-{0}', github.run_id) || '' }}
+  # The action checks comment/review eligibility after scheduling. Give those runs unique groups so even a skipped run cannot replace a pending lifecycle review.
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}${{ github.event_name != 'pull_request_target' && github.event_name != 'push' && format('-{0}', github.run_id) || '' }}
 
 jobs:
   review:

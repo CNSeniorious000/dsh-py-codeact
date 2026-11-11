@@ -43,7 +43,7 @@ export async function apply(ctx) {
       }
       assert.equal(requests, 1, 'unexpected retry or replay')
       const encode = text => JSON.stringify(text).slice(1, -1)
-      const delta = argumentsDelta => ({ type: 'tool-call-delta', index: 0, id: 'codeact-web-call', name: 'python', argumentsDelta })
+      const delta = argumentsDelta => ({ type: 'tool-call-delta', index: 0, id: 'codeact-web-call', name: basename(directory) === 'custom-stop' ? 'execute_python' : 'python', argumentsDelta })
       const approval = basename(directory).startsWith('approval')
       const prefix = "from __dsh__.tools import fixture_probe, bash\nweb_counter = globals().get('web_counter', 0) + 1\nawait fixture_probe(value='FIRST')\n"
         + "await bash(command='printf CODEACT_INSPECT', description='Print the CodeAct inspection marker')\n"

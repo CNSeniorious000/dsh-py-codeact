@@ -134,8 +134,9 @@ try {
 
   const failures = []
   let approvalCommandVisible
-  for (const mode of ['whole', 'stream', 'stop', 'approval-whole', 'approval']) {
-    const streaming = !['whole', 'approval-whole'].includes(mode), needsApproval = mode.startsWith('approval')
+  for (const mode of ['whole', 'stream', 'stop', 'approval-whole', 'approval', 'custom-stop']) {
+    const streaming = !['whole', 'approval-whole'].includes(mode), needsApproval = mode.startsWith('approval'), stopped = mode.endsWith('stop')
+    const toolName = mode === 'custom-stop' ? 'execute_python' : 'python', title = toolName === 'python' ? 'CodeAct' : 'Tool call'
     const caseDirectory = join(directory, mode), profile = join(caseDirectory, 'home/profiles/web')
     await rm(caseDirectory, { recursive: true, force: true })
     await mkdir(profile, { recursive: true })
@@ -154,7 +155,7 @@ try {
       { insert: [
         { id: 'codeact-web-fixture', name: join(directory, 'fixture.js') },
         { id: 'preset-codeact-web', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'codeact-web', name: 'CodeAct', plugins: [
-          { name: '@deepseek-ai/dsh-tool-bash', config: { enableRunInBackground: false } }, { name: 'dsh-py-codeact', config: { mode: 'code' } },
+          { name: '@deepseek-ai/dsh-tool-bash', config: { enableRunInBackground: false } }, { name: 'dsh-py-codeact', config: { mode: 'code', toolName } },
         ] } },
       ] },
     ]))
@@ -174,17 +175,18 @@ try {
       if (!streaming) assert.deepEqual(await effects(), [], 'whole-cell mode executed before provider EOF')
       else await until(effects, values => values.length === 1, 'the streaming prefix did not execute')
       await expand(page)
-      const card = page.locator('[data-tool="python"]')
-      await card.getByText('CodeAct', { exact: true }).waitFor()
-      await card.getByText('Verify incremental execution', { exact: true }).waitFor()
+      const card = page.locator(`[data-tool="${toolName}"]`)
+      await card.getByText(title, { exact: true }).waitFor()
+      await card.getByText(toolName === 'python' ? 'Verify incremental execution' : /Verify incremental execution/, { exact: toolName === 'python' }).waitFor()
       if (streaming) {
         const owner = page.locator('[data-chat-call-id="codeact-web-call"]'), [first] = await effects()
         assert.equal(await owner.count(), 1, 'the streaming parent must not split into separate cards')
-        await owner.locator('[data-tool="python"]').getByText('CodeAct', { exact: true }).waitFor()
+        await owner.locator(`[data-tool="${toolName}"]`).getByText(title, { exact: true }).waitFor()
         await owner.locator(`[data-chat-call-id="${first.callId}"]`).waitFor()
         inspected = await until(inspectedCall, Boolean, 'native bash did not settle before provider EOF')
         assert.equal(inspected.isError, false)
         selectedKey = await inspect(page, inspected.subCallId)
+        await page.locator(`tr[data-trajectory-row-key="${encodeURIComponent('tool\0call\0codeact-web-call')}"]`).getByText(toolName, { exact: true }).waitFor()
       }
       const approval = page.locator('[data-approval-key]'), command = 'printf CODEACT_APPROVED >> approval-effects'
       let approvalKey
@@ -193,7 +195,7 @@ try {
         approvalKey = await approval.getAttribute('data-approval-key')
         assert.equal(await exists(join(caseDirectory, 'approval-effects')), false)
       }
-      if (mode === 'stop') await page.getByRole('button', { name: 'Stop generating', exact: true }).click()
+      if (stopped) await page.getByRole('button', { name: 'Stop generating', exact: true }).click()
       else await writeFile(join(caseDirectory, 'release'), '')
       if (needsApproval) {
         await until(() => exists(join(caseDirectory, 'parent-ready')), Boolean, 'the complete parent call was not committed')
@@ -208,20 +210,20 @@ try {
         await approval.getByRole('button', { name: 'Allow once', exact: true }).click()
       }
       const settled = await until(() => rows(join(caseDirectory, 'settled.json')), values => values.length === 1, 'the turn did not settle')
-      assert.equal(settled[0].reason.kind, mode === 'stop' ? 'aborted' : 'completed')
-      assert.deepEqual((await effects()).map(({ value }) => value), mode === 'stop' ? ['FIRST'] : ['FIRST', 'LAST'])
+      assert.equal(settled[0].reason.kind, stopped ? 'aborted' : 'completed')
+      assert.deepEqual((await effects()).map(({ value }) => value), stopped ? ['FIRST'] : ['FIRST', 'LAST'])
       assert.equal(new Set((await effects()).map(({ callId }) => callId)).size, (await effects()).length)
       const [firstDispatch] = await rows(join(caseDirectory, 'probe-starts.jsonl'))
       assert.equal(firstDispatch.callId, (await effects())[0].callId)
-      if (mode === 'stop') assert.equal(await exists(join(caseDirectory, 'parent-ready')), false)
+      if (stopped) assert.equal(await exists(join(caseDirectory, 'parent-ready')), false)
       else assert.equal(firstDispatch.seq < JSON.parse(await readFile(join(caseDirectory, 'parent-ready'), 'utf8')).seq, streaming, 'execution order must match the streaming setting')
-      assert.equal((await rows(join(caseDirectory, 'requests.jsonl'))).length, mode === 'stop' ? 1 : 2)
+      assert.equal((await rows(join(caseDirectory, 'requests.jsonl'))).length, stopped ? 1 : 2)
       if (selectedKey) assert.equal(await page.locator('tr[aria-selected="true"]').getAttribute('data-trajectory-row-key'), selectedKey, 'parent arrival or cancellation lost the selected child')
       if (needsApproval) assert.equal(await readFile(join(caseDirectory, 'approval-effects'), 'utf8'), 'CODEACT_APPROVED')
-      if (mode === 'stop') assert.equal(await exists(join(caseDirectory, 'approval-effects')), false, 'Stop executed the pending command')
+      if (stopped) assert.equal(await exists(join(caseDirectory, 'approval-effects')), false, 'Stop executed the pending command')
       await page.getByRole('tab', { name: 'Chat', exact: true }).click()
       await expand(page, true)
-      if (mode !== 'stop') {
+      if (!stopped) {
         await card.getByText('CodeAct', { exact: true }).click()
         await card.getByText(/CODEACT_WEB_COUNTER 1/).waitFor()
       }
@@ -237,9 +239,11 @@ try {
       await page.getByText('Verify the CodeAct web fixture.', { exact: true }).first().click()
       await expand(page, true)
       // An aborted prefix has no persisted complete arguments; its known Python parent and children still survive.
-      await page.locator('[data-tool="python"]').getByText('CodeAct', { exact: true }).waitFor()
-      if (mode !== 'stop') await page.getByText('Verify incremental execution', { exact: true }).waitFor()
+      await page.locator(`[data-tool="${toolName}"]`).getByText(title, { exact: true }).waitFor()
+      if (toolName !== 'python') assert.equal(await page.locator('[data-tool="python"]').count(), 0, 'restoration must preserve the actual tool name')
+      if (!stopped) await page.getByText('Verify incremental execution', { exact: true }).waitFor()
       assert.equal(await inspect(page, inspected.subCallId), selectedKey, 'cold history changed the inspected call identity')
+      await page.locator(`tr[data-trajectory-row-key="${encodeURIComponent('tool\0call\0codeact-web-call')}"]`).getByText(toolName, { exact: true }).waitFor()
       assert.deepEqual(await effects(), previous, 'cold restoration replayed side effects')
       assert.deepEqual(await rows(join(caseDirectory, 'requests.jsonl')), requests, 'cold restoration unexpectedly requested a model')
       assert.deepEqual(errors, [], 'the actual Web client raised an exception')

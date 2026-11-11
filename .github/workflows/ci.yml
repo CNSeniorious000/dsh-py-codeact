@@ -45,6 +45,31 @@ jobs:
       - uses: actions/checkout@v7
       - uses: crate-ci/typos@v1.52.2
 
+  web:
+    name: web (official dsh 0.2.2-rc.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.18.0
+      - run: bun run test:web "${{ runner.temp }}/codeact-web"
+      - uses: actions/upload-artifact@v7.0.2
+        if: failure()
+        with:
+          name: web-failure
+          path: |
+            ${{ runner.temp }}/codeact-web/*/host.log
+            ${{ runner.temp }}/codeact-web/*/browser.txt
+            ${{ runner.temp }}/codeact-web/*/failure.png
+            ${{ runner.temp }}/codeact-web/*/settled.json
+
   legacy:
     name: smoke (dsh 0.2.1-rc.2, ${{ matrix.os }})
     strategy:

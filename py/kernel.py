@@ -64,6 +64,7 @@ import sys
 import tempfile
 import traceback
 import types
+import unicodedata
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from dis import get_instructions
@@ -365,6 +366,10 @@ def _make_binding(bridge: Bridge, spec):
         if param_name in names:
             raise ValueError(f"duplicate parameter name: {param_name!r}")
         names.add(param_name)
+        # Python normalizes source identifiers; keep names that would change as literal dictionary keys.
+        if unicodedata.normalize("NFKC", param_name) != param_name:
+            dropped.append(p)
+            continue
         try:
             params.append(
                 inspect.Parameter(

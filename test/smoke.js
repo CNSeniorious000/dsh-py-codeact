@@ -182,13 +182,14 @@ await check('one exotic parameter name does not discard the whole signature', 'i
   { name: 'class', type: 'str', required: false }] }])
 
 const overflowSchemas = [{ name: 'overflow', description: 'Exotic parameters.', parameters: { properties: {
-  kwargs: { type: 'string' }, _kwargs: { type: 'string' }, 'a b': { type: 'string' }, 'c d': { type: 'integer' },
-}, required: ['a b'] } }]
-await check('overflow parameters retain their names, types, and requiredness in help', 'from __dsh__.tools import overflow; help(overflow)', (r) => {
+  kwargs: { type: 'string' }, _kwargs: { type: 'string' }, fi: { type: 'string' }, 'a b': { type: 'string' }, 'c d': { type: 'integer' }, 'ﬁ': { type: 'string' },
+}, required: ['a b', 'ﬁ'] } }]
+await check('overflow parameters retain their names, types, and requiredness in help', "from __dsh__.tools import overflow; help(overflow); await overflow(fi='named', **{'a b': 'required', 'ﬁ': 'literal'})", (r) => {
   assert.equal(r.ok, true)
-  assert.match(r.stdout, /kwargs: '?str'? = Ellipsis,\s+_kwargs: '?str'? = Ellipsis,\s+\*\*__kwargs: '?Any'?/)
-  assert.match(r.stdout, /Pass as dict keys: 'a b': str, 'c d': int = \.\.\./)
-  assert.match(renderToolsSection(overflowSchemas), /\*\*__kwargs: Any {2}# spell as dict keys: "a b": str, "c d": int = \.\.\./)
+  assert.match(r.stdout, /kwargs: '?str'? = Ellipsis,\s+_kwargs: '?str'? = Ellipsis,\s+fi: '?str'? = Ellipsis,\s+\*\*__kwargs: '?Any'?/)
+  assert.match(r.stdout, /Pass as dict keys: 'a b': str, 'c d': int = \.\.\., 'ﬁ': str/)
+  assert.match(renderToolsSection(overflowSchemas), /\*\*__kwargs: Any {2}# spell as dict keys: "a b": str, "c d": int = \.\.\., "ﬁ": str/)
+  assert.deepEqual(calls.at(-1), { name: 'overflow', args: { fi: 'named', 'a b': 'required', 'ﬁ': 'literal' } })
 }, toolSpecs(overflowSchemas).specs)
 
 try {

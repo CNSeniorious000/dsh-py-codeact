@@ -254,7 +254,7 @@ async def binding_failures_preserve_catalogue(runner):
     effects = session.shell.user_ns["effects"] = []
     exec_id = 0
     for kind in ("exec", "stream_start"):
-        for params in ([{}], [{"name": None}], [{"name": "same"}, {"name": "same"}]):
+        for params in ([{}], [{"name": None}], [{"name": "same"}, {"name": "same"}], [{"name": "a b"}, {"name": "a b"}]):
             invalid = [{"name": "new", "params": []}, {"name": "broken", "params": params}]
             # Repeating the rejected catalogue must fail again, not hit the successful-bind cache.
             for _ in range(2):

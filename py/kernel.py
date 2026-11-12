@@ -359,12 +359,16 @@ def _make_binding(bridge: Bridge, spec):
         call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
         # A rebind builds NEW callables, so a name already pulled out with `from __dsh__.tools import read` keeps the docstring it was imported with. `__dsh__.tools.read?` is the authoritative view after a schema revision. True of the signature and return annotation too, and deliberate: the shell's namespace is the model's, and a rebind that reached into it could swap a binding under a cell mid-await.
     # Keep valid parameters visible; only names Python cannot spell belong in **kwargs. Malformed specs must reject the catalogue.
-    params, dropped = [], []
+    params, dropped, names = [], [], set()
     for p in spec.get("params") or []:
+        param_name = p["name"]
+        if param_name in names:
+            raise ValueError(f"duplicate parameter name: {param_name!r}")
+        names.add(param_name)
         try:
             params.append(
                 inspect.Parameter(
-                    p["name"],
+                    param_name,
                     inspect.Parameter.KEYWORD_ONLY,
                     annotation=p.get("type") or "Any",
                     default=inspect.Parameter.empty if p.get("required") else ...,

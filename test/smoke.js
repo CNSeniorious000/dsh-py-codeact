@@ -181,6 +181,38 @@ await check('one exotic parameter name does not discard the whole signature', 'i
   { name: 'file-path', type: 'str', required: true },
   { name: 'class', type: 'str', required: false }] }])
 
+const overflowSchemas = [{ name: 'overflow', description: 'Exotic parameters.', parameters: { properties: {
+  kwargs: { type: 'string' }, _kwargs: { type: 'string' }, fi: { type: 'string' }, 'a b': { type: 'string' }, 'c d': { type: 'integer' }, 'ﬁ': { type: 'string' },
+}, required: ['a b', 'ﬁ'] } }]
+await check('overflow parameters retain their names, types, and requiredness in help', "from __dsh__.tools import overflow; help(overflow); await overflow(fi='named', **{'a b': 'required', 'ﬁ': 'literal'})", (r) => {
+  assert.equal(r.ok, true)
+  assert.match(r.stdout, /kwargs: '?str'? = Ellipsis,\s+_kwargs: '?str'? = Ellipsis,\s+fi: '?str'? = Ellipsis,\s+\*\*__kwargs: '?Any'?/)
+  assert.match(r.stdout, /Pass as dict keys: 'a b': str, 'c d': int = \.\.\., 'ﬁ': str/)
+  assert.match(renderToolsSection(overflowSchemas), /\*\*__kwargs: Any {2}# spell as dict keys: "a b": str, "c d": int = \.\.\., "ﬁ": str/)
+  assert.deepEqual(calls.at(-1), { name: 'overflow', args: { fi: 'named', 'a b': 'required', 'ﬁ': 'literal' } })
+}, toolSpecs(overflowSchemas).specs)
+
+try {
+  await kernel.exec('binding_effects = []', undefined, SPECS)
+  const read = Promise.withResolvers()
+  let reads = 0, closed = false
+  const source = {
+    [Symbol.asyncIterator]() { return this },
+    next() { return ++reads === 1 ? Promise.resolve({ value: "binding_effects.append('ran')\n", done: false }) : read.promise },
+    return() { closed = true; read.resolve({ done: true }); return Promise.resolve({ done: true }) },
+  }
+  const result = await kernel.execStream(source, AbortSignal.timeout(5000), [{ name: 'broken', params: [{}] }])
+  assert.equal(result.ok, false)
+  assert.match(result.error, /failed to bind tools before execution: KeyError/)
+  assert.equal(reads, 2, 'source was waiting for more input when binding failed')
+  assert.equal(closed, true, 'binding rejection must release the open source')
+  assert.equal((await kernel.exec('binding_effects', undefined, undefined)).repr, '[]')
+  console.log('  ok   a rejected streaming catalogue closes a pending source without effects')
+} catch (error) {
+  failures += 1
+  console.log(`  FAIL a rejected streaming catalogue closes a pending source without effects\n       ${error.message}`)
+}
+
 // The idiom this whole loop exists for: discover targets in code, feed them straight in. A `Path` is not JSON-serializable, so this used to die with a TypeError raised mid-frame and force `str(p)` at every call site.
 await check('discovered Path objects can be passed straight to a tool', `
 from pathlib import Path
@@ -337,6 +369,26 @@ try {
     failures += 1
     console.log(`  FAIL a failed spawn is dead, not silently alive\n       ${error.message}`)
   }
+}
+
+for (const reopening of [false, true]) {
+  const broken = new PythonKernel({ cwd: process.cwd(), onCall: async () => ({ ok: true, value: null }) })
+  let timer
+  try {
+    if (reopening) {
+      await broken.start([])
+      await broken.exec('import asyncio\nasync def detached():\n    try:\n        await asyncio.sleep(3600)\n    finally:\n        await asyncio.sleep(0.2)\nasyncio.create_task(detached())\nawait asyncio.sleep(0)')
+      broken.closeShell('main')
+    }
+    const failed = broken.start([{ name: 'broken', params: [{}] }]).then(() => broken.exec('raise AssertionError("must not run")'))
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('malformed init did not settle')), 5000) })
+    await assert.rejects(Promise.race([failed, timeout]), { name: 'KernelDeadError' })
+    assert.equal(broken.alive, false)
+    console.log(`  ok   a malformed catalogue rejects ${reopening ? 'reopening during cleanup' : 'initial startup'}`)
+  } catch (error) {
+    failures += 1
+    console.log(`  FAIL a malformed catalogue rejects startup (reopening=${reopening})\n       ${error.message}`)
+  } finally { clearTimeout(timer); await broken.dispose() }
 }
 
 // Each of these used to be unrecoverable — a wedged turn, a dead interpreter, a discarded observation — and each is reachable from ordinary model code.
@@ -1251,10 +1303,10 @@ console.log('session kernel:')
     await checkSession('a changed tool schema is still rebound in the same session', async () => {
       const v2 = [{ name: 'read', doc: 'REVISED', params: [{ name: 'file-path', type: 'str', required: true }, { name: 'limit', type: 'int', required: false }] }]
       await owner.exec('1', undefined, v2, 'owner')
-      assert.equal((await cell('import __dsh__.tools as T; T.read.__doc__')).repr, "'REVISED'")
+      assert.equal((await cell('import __dsh__.tools as T; print(T.read.__doc__)')).stdout, "REVISED\n\nPass as dict keys: 'file-path': str\n")
       assert.equal((await cell('import inspect; sorted(inspect.signature(T.read).parameters)')).repr, "['kwargs', 'limit']")
     })
-    await checkSession('a busy session keeps the error wording the host keys on', async () => {
+    await checkSession('a busy session rejects a second cell', async () => {
       const running = cell('import asyncio\nawait asyncio.sleep(0.5)')
       await new Promise((resume) => setTimeout(resume, 80).unref())
       const result = await cell('1')

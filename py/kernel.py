@@ -64,6 +64,7 @@ import sys
 import tempfile
 import traceback
 import types
+import unicodedata
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from dis import get_instructions
@@ -358,25 +359,37 @@ def _make_binding(bridge: Bridge, spec):
         section = "Parameters:\n" + "\n".join(f"    {p['name']}: {p['doc'].replace(chr(10), chr(10) + '        ')}" for p in documented)
         call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
         # A rebind builds NEW callables, so a name already pulled out with `from __dsh__.tools import read` keeps the docstring it was imported with. `__dsh__.tools.read?` is the authoritative view after a schema revision. True of the signature and return annotation too, and deliberate: the shell's namespace is the model's, and a rebind that reached into it could swap a binding under a cell mid-await.
-    # Per-parameter, not one suppress around the whole thing: a single exotic name (`class`, `file-path` — hyphens are routine for MCP tools) used to discard the ENTIRE signature, so `read?` showed `(**kwargs)` while the prompt showed the full parameter list, with no error either way. Anything unrenderable is folded into `**kwargs` so the picture stays honest.
-    params, dropped = [], False
+    # Keep valid parameters visible; only names Python cannot spell belong in **kwargs. Malformed specs must reject the catalogue.
+    params, dropped, names = [], [], set()
     for p in spec.get("params") or []:
+        param_name = p["name"]
+        if param_name in names:
+            raise ValueError(f"duplicate parameter name: {param_name!r}")
+        names.add(param_name)
+        # Python normalizes source identifiers; keep names that would change as literal dictionary keys.
+        if unicodedata.normalize("NFKC", param_name) != param_name:
+            dropped.append(p)
+            continue
         try:
             params.append(
                 inspect.Parameter(
-                    p["name"],
+                    param_name,
                     inspect.Parameter.KEYWORD_ONLY,
                     annotation=p.get("type") or "Any",
                     default=inspect.Parameter.empty if p.get("required") else ...,
                 )
             )
-        except (ValueError, TypeError):
-            dropped = True
+        except ValueError:
+            dropped.append(p)
     if dropped:
-        params.append(inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD))
-    with contextlib.suppress(ValueError, TypeError):
-        # The return annotation matters as much as the parameters here: it is what `read?` can tell the model that no amount of re-reading the call site can. Same source as the prompt block, so the two never disagree.
-        call.__signature__ = inspect.Signature(params, return_annotation=spec.get("returns") or "Any")  # type: ignore
+        overflow = "kwargs"
+        while any(p.name == overflow for p in params):
+            overflow = f"_{overflow}"
+        params.append(inspect.Parameter(overflow, inspect.Parameter.VAR_KEYWORD, annotation="Any"))
+        section = "Pass as dict keys: " + ", ".join(f"{p['name']!r}: {p.get('type') or 'Any'}{'' if p.get('required') else ' = ...'}" for p in dropped)
+        call.__doc__ = f"{call.__doc__}\n\n{section}" if call.__doc__ else section
+    # Duplicate or malformed parameters must fail the rebind, not silently discard the tool's signature.
+    call.__signature__ = inspect.Signature(params, return_annotation=spec.get("returns") or "Any")  # type: ignore
     return call
 
 
@@ -874,13 +887,14 @@ class Session:
         """
         if specs == self._last_specs:
             return
-        self.bindings, servers = build_bindings(bridge, specs)
-        install_mcp_modules(servers)
+        bindings, servers = build_bindings(bridge, specs)
         # `mcp_members` reads a servable-filtered tree: a true-dunder raw name (e.g. `__odd__`) is
         # reachable via the flat name and the deep import, never via `mcp.<server>.<tool>`, so the
         # server it sits under is absent from `dir(mcp)`. `install_mcp_modules` takes the unfiltered
         # tree so the server module is still registered for the deep import form.
-        self.mcp_tree = mcp_servers({name: call for name, call in self.bindings.items() if servable(name) is not None})
+        tree = mcp_servers({name: call for name, call in bindings.items() if servable(name) is not None})
+        install_mcp_modules(servers)
+        self.bindings, self.mcp_tree = bindings, tree
         # Recorded only once the build above has succeeded: a memo written before a raising spec would make a retry with the same specs early-return and silently serve the stale catalogue.
         self._last_specs = specs
 
@@ -1167,6 +1181,9 @@ class Kernel:
         if not replay and kind in ("init", "exec", "stream_start", "stream_append", "stream_finish", "stream_abort"):
             cleanup = self._closing.get(shell)
             if shell in self._deferred or (cleanup is not None and not cleanup.done()):
+                if kind == "init" and isinstance(specs := frame.get("tools"), list):
+                    # Validate before deferring so malformed init still exits through serve's startup failure path.
+                    build_bindings(self._bridge, specs)
                 # Keep new frames behind the replay even after cleanup finishes.
                 # Replay in arrival order after cleanup; the host may send exec immediately
                 # after init without waiting for ready. Keep reading finalizers' tool results.
@@ -1189,7 +1206,25 @@ class Kernel:
                 )
                 return
             specs = frame.get("tools")
-            self._session_for(shell, specs if isinstance(specs, list) else None)
+            try:
+                self._session_for(shell, specs if isinstance(specs, list) else None)
+            except Exception as error:  # noqa: BLE001 — binding happens before the execution task can answer failures
+                if kind == "stream_start":
+                    self._last_stream_ids[shell] = frame["id"]  # A rejected source must not replay against the previous catalogue.
+                await self._send(
+                    {
+                        "t": "done",
+                        "id": frame.get("id"),
+                        "shell": shell,
+                        "ok": False,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": f"KernelError: failed to bind tools before execution: {type(error).__name__}: {error}",
+                        "repr": None,
+                        "note": None,
+                    }
+                )
+                return
             if kind == "exec":
                 self._tasks[shell] = asyncio.ensure_future(self._exec(frame.get("id"), shell, frame.get("code") or ""))
             else:
@@ -1252,7 +1287,7 @@ class Kernel:
             elif self._busy(shell):
                 self._tasks[shell].cancel()
         elif kind == "init":
-            # Mirror the exec branch's two guards: a non-list `tools` would raise inside `build_bindings` (caught only by `serve`'s broad `except`, which swallows the `ready` frame and wedges the host), and a re-init while a cell is running must not rebind the tool table under it. `ready` is always sent — init is idempotent, so the existing bindings stay valid when we skip.
+            # Ignore absent catalogues and repeated init during a cell. A supplied catalogue must bind before ready; malformed entries fail startup through serve.
             specs = frame.get("tools")
             if isinstance(specs, list) and not self._busy(shell) and not (shell in self._sessions and self._sessions[shell].closing):
                 self._session_for(shell, specs)

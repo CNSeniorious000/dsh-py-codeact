@@ -186,7 +186,7 @@ const overflowSchemas = [{ name: 'overflow', description: 'Exotic parameters.', 
 }, required: ['a b'] } }]
 await check('overflow parameters retain their names, types, and requiredness in help', 'from __dsh__.tools import overflow; help(overflow)', (r) => {
   assert.equal(r.ok, true)
-  assert.match(r.stdout, /kwargs: '?str'? = Ellipsis, _kwargs: '?str'? = Ellipsis, \*\*__kwargs: '?Any'?/)
+  assert.match(r.stdout, /kwargs: '?str'? = Ellipsis,\s+_kwargs: '?str'? = Ellipsis,\s+\*\*__kwargs: '?Any'?/)
   assert.match(r.stdout, /Pass as dict keys: 'a b': str, 'c d': int = \.\.\./)
   assert.match(renderToolsSection(overflowSchemas), /\*\*__kwargs: Any {2}# spell as dict keys: "a b": str, "c d": int = \.\.\./)
 }, toolSpecs(overflowSchemas).specs)

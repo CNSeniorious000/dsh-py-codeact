@@ -270,6 +270,31 @@ await asyncio.sleep(0)
             assert (await done(33))["repr"] == "42"
             await quiet()
             checks.append("cancelled deferred source cannot replay after session replacement")
+
+            original = [{"name": "mark", "params": [{"name": "value", "type": "str", "required": True}]}]
+            await send("exec", id=34, tools=original, code="effects = []")
+            await done(34)
+            invalid = [{"name": "replacement", "params": []}, {"name": "broken", "params": [{}]}]
+            for exec_id, kind in enumerate(("exec", "exec", "stream_start", "stream_start"), 35):
+                await send(kind, id=exec_id, tools=invalid, code="effects.append('ran')")
+                if kind == "stream_start":
+                    await send("stream_append", id=exec_id, text="effects.append('ran')\n")
+                    await send("stream_finish", id=exec_id, source="effects.append('ran')\n")
+                reply = await done(exec_id, False)
+                assert "failed to bind tools before execution: KeyError" in reply["error"], reply
+                assert reply["stdout"] == reply["stderr"] == ""
+                if kind == "stream_start":
+                    await send("stream_start", id=exec_id)
+                    await send("stream_append", id=exec_id, text="effects.append('replayed')\n")
+                    await send("stream_finish", id=exec_id, source="effects.append('replayed')\n")
+            await send("exec", id=39, code="import __dsh__.tools as T; (effects, dir(T))")
+            assert (await done(39))["repr"] == "([], ['mark'])"
+            await send("stream_start", id=40, tools=[{"name": "replacement", "params": []}])
+            await send("stream_append", id=40, text="print(dir(T))\n")
+            await send("stream_finish", id=40, source="print(dir(T))\n")
+            assert (await done(40))["stdout"] == "['replacement']\n"
+            await quiet()
+            checks.append("binding failures settle without effects, preserve tools, reject replay, and allow a corrected catalogue")
     finally:
         writer.close()
         await writer.wait_closed()

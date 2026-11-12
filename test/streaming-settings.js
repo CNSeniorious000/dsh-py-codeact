@@ -9,6 +9,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { createHost } from './streaming-fixture.js'
 import plugin from '../lib/index.js'
 import settings, { apply as installSettings } from '../lib/settings.js'
+import { PythonKernel } from '../lib/kernel.js'
 
 async function bounded(operation) {
   let timer
@@ -84,6 +85,49 @@ try {
   assert.equal(host.requests, 5)
   console.log('PASS: mode changes retain namespace, step semantics, and exactly-once effects after success and interruption')
 } finally { await host.close() }
+
+for (const streaming of [false, true]) {
+  let admitted = false, rejectBinding = false, code, bindingHost
+  const method = streaming ? 'execStream' : 'exec', execute = PythonKernel.prototype[method], catalogues = []
+  PythonKernel.prototype[method] = function (source, signal, specs, shell) {
+    catalogues.push(specs?.map(({ name }) => name))
+    // A pre-admission failure leaves the old bindings intact; all successful calls use the real worker.
+    if (rejectBinding) { rejectBinding = false; return Promise.resolve({ ok: false, stdout: '', stderr: '', error: 'binding rejected before execution' }) }
+    return execute.call(this, source, signal, specs, shell)
+  }
+  try {
+    bindingHost = await createHost({
+      id: `binding-cache-${streaming}`, streaming,
+      setup({ ctx }) {
+        ctx.tools.register(defineTool({ name: 'binding_probe', description: 'Observe a changing catalogue.', parameters: {},
+          output: { schema: { type: 'string' }, render: () => [] }, execute: () => 'bound' }), { when: () => admitted })
+      },
+      async *stream() {
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: `binding-${catalogues.length}`, name: 'python', arguments: JSON.stringify({ code, description: 'Inspect available bindings' }) } }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      },
+    })
+    const inspect = 'import __dsh__.tools as T\nprint("BOUND", hasattr(T, "binding_probe"))\n'
+    const run = async (source = inspect) => {
+      code = source
+      await bindingHost.run({ signal: AbortSignal.timeout(15000) })
+      return bindingHost.events.findLast(event => event.type === 'tool/result').data.message.content.map(block => block.text ?? '').join('\n')
+    }
+    assert.match(await run(), /BOUND False/)
+    admitted = true; rejectBinding = true
+    assert.match(await run(), /binding rejected before execution/)
+    assert.match(await run(), /BOUND True/, 'a failed catalogue must be retried before executing the next cell')
+    assert.ok(catalogues.at(-1)?.includes('binding_probe'))
+    admitted = false
+    assert.match(await run(), /BOUND False/)
+    admitted = true
+    assert.match(await run(inspect + 'raise RuntimeError("after rebinding")\n'), /BOUND True[\s\S]*after rebinding/)
+    admitted = false
+    assert.match(await run(), /BOUND False/, 'a runtime error must invalidate the previous catalogue cache too')
+    assert.ok(catalogues.at(-1))
+    console.log(`PASS: binding failures streaming=${streaming} retry new catalogues and discard stale ones`)
+  } finally { PythonKernel.prototype[method] = execute; await bindingHost?.close() }
+}
 
 for (const [streaming, restricted] of [[false, false], [true, false], [true, true]]) {
   const effects = []

@@ -246,6 +246,47 @@ async def bridge_queue_deadlines(runner):
         assert not bridge._pending and not bridge._timeouts
 
 
+async def binding_failures_preserve_catalogue(runner):
+    original = [{"name": "mcp__old__read", "params": []}]
+    await runner.send("init", tools=original)
+    session = runner._sessions["test"]
+    bindings, tree = session.bindings, session.mcp_tree
+    effects = session.shell.user_ns["effects"] = []
+    exec_id = 0
+    for kind in ("exec", "stream_start"):
+        for params in ([{}], [{"name": None}], [{"name": "same"}, {"name": "same"}]):
+            invalid = [{"name": "new", "params": []}, {"name": "broken", "params": params}]
+            # Repeating the rejected catalogue must fail again, not hit the successful-bind cache.
+            for _ in range(2):
+                exec_id += 1
+                await runner.send(kind, id=exec_id, tools=invalid, code="effects.append('ran')")
+                runner.expect(exec_id, ok=False, stdout="", stderr="")
+                assert "failed to bind tools before execution" in runner.frames[-1]["error"]
+                assert session.bindings is bindings and session.mcp_tree is tree
+                assert session._last_specs is original
+                if kind == "stream_start":
+                    # Neither late deltas nor a repeated start may revive this rejected source.
+                    await runner.send("stream_start", id=exec_id)
+                    await runner.send("stream_append", id=exec_id, text="effects.append('ran')\n")
+                    await runner.send("stream_finish", id=exec_id, source="effects.append('ran')\n")
+                await asyncio.sleep(0)
+                assert effects == []
+                runner.expect(exec_id, ok=False)
+    revised = [{"name": "mcp__new__read", "params": [{"name": "path", "type": "str", "required": True}]}]
+    await runner.send("exec", id=100, tools=revised, code="from __dsh__.tools.mcp.new import read; import inspect; print(inspect.signature(read))")
+    await runner.finish()
+    runner.expect(100, ok=True, stdout="(*, path: 'str') -> 'Any'\n")
+    assert session._last_specs is revised and session.bindings is not bindings
+    assert "mcp__old__read" not in session.bindings
+    await runner.send("dispose")
+    await runner.send("init", tools=original)
+    await runner.send("exec", id=101, tools=invalid, code="deferred_effect = True")
+    await runner.finish()
+    runner.expect(101, ok=False)
+    assert "deferred_effect" not in runner._sessions["test"].shell.user_ns
+    assert runner._sessions["test"]._last_specs is original
+
+
 async def main():
     loop = asyncio.get_running_loop()
     factory = loop.get_task_factory()
@@ -253,6 +294,7 @@ async def main():
     loop.set_task_factory(kernel.Kernel._task_factory)
     try:
         for test, *args in (
+            (binding_failures_preserve_catalogue,),
             (bridge_queue_deadlines,),
             (rejects_late_tasks,),
             (preserves_replacement_cleanup,),

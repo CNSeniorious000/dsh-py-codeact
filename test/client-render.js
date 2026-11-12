@@ -44,6 +44,16 @@ for (const icons of [
   assert.equal(row.type.name, 'CodeActCard')
   const card = row.type(row.props)
   assert.equal(card.props['data-tool'], 'python')
+  assert.equal(elements(card).find(node => node.props?.title === 'CodeAct').props.collapsedContent, undefined)
+  for (const description of [undefined, '', '   ', 'Read', 'Read streamed arguments']) {
+    const codeFirst = view({ toolName: 'python', block: { phase: 'preparing', args: { text: key => ({ code: 'await probe()', description })[key] } } })
+    const nodes = elements(codeFirst.type(codeFirst.props)), disclosure = nodes.find(node => node.props?.title === 'CodeAct')
+    if (description?.trim()) {
+      const summary = elements(disclosure.props.collapsedContent).find(node => node.props?.className === 'summary')
+      assert.equal(summary.props.children.join(''), description)
+    } else assert.equal(disclosure.props.collapsedContent, undefined, 'code must not become a placeholder description')
+    assert.equal(nodes.find(node => node.props?.lang === 'python').props.code, 'await probe()')
+  }
   const partial = view({ toolName: 'python', block: { phase: 'preparing', args: { text: (key) => ({ code: 'await probe()', description: 'Read streamed arguments' })[key] } } })
   const preparing = JSON.stringify(partial.type(partial.props))
   assert.match(preparing, /Read streamed arguments/)

@@ -81,7 +81,10 @@ for (const streaming of [false, true]) {
   const block = async () => {
     const connected = once(server, 'connection', { signal: AbortSignal.timeout(15000) })
     pending = run(host.agent, `import socket\nblocked = socket.create_connection(("127.0.0.1", ${server.address().port}))\nblocked.recv(1)\nblocked.close()\n`)
-    return (await connected)[0]
+    const peer = (await connected)[0]
+    // Killing a blocked Windows process resets its socket instead of sending a graceful EOF.
+    peer.on('error', error => assert.equal(error.code, 'ECONNRESET'))
+    return peer
   }
   try {
     server.listen(0, '127.0.0.1')

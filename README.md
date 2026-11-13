@@ -304,7 +304,7 @@ Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged 
 
 ## Test
 
-`bun run test` covers the installed host, including its registry API. CI tests the pinned development host and the exact 0.2.1-rc.2, 0.2.2-rc.1, and 0.2.2-rc.2 host sets on Ubuntu and macOS. Each 0.2.2 host also runs streaming tests on both platforms and browser tests on Ubuntu. `bun run test:streaming` requires the matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
+`bun run test` covers the installed host, including its registry API. CI tests the pinned development host and the exact 0.2.1-rc.2, 0.2.2-rc.1, and 0.2.2-rc.2 host sets on Ubuntu, macOS, and Windows. Each 0.2.2 host also runs streaming tests on all three platforms and browser tests on Ubuntu and Windows. `bun run test:streaming` requires the matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
 
 `bun run test:web` installs official DSH and a packed plugin in a temporary directory, then tests streaming, whole-cell execution, Stop, Inspect, approvals, and cold history restoration in Chromium. It requires Bun, pnpm, and uv; all test servers use automatically assigned ports.
 

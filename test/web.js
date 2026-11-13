@@ -115,7 +115,9 @@ try {
     '@deepseek-ai/dsh': version, '@deepseek-ai/cordis': '4.1.0', '@deepseek-ai/schemastery': '3.19.0', 'dsh-py-codeact': `file:./${tarball}`, playwright: '1.61.1',
   } }))
   // DSH's package manager installs private copies, never links to a global Bun cache or installation.
-  await run('pnpm', ['install', '--ignore-scripts', '--store-dir', join(directory, 'store'), '--package-import-method', 'copy', '--node-linker', 'hoisted', '--registry', 'https://registry.npmjs.org'])
+  // Bun resolves Windows command shims while preserving the installed pnpm version.
+  const pnpm = process.platform === 'win32' ? ['bun', 'run', 'pnpm'] : ['pnpm']
+  await run(pnpm[0], [...pnpm.slice(1), 'install', '--ignore-scripts', '--store-dir', join(directory, 'store'), '--package-import-method', 'copy', '--node-linker', 'hoisted', '--registry', 'https://registry.npmjs.org'])
   const require = createRequire(join(directory, 'package.json'))
   const identities = {}
   for (const name of ['@deepseek-ai/dsh', '@deepseek-ai/dsh-client-ui-chat', '@deepseek-ai/dsh-client-ui-tool', '@deepseek-ai/dsh-client-ui-trajectory', 'dsh-py-codeact']) {
@@ -170,7 +172,7 @@ try {
       await input.press('Enter')
       await until(() => exists(join(caseDirectory, 'prefix-ready')), Boolean, 'provider prefix was not delivered')
       const effects = () => rows(join(caseDirectory, 'effects.jsonl'))
-      const inspectedCall = () => rows(join(caseDirectory, 'bash.jsonl')).then(calls => calls.find(call => call.type === 'tool/ptc-dispatch' && call.arguments.command === 'printf CODEACT_INSPECT'))
+      const inspectedCall = () => rows(join(caseDirectory, 'bash.jsonl')).then(calls => calls.find(call => call.type === 'tool/ptc-dispatch' && call.arguments.command === 'echo CODEACT_INSPECT'))
       let inspected, selectedKey
       if (!streaming) assert.deepEqual(await effects(), [], 'whole-cell mode executed before provider EOF')
       else await until(effects, values => values.length === 1, 'the streaming prefix did not execute')

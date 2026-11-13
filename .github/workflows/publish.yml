@@ -59,7 +59,7 @@ jobs:
           bun run test
           TY_UV=scripts uvx ty check py/kernel.py
 
-      - name: Check streaming on dsh 0.2.2-rc.1
+      - name: Check streaming on the pinned DSH host
         run: |
           bun run test:streaming
           uv run --script test/streaming-kernel.py

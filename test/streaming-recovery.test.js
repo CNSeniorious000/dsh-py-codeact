@@ -12,6 +12,8 @@ import { join } from 'node:path'
 import { hashArguments, hashDecodedArguments, installRecovery, recordSource } from '../lib/streaming-recovery.js'
 
 const identity = { streamId: 'stream-1', callId: 'python-1', turn: 1, step: 1 }
+// DSH 0.2.2-rc.2+ wraps the string denial returned by earlier hosts.
+const guardReason = (denial) => typeof denial === 'string' ? denial : denial?.reason
 const notices = new WeakMap()
 const record = (session, phase, data = {}) => {
   let owned = notices.get(session)
@@ -42,7 +44,7 @@ test('restored admission reports unknown outcome and denies exact-call replay', 
     const restored = Session.create('restored', session.snapshotEvents(), { ...session.header, id: 'restored' })
     assert.ok((env.recovery.context(restored)).includes('execution outcome unknown'))
     assert.ok((env.recovery.context(restored)).includes('TOOL_NOT_STARTED'))
-    assert.ok((env.ctx.tools.checkGuards({ agent: { session: restored }, callId: identity.callId })).includes('cannot be replayed'))
+    assert.match(guardReason(env.ctx.tools.checkGuards({ agent: { session: restored }, callId: identity.callId })), /cannot be replayed/)
     assert.equal(env.ctx.tools.checkGuards({ agent: { session: restored }, callId: 'new-call' }), undefined)
     assert.ok((env.recovery.context(restored)).includes('execution outcome unknown'))
   } finally { await env.close() }
@@ -58,7 +60,7 @@ test('remounting the plugin on the same live session refuses ownerless admission
     assert.equal(session.firstLiveSeq, 0)
     assert.equal(env.ctx.tools.checkGuards({ agent, callId: identity.callId }), undefined)
     assert.equal(env.recovery.context(session, agent), '')
-    assert.ok((remounted.ctx.tools.checkGuards({ agent, callId: identity.callId })).includes('cannot be replayed'))
+    assert.match(guardReason(remounted.ctx.tools.checkGuards({ agent, callId: identity.callId })), /cannot be replayed/)
     assert.ok((remounted.recovery.context(session, agent)).includes('execution outcome unknown'))
     assert.equal(remounted.ctx.tools.checkGuards({ agent, callId: 'new-call' }), undefined)
   } finally { await env.close(); await remounted.close() }
@@ -71,7 +73,7 @@ test('later turns can reuse provider identities without settling an earlier unkn
     const agent = { session, position: { turn: 1, step: 1 } }
     const streamId = (turn) => JSON.stringify([session.id, turn, 1, 'attempt-1', identity.callId])
     record(session, 'start', { streamId: streamId(1) })
-    assert.match(env.ctx.tools.checkGuards({ agent, callId: identity.callId }), /cannot be replayed/)
+    assert.match(guardReason(env.ctx.tools.checkGuards({ agent, callId: identity.callId })), /cannot be replayed/)
     agent.position = { turn: 2, step: 1 }
     assert.equal(env.ctx.tools.checkGuards({ agent, callId: identity.callId }), undefined)
     record(session, 'start', { streamId: streamId(2), turn: 2 })
@@ -146,7 +148,7 @@ test('session flush persists admission before restart without a result', async (
     const second = await environment()
     try {
       assert.ok((second.recovery.context(restored)).includes('execution outcome unknown'))
-      assert.ok((second.ctx.tools.checkGuards({ agent: { session: restored }, callId: identity.callId })).includes('cannot be replayed'))
+      assert.match(guardReason(second.ctx.tools.checkGuards({ agent: { session: restored }, callId: identity.callId })), /cannot be replayed/)
     } finally { await second.close() }
   } finally { await env.close(); await rm(directory, { recursive: true, force: true }) }
 })

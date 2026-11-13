@@ -46,7 +46,8 @@ export async function apply(ctx) {
       const delta = argumentsDelta => ({ type: 'tool-call-delta', index: 0, id: 'codeact-web-call', name: basename(directory) === 'custom-stop' ? 'execute_python' : 'python', argumentsDelta })
       const approval = basename(directory).startsWith('approval')
       const prefix = "from __dsh__.tools import fixture_probe, bash\nweb_counter = globals().get('web_counter', 0) + 1\nawait fixture_probe(value='FIRST')\n"
-        + "await bash(command='printf CODEACT_INSPECT', description='Print the CodeAct inspection marker')\n"
+        // echo is a shell builtin on Windows too; external MSYS utilities can need pipes the sandbox denies.
+        + "await bash(command='echo CODEACT_INSPECT', description='Print the CodeAct inspection marker')\n"
         + (approval ? "await bash(command='printf CODEACT_APPROVED >> approval-effects', description='Write the CodeAct approval marker', sandbox_permissions='danger-full-access', justification='Verify native approval with a marker in the test directory.')\n" : '')
       const suffix = "await fixture_probe(value='LAST')\nprint('CODEACT_WEB_COUNTER', web_counter)\n"
       yield delta('{"description":"Verify incremental execution","code":"' + encode(prefix))

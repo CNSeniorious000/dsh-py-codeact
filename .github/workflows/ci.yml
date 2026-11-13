@@ -46,7 +46,7 @@ jobs:
       - uses: crate-ci/typos@v1.52.2
 
   web:
-    name: web (official dsh 0.2.2-rc.1)
+    name: web (official dsh)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -92,7 +92,7 @@ jobs:
       - run: bun run test
 
   streaming:
-    name: streaming (dsh 0.2.2-rc.1, ${{ matrix.os }})
+    name: streaming (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu, macos]

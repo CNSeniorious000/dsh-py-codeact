@@ -10,7 +10,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 // Test the published integration surface: registry DSH, a packed plugin, and its actual browser client.
-const repository = fileURLToPath(new URL('../', import.meta.url)), version = '0.2.2-rc.1'
+const repository = fileURLToPath(new URL('../', import.meta.url))
+const plugin = JSON.parse(await readFile(join(repository, 'package.json'), 'utf8')), version = plugin.devDependencies['@deepseek-ai/dsh-tools']
 // Linux confinement replaces /tmp, so the packed worker and its interpreter must remain outside it.
 const requestedDirectory = process.argv[2] ? resolve(process.argv[2]) : await mkdtemp(join(homedir(), '.codeact-web-'))
 await mkdir(requestedDirectory, { recursive: true })
@@ -106,7 +107,6 @@ async function inspect(page, callId) {
 
 try {
   await run('bun', ['pm', 'pack', '--destination', directory], repository)
-  const plugin = JSON.parse(await readFile(join(repository, 'package.json'), 'utf8'))
   const packed = join(directory, `dsh-py-codeact-${plugin.version}.tgz`)
   const tarball = `codeact-${createHash('sha256').update(await readFile(packed)).digest('hex')}.tgz`
   await cp(packed, join(directory, tarball))

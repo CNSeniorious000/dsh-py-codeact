@@ -81,7 +81,7 @@ try {
   }
   assert.deepEqual(effects, [1, 2, 3, 4, 5])
   assert.equal(new Set(pids).size, 1, 'settings changes must retain the interpreter and its namespace')
-  assert.equal(host.events.filter(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'start').length, 2)
+  assert.equal(host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'start').length, 2)
   assert.equal(host.requests, 5)
   console.log('PASS: mode changes retain namespace, step semantics, and exactly-once effects after success and interruption')
 } finally { await host.close() }
@@ -163,7 +163,7 @@ for (const [streaming, restricted] of [[false, false], [true, false], [true, tru
     assert.match(text, /FALLBACK 1/)
     if (streaming) assert.doesNotMatch(text, /<return>/, 'the completed fallback must retain raw Python semantics after admission shrinks')
     else assert.match(text, /<return>1<\/return>/)
-    assert.equal(host.events.filter(event => event.type === 'user/message' && event.data.source.kind === 'python-stream').length, 0, 'a completed fallback is never an early source admission')
+    assert.equal(host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').length, 0, 'a completed fallback is never an early source admission')
     console.log(`PASS: complete-block fallback streaming=${streaming} restricted=${restricted} preserves step semantics and executes once`)
   } finally { releaseRestriction?.(); await host.close() }
 }

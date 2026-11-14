@@ -122,7 +122,7 @@ test('production source retains many child dispatches without repeatedly copying
 })
 
 test('production preserves observed names, leaves unknown names blank and lets canonical calls take over', () => {
-  for (const kind of ['tool-call', 'trajectory-tool-call']) for (const name of ['py', 'python']) for (const durable of [false, true]) {
+  for (const kind of ['tool-call', 'trajectory-tool-call']) for (const name of ['py', 'python']) for (const durable of [false, true]) for (const legacy of [false, true]) {
     const h = harness(), original = { ...native(kind),
       start: (_context, match) => ({ name: match.event.data.name ?? match.event.data.chunk?.name ?? '', subCalls: [], args: {} }),
       update: (context, match) => match.event.type === 'tool/call' ? { ...context.state, name: match.event.data.name } : context.state,
@@ -138,7 +138,9 @@ test('production preserves observed names, leaves unknown names blank and lets c
       state = (matches.length === 1 ? definition.start : definition.update)(context, match)
       return definition.buildViewNode({ ...context, state }).data.root.name
     }
-    assert.equal(accept({ ...event('user/message', { source: { kind: 'python-stream', phase: 'start', callId: 'parent', turn: 1, step: 1 } }), seq: 0 }), '')
+    const source = { kind: 'python-stream', phase: 'start', callId: 'parent', turn: 1, step: 1 }
+    const admission = legacy ? event('user/message', { source }) : event('developer/message', { turn: 1, step: 1, message: { source, content: [] } })
+    assert.equal(accept({ ...admission, seq: 0 }), '')
     const observed = durable ? { ...event('assistant/attempt', { stream: [{ type: 'tool-call-chunks', id: 'parent' }, { type: 'tool-call-chunks', id: 'parent', name }] }), seq: 1 } : delta(1, '{}', name).event
     assert.equal(accept(observed), name)
     assert.equal(accept({ ...event('assistant/attempt', { stream: [{ type: 'tool-call-chunks', id: 'parent', name: 'unrelated' }] }), seq: 2 }, { ...location, step: { turn: 1, step: 2 } }), name)

@@ -44,7 +44,7 @@ try {
     const events = agent.session.snapshotEvents()
     const result = events.find(event => event.type === 'tool/result')
     assert.notEqual(result.data.message.isError, true)
-    assert.ok(events.find(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result').seq < events.find(event => event.type === 'step/end').seq)
+    assert.ok(events.find(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result').seq < events.find(event => event.type === 'step/end').seq)
   }
   await second.dispose()
   second = undefined

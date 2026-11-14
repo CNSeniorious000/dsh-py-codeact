@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { Session, SessionStore } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import { ToolsService } from '@deepseek-ai/dsh-tools'
-import { createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { mkdtemp, open, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -14,6 +14,7 @@ import { hashArguments, hashDecodedArguments, installRecovery, recordSource } fr
 const identity = { streamId: 'stream-1', callId: 'python-1', turn: 1, step: 1 }
 // DSH 0.2.2-rc.2+ wraps the string denial returned by earlier hosts.
 const guardReason = (denial) => typeof denial === 'string' ? denial : denial?.reason
+const latestRecord = session => session.snapshotEvents().findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').data.message
 const notices = new WeakMap()
 const record = (session, phase, data = {}) => {
   let owned = notices.get(session)
@@ -154,27 +155,26 @@ test('session flush persists admission before restart without a result', async (
 })
 
 
-test('native notices preserve model-visible admission and settlement across fork and restore', async () => {
+test('recovery evidence survives fork and restore without adding chat or model messages', async () => {
   const env = await environment()
   try {
     const session = env.ctx.sessions.create('native-notices', { meta: { cwd: process.cwd() } })
     const start = record(session, 'start')
-    const admission = session.deriveMessages().find(message => message.source.kind === 'python-stream')
-    assert.match(admission.content[0].text, /do not replay/)
+    const admission = latestRecord(session)
+    assert.deepEqual(session.deriveMessages(), [])
     assert.equal(admission.source.phase, 'start')
     const result = record(session, 'result', { result: { content: [{ type: 'text', text: 'Accepted visible output' }], value: 'private canonical result' } })
-    const messages = session.deriveMessages().filter(message => message.source.kind === 'python-stream')
-    assert.equal(messages.length, 1)
-    assert.equal(messages[0].source.phase, 'result')
-    assert.match(messages[0].content[0].text, /Accepted visible output/)
+    assert.deepEqual(session.deriveMessages(), [])
+    assert.equal(latestRecord(session).source.phase, 'result')
+    assert.match(latestRecord(session).source.output, /Accepted visible output/)
     assert.doesNotMatch(JSON.stringify(session.snapshotEvents()), /private canonical result/)
     assert.deepEqual(session.eventAt(result).sourceEventSeqs, [start])
     const fork = env.ctx.sessions.fork(session, start, 'before-settlement')
     assert.match(env.recovery.context(fork), /execution outcome unknown/)
-    assert.equal(fork.deriveMessages().find(message => message.source.kind === 'python-stream').source.phase, 'start')
+    assert.equal(latestRecord(fork).source.phase, 'start')
     const restored = Session.create('restored-notices', session.snapshotEvents(), { ...session.header, id: 'restored-notices' })
     assert.match(env.recovery.context(restored), /Accepted visible output/)
-    assert.equal(restored.deriveMessages().filter(message => message.source.kind === 'python-stream').length, 1)
+    assert.deepEqual(restored.deriveMessages(), [])
   } finally { await env.close() }
 })
 
@@ -188,11 +188,11 @@ test('recovery metadata stays bounded while persisted notices retain the full ou
       record(session, 'result', failure ? { error: text } : { result: { content: [{ type: 'text', text }] } })
       const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
       const restored = Session.create(saved.header.id, saved.events, saved.header)
-      const notice = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
+      const notice = latestRecord(restored)
       assert.equal(notice.source.outcome.isWellFormed(), true, 'truncation must not create an unpaired surrogate')
       assert.equal(notice.source.outcome, expected)
-      assert.ok(notice.content[0].text.endsWith(text), 'history must retain output beyond the recovery metadata limit')
-      assert.equal(Buffer.from(notice.content[0].text, 'utf8').toString('utf8'), notice.content[0].text)
+      assert.ok(notice.source.output.endsWith(text), 'history must retain output beyond the recovery metadata limit')
+      assert.equal(Buffer.from(notice.source.output, 'utf8').toString('utf8'), notice.source.output)
     }
   } finally { await env.close() }
 })
@@ -215,9 +215,9 @@ test('restored recovery distinguishes empty output, failed output and an absent 
       record(session, 'result', data)
       const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
       const restored = Session.create(saved.header.id, saved.events, saved.header)
-      const notice = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
+      const notice = latestRecord(restored)
       assert.equal(notice.source.outcome, expected)
-      assert.ok(notice.content[0].text.endsWith(expected))
+      assert.ok(notice.source.output.endsWith(expected))
       assert.ok(env.recovery.context(restored).endsWith(expected))
     }
   } finally { await env.close() }
@@ -229,4 +229,31 @@ test('authoritative Python arguments compare decoded values while rejecting ambi
   assert.equal(hashArguments('{"code":"first","code":"second","description":"Print"}'), null)
   assert.equal(hashArguments('{"code":"first","description":"Print","extra":true}'), null)
   assert.equal(hashArguments('{"code":"first","description":"Print"} trailing'), null)
+})
+
+
+test('successful calls leave only the ordinary result and no recovery context after restore', async () => {
+  const env = await environment()
+  try {
+    const session = env.ctx.sessions.create('normal', { meta: { cwd: process.cwd() } })
+    record(session, 'start')
+    record(session, 'result', { result: { isError: false, content: [{ type: 'text', text: '42' }] } })
+    const message = createToolResultMessage({ callId: identity.callId, isError: false, content: [{ type: 'text', text: '42' }] })
+    session.append('tool/result', { turn: 1, step: 1, message }, { surfaceOp: 'append' })
+    const restored = Session.create('normal-restored', session.snapshotEvents(), { ...session.header, id: 'normal-restored' })
+    for (const current of [session, restored]) {
+      assert.deepEqual(current.deriveMessages(), [message])
+      assert.equal(env.recovery.context(current), '')
+    }
+  } finally { await env.close() }
+})
+
+test('legacy user notices still prevent replay after upgrade', async () => {
+  const env = await environment()
+  try {
+    const session = env.ctx.sessions.create('legacy', { meta: { cwd: process.cwd() } })
+    session.append('user/message', createUserMessage({ source: { kind: 'python-stream', phase: 'start', ...identity }, content: [{ type: 'text', text: 'Legacy admission' }] }), { surfaceOp: 'append' })
+    assert.match(env.recovery.context(session), /execution outcome unknown/)
+    assert.match(guardReason(env.ctx.tools.checkGuards({ agent: { session }, callId: identity.callId })), /cannot be replayed/)
+  } finally { await env.close() }
 })

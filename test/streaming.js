@@ -33,10 +33,10 @@ async function scenario(name, options, test) {
     const originalAppend = host.session.append
     await test({ host, effects, observed, dispatches, start })
     assert.equal(host.session.append, originalAppend, 'plugin must not intercept Session.append')
-    const notices = host.events.filter(event => event.type === 'user/message' && event.data.source.kind === 'python-stream')
-    for (const admission of notices.filter(event => event.data.source.phase === 'start')) {
-      const { streamId, turn, step } = admission.data.source
-      const result = notices.find(event => event.data.source.phase === 'result' && event.data.source.streamId === streamId)
+    const notices = host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream')
+    for (const admission of notices.filter(event => event.data.message.source.phase === 'start')) {
+      const { streamId, turn, step } = admission.data.message.source
+      const result = notices.find(event => event.data.message.source.phase === 'result' && event.data.message.source.streamId === streamId)
       const end = host.events.find(event => event.type === 'step/end' && event.data.turn === turn && event.data.step === step)
       assert.ok(result && end && result.seq < end.seq, 'Python must settle before the host closes its step')
     }
@@ -76,6 +76,7 @@ for (const streaming of [true, false]) {
     const assistant = host.events.findIndex((e) => e.type === 'assistant/message')
     const result = host.events.findIndex((e) => e.type === 'tool/result')
     assert.ok(assistant >= 0 && result > assistant, 'outer result must follow the settled assistant call')
+    assert.equal(host.session.deriveMessages().some(message => message.source?.kind === 'python-stream'), false, 'normal execution must not inject recovery notices')
     if (streaming) assert.ok(host.events.findIndex((e) => e.type === 'tool/ptc-dispatch') < assistant, 'nested effects must be real and early')
   })
 }
@@ -209,12 +210,12 @@ await scenario('cancel-while-awaiting-source', {
   cancellationEffect = observed
   await assert.rejects(host.run({ signal: controller.signal }), /cancelled by fixture/)
   assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
-  const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
-  assert.ok(notice.data.source.outcome.length <= 4000, 'recovery metadata remains bounded')
+  const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
+  assert.ok(notice.data.message.source.outcome.length <= 4000, 'recovery metadata remains bounded')
   const restored = Session.create('restored-interruption', JSON.parse(JSON.stringify(host.events)), { ...host.session.header, id: 'restored-interruption' })
-  const saved = restored.deriveMessages().find(message => message.source.kind === 'python-stream')
-  assert.deepEqual(saved.content, notice.data.content, 'restored history must retain the complete accepted output')
-  const content = saved.content.map(block => block.text ?? '').join('\n')
+  const saved = restored.snapshotEvents().findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').data.message
+  assert.equal(saved.source.output, notice.data.message.source.output, 'restored history must retain the complete accepted output')
+  const content = saved.source.output
   assert.match(content, /<stdout>early stdout/)
   assert.match(content, /OUTPUT-TAIL/)
   assert.match(content, /<stderr>early stderr/)
@@ -257,12 +258,12 @@ for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution
       host.agent.cancel({ kind: 'user' })
       release.resolve()
       assert.equal((await running).kind, 'aborted')
-      const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+      const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
       const result = host.events.findLast(event => event.type === 'tool/result')
       assert.doesNotMatch(JSON.stringify([notice, result]), /\[object Object\]/)
       if (phase === 'admission') {
         assert.deepEqual(effects, [])
-        assert.match(notice.data.source.outcome, /InterruptedError:.*cancelled.*Earlier effects remain/)
+        assert.match(notice.data.message.source.outcome, /InterruptedError:.*cancelled.*Earlier effects remain/)
       } else {
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
         assert.equal(result.data.message.isError, true)
@@ -276,7 +277,7 @@ for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution
           assert.match(content, /cleanup after interrupt/)
           assert.match(content, /InterruptedError|KeyboardInterrupt/)
         }
-        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
+        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.message.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
         await host.run({ signal: AbortSignal.timeout(15000) })
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must neither replay prior effects nor execute the cancelled suffix')
       }
@@ -351,7 +352,7 @@ for (const redacted of [false, true]) {
       const content = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
       assert.match(content, redacted ? /REDACTED/ : /output awaiting persistence/)
       assert.match(content, /InterruptedError|KeyboardInterrupt/)
-      const notice = host.events.findLast(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+      const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
       if (redacted) assert.doesNotMatch(JSON.stringify([notice, result]), /output awaiting persistence/)
       assert.deepEqual(effects.map(({ value }) => value), ['once'])
     } finally { release.resolve(); await running.catch(() => {}) }
@@ -626,10 +627,10 @@ await scenario('accepted-content-survives-final-join', {
 }, async ({ host }) => {
   await host.run({ signal: AbortSignal.timeout(15000) })
   const result = host.events.find(event => event.type === 'tool/result')
-  const ledger = host.events.find(event => event.type === 'user/message' && event.data.source.kind === 'python-stream' && event.data.source.phase === 'result')
+  const ledger = host.events.find(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
   assert.match(JSON.stringify(result), /REDACTED/)
   assert.doesNotMatch(JSON.stringify([result, ledger]), /private-output-marker/)
-  assert.equal(ledger.data.source.outcome, 'REDACTED')
+  assert.equal(ledger.data.message.source.outcome, 'REDACTED')
 })
 
 let duplicate

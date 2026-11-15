@@ -82,7 +82,12 @@ try {
   let descendantClosed
   const descendantConnected = once(descendantServer, 'connection', { signal: AbortSignal.timeout(30000) }).then(([peer]) => {
     descendantPeer = peer
-    descendantClosed = once(peer, 'close', { signal: AbortSignal.timeout(30000) })
+    peer.on('error', error => assert.equal(error.code, 'ECONNRESET'))
+    // events.once would reject on the expected Windows ECONNRESET before the socket closes.
+    descendantClosed = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('descendant socket did not close')), 30000)
+      peer.once('close', () => { clearTimeout(timeout); resolve() })
+    })
     peer.resume()
   })
   const port = descendantServer.address().port

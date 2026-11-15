@@ -459,7 +459,7 @@ console.log('prompt:')
   const pythonBlock = (text) => text.split('```python\n')[1]?.split('```')[0] ?? ''
   const parses = (code) => {
     try {
-      execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
+      execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast,sys; ast.parse(sys.stdin.buffer.read())'], { input: code, stdio: ['pipe', 'ignore', 'pipe'] })
       return true
     } catch { return false }
   }
@@ -826,7 +826,7 @@ console.log('prompt:')
     // never declared, and the call would fail as if the tool were broken.
     assert.match(unicode, /# spell as dict keys: .*ﬁ.*ｘ/, 'an NFKC-unstable one folds even though Python calls it an identifier')
     const fence = unicode.slice(unicode.indexOf('```python') + 10, unicode.lastIndexOf('```'))
-    execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+    execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.buffer.read(), "<block>", "exec")'], { input: fence })
     const unsupportedNames = ['\u{323B0}', '\u{105C0}', '\u1C89', 'x\u30FB', 'name\n']
     const compatible = renderToolsSection([{ name: 'versions', parameters: { properties: {
       '𠀀': { type: 'string' }, ...Object.fromEntries(unsupportedNames.map((name) => [name, { type: 'string' }])),
@@ -948,7 +948,7 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     } } }])
     renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
     const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
-    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
+    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.buffer.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
     for (const value of ['{{missing}}', '{{{three}}}', '{{{{four}}}}']) assert.ok(values.includes(value), 'Python literals must retain their original values')
   })
   await checkDoc('folded parameter names and literal types survive prompt interpolation', async () => {
@@ -971,7 +971,7 @@ console.log('a parameter carries its prose to `name?`, not to the prompt:')
     }, required: ['a b'] } }])
     renderPrompt({ sections: [{ name: 'py-codeact:sdk', text: block }], contexts: [], tools: [], variables: {} })
     const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
-    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
+    const values = JSON.parse(execFileSync(kernel.pythonEnv.executable, ['-c', 'import ast, json, sys; print(json.dumps([n.value for n in ast.walk(ast.parse(sys.stdin.buffer.read())) if isinstance(n, ast.Constant) and isinstance(n.value, str)]))'], { input: fence, encoding: 'utf8' }))
     assert.ok(values.includes('{{x}}'), 'a fallback annotation must retain its literal value')
   })
   docs.dispose()
@@ -1006,7 +1006,7 @@ try {
     { name: 'after', description: 'Must still be here.', parameters: {} },
   ])
   const fence = hostile.slice(hostile.indexOf('```python') + 10, hostile.lastIndexOf('```'))
-  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.buffer.read(), "<block>", "exec")'], { input: fence })
   assert.match(fence, /async def after\(\) -> Any:/, 'the tool after the hostile ones still renders')
   console.log('  ok   a triple quote or trailing backslash costs fidelity, never the block')
 } catch (error) {
@@ -1025,7 +1025,7 @@ try {
   const properties = Object.fromEntries(listed.map((kw) => [kw, { type: 'string' }]))
   const block = renderToolsSection([{ name: 'kw', parameters: { type: 'object', properties, required: [] }, output: { type: 'string' } }])
   const fence = block.slice(block.indexOf('```python') + 10, block.lastIndexOf('```'))
-  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.buffer.read(), "<block>", "exec")'], { input: fence })
   console.log(`  ok   all ${listed.length} of this interpreter's keywords survive the block`)
 } catch (error) {
   failures += 1
@@ -1041,7 +1041,7 @@ try {
     file_path: { type: 'string', description: 'Path.\rinjected = 1' },
   }, required: ['file_path'] } }])
   const fence = cr.slice(cr.indexOf('```python') + 10, cr.lastIndexOf('```'))
-  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: fence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.buffer.read(), "<block>", "exec")'], { input: fence })
   assert.doesNotMatch(fence, /^\s*injected = 1$/m, 'the description stays inside the comment it was rendered into')
   assert.match(fence, /file_path: str,  # Path\. injected = 1\n/, 'collapsed onto the one line a comment can occupy')
   // Narrower than `str.splitlines()` on purpose. `\v`, `\f`, `\x85`, `\u2028` and `\u2029` all split a
@@ -1052,7 +1052,7 @@ try {
     file_path: { type: 'string', description: 'Kept\u2028together\vhere' },
   }, required: ['file_path'] } }])
   const wideFence = wide.slice(wide.indexOf('```python') + 10, wide.lastIndexOf('```'))
-  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.read(), "<block>", "exec")'], { input: wideFence })
+  execFileSync(kernel.pythonEnv.executable, ['-c', 'import sys; compile(sys.stdin.buffer.read(), "<block>", "exec")'], { input: wideFence })
   assert.match(wideFence, /file_path: str,  # Kept\u2028together\vhere\n/, 'a terminator Python does not honour stays in the description')
   console.log('  ok   a lone \\r cannot end the comment it sits in')
 } catch (error) {

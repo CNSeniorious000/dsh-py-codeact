@@ -1328,10 +1328,15 @@ class Kernel:
         loop.set_task_factory(self._task_factory)
         # The default 64 KiB line limit is far below a real frame: a catalogue of ~40 tools serialises past 80 KB, and a cell carrying a file body is unbounded by nature. Overrunning it raises out of `readline` and takes every shell's namespace with it.
         reader = asyncio.StreamReader(limit=1 << 24)
-        await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader),
-            os.fdopen(PROTOCOL_FD, "rb", buffering=0),
-        )
+        if sys.platform == "win32":
+            import msvcrt
+            from asyncio.windows_utils import PipeHandle
+
+            # Proactor transports consume native HANDLEs, while fdopen exposes a CRT descriptor.
+            pipe = PipeHandle(msvcrt.get_osfhandle(PROTOCOL_FD))
+        else:
+            pipe = os.fdopen(PROTOCOL_FD, "rb", buffering=0)
+        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), pipe)
         while True:
             try:
                 line = await reader.readline()

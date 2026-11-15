@@ -30,9 +30,10 @@ jobs:
     name: smoke (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu, macos]
+        os: [ubuntu, macos, windows]
       fail-fast: false
     runs-on: ${{ matrix.os }}-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       # The suite spawns the real kernel, which builds its own PEP 723 environment — no separate Python setup, but uv has to be there.
@@ -51,8 +52,12 @@ jobs:
       - uses: crate-ci/typos@v1.52.2
 
   web:
-    name: web (official dsh)
-    runs-on: ubuntu-latest
+    name: web (official dsh, ${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu, windows]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -68,7 +73,7 @@ jobs:
       - uses: actions/upload-artifact@v7.0.2
         if: failure()
         with:
-          name: web-failure
+          name: web-failure-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/codeact-web/*/host.log
             ${{ runner.temp }}/codeact-web/*/browser.txt
@@ -79,7 +84,7 @@ jobs:
     name: compatibility (dsh ${{ matrix.dsh }}, ${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu, macos]
+        os: [ubuntu, macos, windows]
         dsh: [0.2.1-rc.2, 0.2.2-rc.1, 0.2.2-rc.2]
       fail-fast: false
     runs-on: ${{ matrix.os }}-latest
@@ -92,6 +97,7 @@ jobs:
         with:
           node-version: 26
       - name: Install exact compatibility host packages
+        shell: bash
         env:
           DSH_VERSION: ${{ matrix.dsh }}
         run: |
@@ -113,14 +119,14 @@ jobs:
         if: matrix.dsh != '0.2.1-rc.2'
         run: bun run test:streaming
       - uses: pnpm/action-setup@v6
-        if: matrix.os == 'ubuntu' && matrix.dsh != '0.2.1-rc.2'
+        if: matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
         with:
           version: 12.18.0
       - name: Run web tests
-        if: matrix.os == 'ubuntu' && matrix.dsh != '0.2.1-rc.2'
+        if: matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
         run: bun run test:web "${{ runner.temp }}/codeact-web"
       - uses: actions/upload-artifact@v7.0.2
-        if: failure() && matrix.os == 'ubuntu' && matrix.dsh != '0.2.1-rc.2'
+        if: failure() && matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
         with:
           name: web-failure-${{ matrix.dsh }}-${{ matrix.os }}
           path: |
@@ -133,9 +139,10 @@ jobs:
     name: streaming (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu, macos]
+        os: [ubuntu, macos, windows]
       fail-fast: false
     runs-on: ${{ matrix.os }}-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.3

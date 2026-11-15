@@ -55,7 +55,7 @@ jobs:
     name: web (official dsh, ${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu, windows]
+        os: [ubuntu, macos, windows]
       fail-fast: false
     runs-on: ${{ matrix.os }}-latest
     timeout-minutes: 15
@@ -119,14 +119,14 @@ jobs:
         if: matrix.dsh != '0.2.1-rc.2'
         run: bun run test:streaming
       - uses: pnpm/action-setup@v6
-        if: matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
+        if: matrix.dsh != '0.2.1-rc.2'
         with:
           version: 12.18.0
       - name: Run web tests
-        if: matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
+        if: matrix.dsh != '0.2.1-rc.2'
         run: bun run test:web "${{ runner.temp }}/codeact-web"
       - uses: actions/upload-artifact@v7.0.2
-        if: failure() && matrix.os != 'macos' && matrix.dsh != '0.2.1-rc.2'
+        if: failure() && matrix.dsh != '0.2.1-rc.2'
         with:
           name: web-failure-${{ matrix.dsh }}-${{ matrix.os }}
           path: |

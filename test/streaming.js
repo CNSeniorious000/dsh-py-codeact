@@ -114,7 +114,11 @@ await scenario('retire-redundant-legacy-notices-on-resume', {
   await host.run({ signal: AbortSignal.timeout(15000) })
   await host.run({ signal: AbortSignal.timeout(15000) })
   assert.equal(host.requests, 2)
-  assert.equal(host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').length, 1)
+  const replacements = host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream')
+  assert.equal(replacements.length, 1)
+  const [replacement] = replacements
+  const opening = host.events.find(event => event.type === 'step/start' && event.data.turn === replacement.data.turn && event.data.step === replacement.data.step)
+  assert.ok(opening && opening.seq < replacement.seq, 'the persisted replacement must belong to an open step')
 })
 
 for (const changed of [false, true]) {

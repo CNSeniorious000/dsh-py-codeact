@@ -27,7 +27,7 @@ jobs:
       || (github.event.pull_request.state == 'open' && github.event.pull_request.head.repo.full_name == github.repository
           && (github.event.action != 'ready_for_review' || github.event.pull_request.user.type == 'Bot')
           && (github.event_name == 'pull_request_target' || github.event.sender.type != 'Bot'))
-    uses: promplate/code-review/.github/workflows/review.yml@6ddbcf32de47c2a3263903dfe94d9eb359be817b
+    uses: promplate/code-review/.github/workflows/review.yml@main
     with:
       codex-config: ${{ vars.CODEX_CONFIG }}
       model-catalog: ${{ vars.CODEX_MODEL_CATALOG }}

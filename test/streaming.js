@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { defineTool, ToolBatchExecutionError } from '@deepseek-ai/dsh-tools'
-import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { Session } from '@deepseek-ai/dsh-session'
 import { createHost } from './streaming-fixture.js'
+import { streamRecoveryEvent } from '../lib/streaming-recovery.js'
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const encode = (text) => JSON.stringify(text).slice(1, -1)
@@ -17,7 +18,7 @@ async function scenario(name, options, test) {
     if (!gates.has(value)) gates.set(value, Promise.withResolvers())
     return gates.get(value).promise
   }
-  const host = await createHost({ id: name, ...options, setup({ ctx }) {
+  const host = await createHost({ id: name, ...options, setup({ ctx, session }) {
     ctx.tools.register(defineTool({ name: 'probe', description: 'Record an observable effect.', parameters: { value: { type: 'string', required: true } },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute({ value }, exec) {
@@ -27,16 +28,16 @@ async function scenario(name, options, test) {
         return value
       } }))
     ctx.tools.guard((exec) => { dispatches.push({ name: exec.name, callId: exec.callId, parent: exec.parent?.callId ?? exec.parent, rootCallId: exec.rootCallId }) })
-    options.setup?.({ ctx })
+    options.setup?.({ ctx, session })
   } })
   try {
     const originalAppend = host.session.append
     await test({ host, effects, observed, dispatches, start })
     assert.equal(host.session.append, originalAppend, 'plugin must not intercept Session.append')
-    const notices = host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream')
-    for (const admission of notices.filter(event => event.data.message.source.phase === 'start')) {
-      const { streamId, turn, step } = admission.data.message.source
-      const result = notices.find(event => event.data.message.source.phase === 'result' && event.data.message.source.streamId === streamId)
+    const records = host.events.filter(event => event.type === streamRecoveryEvent)
+    for (const admission of records.filter(event => event.data.phase === 'start')) {
+      const { streamId, turn, step } = admission.data
+      const result = records.find(event => event.data.phase === 'result' && event.data.streamId === streamId)
       const end = host.events.find(event => event.type === 'step/end' && event.data.turn === turn && event.data.step === step)
       assert.ok(result && end && result.seq < end.seq, 'Python must settle before the host closes its step')
     }
@@ -77,9 +78,44 @@ for (const streaming of [true, false]) {
     const result = host.events.findIndex((e) => e.type === 'tool/result')
     assert.ok(assistant >= 0 && result > assistant, 'outer result must follow the settled assistant call')
     assert.equal(host.session.deriveMessages().some(message => message.source?.kind === 'python-stream'), false, 'normal execution must not inject recovery notices')
-    if (streaming) assert.ok(host.events.findIndex((e) => e.type === 'tool/ptc-dispatch') < assistant, 'nested effects must be real and early')
+    if (streaming) {
+      assert.ok(host.events.findIndex((e) => e.type === 'tool/ptc-dispatch') < assistant, 'nested effects must be real and early')
+      assert.deepEqual(host.events.filter(event => event.type === streamRecoveryEvent).map(event => event.data.phase), ['start', 'result'])
+    }
   })
 }
+
+await scenario('retire-redundant-legacy-notices-on-resume', {
+  setup({ session }) {
+    const position = { turn: 1, step: 1 }
+    const appendNotice = (callId, phase, text, replace) => session.append('user/message', createUserMessage({
+      source: { kind: 'python-stream', streamId: callId, callId, phase, ...position }, content: [{ type: 'text', text }],
+    }), replace ?? { surfaceOp: 'append' }).seq
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', position)
+    const start = appendNotice('legacy-success', 'start', 'Redundant admission')
+    appendNotice('legacy-success', 'result', 'Redundant settlement', { surfaceOp: { op: 'replace', startSeq: start, endSeq: start }, sourceEventSeqs: [start] })
+    session.append('tool/call', { ...position, callId: 'legacy-success', name: 'python', arguments: '{}' })
+    session.append('tool/result', { ...position, message: createToolResultMessage({ callId: 'legacy-success', isError: false, content: [{ type: 'text', text: 'Original Python result' }] }) }, { surfaceOp: 'append' })
+    appendNotice('legacy-pending', 'start', 'Useful unresolved admission')
+    session.append('step/end', position)
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  },
+  async *stream(request) {
+    const history = JSON.stringify(request.messages)
+    assert.doesNotMatch(history, /Redundant admission|Redundant settlement/)
+    assert.match(history, /Original Python result/)
+    assert.match(history, /Useful unresolved admission/)
+    assert.match(history, /execution outcome unknown/)
+    yield { type: 'text-delta', index: 0, text: 'Resumed' }
+    yield finish('stop')
+  },
+}, async ({ host }) => {
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.equal(host.requests, 2)
+  assert.equal(host.events.filter(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').length, 1)
+})
 
 for (const changed of [false, true]) {
   let effect
@@ -210,12 +246,12 @@ await scenario('cancel-while-awaiting-source', {
   cancellationEffect = observed
   await assert.rejects(host.run({ signal: controller.signal }), /cancelled by fixture/)
   assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
-  const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
-  assert.ok(notice.data.message.source.outcome.length <= 4000, 'recovery metadata remains bounded')
+  const notice = host.events.findLast(event => event.type === streamRecoveryEvent && event.data.phase === 'result')
+  assert.ok(notice.data.outcome.length <= 4000, 'recovery metadata remains bounded')
   const restored = Session.create('restored-interruption', JSON.parse(JSON.stringify(host.events)), { ...host.session.header, id: 'restored-interruption' })
-  const saved = restored.snapshotEvents().findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').data.message
-  assert.equal(saved.source.output, notice.data.message.source.output, 'restored history must retain the complete accepted output')
-  const content = saved.source.output
+  const saved = restored.snapshotEvents().findLast(event => event.type === streamRecoveryEvent).data
+  assert.equal(saved.output, notice.data.output, 'restored history must retain the complete accepted output')
+  const content = saved.output
   assert.match(content, /<stdout>early stdout/)
   assert.match(content, /OUTPUT-TAIL/)
   assert.match(content, /<stderr>early stderr/)
@@ -258,12 +294,12 @@ for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution
       host.agent.cancel({ kind: 'user' })
       release.resolve()
       assert.equal((await running).kind, 'aborted')
-      const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
+      const notice = host.events.findLast(event => event.type === streamRecoveryEvent && event.data.phase === 'result')
       const result = host.events.findLast(event => event.type === 'tool/result')
       assert.doesNotMatch(JSON.stringify([notice, result]), /\[object Object\]/)
       if (phase === 'admission') {
         assert.deepEqual(effects, [])
-        assert.match(notice.data.message.source.outcome, /InterruptedError:.*cancelled.*Earlier effects remain/)
+        assert.match(notice.data.outcome, /InterruptedError:.*cancelled.*Earlier effects remain/)
       } else {
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel'])
         assert.equal(result.data.message.isError, true)
@@ -277,7 +313,7 @@ for (const [streaming, phase, policy] of [[true, 'admission'], [true, 'execution
           assert.match(content, /cleanup after interrupt/)
           assert.match(content, /InterruptedError|KeyboardInterrupt/)
         }
-        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.message.source.outcome, content, 'settlement must retain the accepted result, including cancellation output')
+        if (streaming && (!policy || ['inner', 'both'].includes(policy))) assert.equal(notice.data.outcome, content, 'settlement must retain the accepted result, including cancellation output')
         await host.run({ signal: AbortSignal.timeout(15000) })
         assert.deepEqual(effects.map(({ value }) => value), ['before-cancel', '41'], 'continuing must neither replay prior effects nor execute the cancelled suffix')
       }
@@ -352,7 +388,7 @@ for (const redacted of [false, true]) {
       const content = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
       assert.match(content, redacted ? /REDACTED/ : /output awaiting persistence/)
       assert.match(content, /InterruptedError|KeyboardInterrupt/)
-      const notice = host.events.findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
+      const notice = host.events.findLast(event => event.type === streamRecoveryEvent && event.data.phase === 'result')
       if (redacted) assert.doesNotMatch(JSON.stringify([notice, result]), /output awaiting persistence/)
       assert.deepEqual(effects.map(({ value }) => value), ['once'])
     } finally { release.resolve(); await running.catch(() => {}) }
@@ -627,10 +663,10 @@ await scenario('accepted-content-survives-final-join', {
 }, async ({ host }) => {
   await host.run({ signal: AbortSignal.timeout(15000) })
   const result = host.events.find(event => event.type === 'tool/result')
-  const ledger = host.events.find(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result')
+  const ledger = host.events.find(event => event.type === streamRecoveryEvent && event.data.phase === 'result')
   assert.match(JSON.stringify(result), /REDACTED/)
   assert.doesNotMatch(JSON.stringify([result, ledger]), /private-output-marker/)
-  assert.equal(ledger.data.message.source.outcome, 'REDACTED')
+  assert.equal(ledger.data.outcome, 'REDACTED')
 })
 
 let duplicate

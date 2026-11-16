@@ -91,6 +91,11 @@ async function expand(page, closed = false) {
   }
 }
 
+async function assertNoRecoveryRows(page) {
+  assert.equal(await page.getByText(/Python streaming (started|settled)/).count(), 0, 'Chat shows internal Python recovery records')
+  assert.equal(await page.locator('tr[data-kind="context"]').getByText('—', { exact: true }).count(), 0, 'Trajectory shows blank Python recovery rows')
+}
+
 async function inspect(page, callId) {
   const child = page.locator(`[data-chat-call-id="${callId}"]`)
   await child.locator('[data-sample="bash"]').click()
@@ -177,6 +182,7 @@ try {
       if (!streaming) assert.deepEqual(await effects(), [], 'whole-cell mode executed before provider EOF')
       else await until(effects, values => values.length === 1, 'the streaming prefix did not execute')
       await expand(page)
+      await assertNoRecoveryRows(page)
       const card = page.locator(`[data-tool="${toolName}"]`)
       await card.getByText(title, { exact: true }).waitFor()
       await card.getByText(toolName === 'python' ? 'Verify incremental execution' : /Verify incremental execution/, { exact: toolName === 'python' }).waitFor()
@@ -189,6 +195,7 @@ try {
         assert.equal(inspected.isError, false)
         selectedKey = await inspect(page, inspected.subCallId)
         await page.locator(`tr[data-trajectory-row-key="${encodeURIComponent('tool\0call\0codeact-web-call')}"]`).getByText(toolName, { exact: true }).waitFor()
+        await assertNoRecoveryRows(page)
       }
       const approval = page.locator('[data-approval-key]'), command = 'printf CODEACT_APPROVED >> approval-effects'
       let approvalKey
@@ -240,12 +247,14 @@ try {
       await page.goto(host.url)
       await page.getByText('Verify the CodeAct web fixture.', { exact: true }).first().click()
       await expand(page, true)
+      await assertNoRecoveryRows(page)
       // An aborted prefix has no persisted complete arguments; its known Python parent and children still survive.
       await page.locator(`[data-tool="${toolName}"]`).getByText(title, { exact: true }).waitFor()
       if (toolName !== 'python') assert.equal(await page.locator('[data-tool="python"]').count(), 0, 'restoration must preserve the actual tool name')
       if (!stopped) await page.getByText('Verify incremental execution', { exact: true }).waitFor()
       assert.equal(await inspect(page, inspected.subCallId), selectedKey, 'cold history changed the inspected call identity')
       await page.locator(`tr[data-trajectory-row-key="${encodeURIComponent('tool\0call\0codeact-web-call')}"]`).getByText(toolName, { exact: true }).waitFor()
+      await assertNoRecoveryRows(page)
       assert.deepEqual(await effects(), previous, 'cold restoration replayed side effects')
       assert.deepEqual(await rows(join(caseDirectory, 'requests.jsonl')), requests, 'cold restoration unexpectedly requested a model')
       assert.deepEqual(errors, [], 'the actual Web client raised an exception')

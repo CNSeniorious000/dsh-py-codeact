@@ -122,7 +122,7 @@ test('production source retains many child dispatches without repeatedly copying
 })
 
 test('production preserves observed names, leaves unknown names blank and lets canonical calls take over', () => {
-  for (const kind of ['tool-call', 'trajectory-tool-call']) for (const name of ['py', 'python']) for (const durable of [false, true]) for (const legacy of [false, true]) {
+  for (const kind of ['tool-call', 'trajectory-tool-call']) for (const name of ['py', 'python']) for (const durable of [false, true]) for (const format of ['user/message', 'developer/message', 'plugin:dsh-py-codeact/stream-recovery']) {
     const h = harness(), original = { ...native(kind),
       start: (_context, match) => ({ name: match.event.data.name ?? match.event.data.chunk?.name ?? '', subCalls: [], args: {} }),
       update: (context, match) => match.event.type === 'tool/call' ? { ...context.state, name: match.event.data.name } : context.state,
@@ -139,7 +139,9 @@ test('production preserves observed names, leaves unknown names blank and lets c
       return definition.buildViewNode({ ...context, state }).data.root.name
     }
     const source = { kind: 'python-stream', phase: 'start', callId: 'parent', turn: 1, step: 1 }
-    const admission = legacy ? event('user/message', { source }) : event('developer/message', { turn: 1, step: 1, message: { source, content: [] } })
+    const admission = event(format, format === 'user/message' ? { source } : format === 'developer/message' ? { turn: 1, step: 1, message: { source, content: [] } } : source)
+    const chat = h.definitions.get(kind === 'tool-call' ? 'py-codeact-stream' : 'py-codeact-trajectory')
+    assert.equal(chat.match(admission).exclusive, format.startsWith('plugin:') ? undefined : true)
     assert.equal(accept({ ...admission, seq: 0 }), '')
     const observed = durable ? { ...event('assistant/attempt', { stream: [{ type: 'tool-call-chunks', id: 'parent' }, { type: 'tool-call-chunks', id: 'parent', name }] }), seq: 1 } : delta(1, '{}', name).event
     assert.equal(accept(observed), name)
@@ -147,4 +149,21 @@ test('production preserves observed names, leaves unknown names blank and lets c
     assert.equal(accept({ ...event('tool/call', { callId: 'parent', name: 'canonical', arguments: '{}' }), seq: 3 }), 'canonical')
     h.close()
   }
+})
+
+test('only legacy Python recovery input rows are suppressed after settlement', () => {
+  const h = harness()
+  h.events.register(native()); h.events.register(native('trajectory-tool-call'))
+  for (const kind of ['py-codeact-stream', 'py-codeact-trajectory']) {
+    const definition = h.definitions.get(kind), source = { kind: 'python-stream', phase: 'result', callId: 'parent' }
+    for (const message of [event('user/message', { source }), event('developer/message', { message: { source } })]) {
+      assert.equal(definition.match(message).exclusive, true)
+      const match = { event: message, location: { kind: 'unresolved' } }
+      assert.equal(definition.buildViewNode({ matches: [match], state: definition.start({}, match) }), null)
+      assert.equal(h.definitions.get('py-codeact-source').match(message), null)
+    }
+    assert.equal(definition.match(event('user/message', { source: { kind: 'user' } })), null)
+    assert.equal(definition.match(event('developer/message', { message: { source: { kind: 'tool-registry' } } })), null)
+  }
+  h.close()
 })

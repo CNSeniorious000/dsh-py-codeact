@@ -9,6 +9,7 @@ import { ToolsService, defineTool } from '@deepseek-ai/dsh-tools'
 import { LlmRuntime, createUserMessage } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import plugin, { apply } from '../lib/index.js'
+import { streamRecoveryEvent } from '../lib/streaming-recovery.js'
 import { createHost } from './streaming-fixture.js'
 
 const prompt = () => createUserMessage({ content: [{ type: 'text', text: 'Run the fixture.' }], source: { kind: 'human' } })
@@ -44,7 +45,7 @@ try {
     const events = agent.session.snapshotEvents()
     const result = events.find(event => event.type === 'tool/result')
     assert.notEqual(result.data.message.isError, true)
-    assert.ok(events.find(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream' && event.data.message.source.phase === 'result').seq < events.find(event => event.type === 'step/end').seq)
+    assert.ok(events.find(event => event.type === streamRecoveryEvent && event.data.phase === 'result').seq < events.find(event => event.type === 'step/end').seq)
   }
   await second.dispose()
   second = undefined

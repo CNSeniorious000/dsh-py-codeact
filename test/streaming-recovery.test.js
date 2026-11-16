@@ -9,20 +9,13 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { mkdtemp, open, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { hashArguments, hashDecodedArguments, installRecovery, recordSource } from '../lib/streaming-recovery.js'
+import { hashArguments, hashDecodedArguments, installRecovery, recordSource, streamRecoveryEvent } from '../lib/streaming-recovery.js'
 
 const identity = { streamId: 'stream-1', callId: 'python-1', turn: 1, step: 1 }
 // DSH 0.2.2-rc.2+ wraps the string denial returned by earlier hosts.
 const guardReason = (denial) => typeof denial === 'string' ? denial : denial?.reason
-const latestRecord = session => session.snapshotEvents().findLast(event => event.type === 'developer/message' && event.data.message.source.kind === 'python-stream').data.message
-const notices = new WeakMap()
-const record = (session, phase, data = {}) => {
-  let owned = notices.get(session)
-  if (!owned) notices.set(session, owned = new Map())
-  const source = { ...identity, ...data }, seq = recordSource(session, phase, source, owned.get(source.streamId))
-  owned.set(source.streamId, seq)
-  return seq
-}
+const latestRecord = session => session.snapshotEvents().findLast(event => event.type === streamRecoveryEvent).data
+const record = (session, phase, data = {}) => recordSource(session, phase, { ...identity, ...data })
 async function environment(options) {
   const ctx = new Context()
   new SessionStore(ctx)
@@ -155,23 +148,24 @@ test('session flush persists admission before restart without a result', async (
 })
 
 
-test('recovery evidence survives fork and restore without adding chat or model messages', async () => {
+test('recovery evidence survives fork and restore without changing the message surface', async () => {
   const env = await environment()
   try {
     const session = env.ctx.sessions.create('native-notices', { meta: { cwd: process.cwd() } })
     const start = record(session, 'start')
     const admission = latestRecord(session)
     assert.deepEqual(session.deriveMessages(), [])
-    assert.equal(admission.source.phase, 'start')
+    assert.equal(admission.phase, 'start')
     const result = record(session, 'result', { result: { content: [{ type: 'text', text: 'Accepted visible output' }], value: 'private canonical result' } })
     assert.deepEqual(session.deriveMessages(), [])
-    assert.equal(latestRecord(session).source.phase, 'result')
-    assert.match(latestRecord(session).source.output, /Accepted visible output/)
+    assert.equal(latestRecord(session).phase, 'result')
+    assert.match(latestRecord(session).output, /Accepted visible output/)
     assert.doesNotMatch(JSON.stringify(session.snapshotEvents()), /private canonical result/)
-    assert.deepEqual(session.eventAt(result).sourceEventSeqs, [start])
+    assert.equal(session.eventAt(result).surfaceOp, undefined)
+    assert.equal(session.surface.contentGeneration, 0)
     const fork = env.ctx.sessions.fork(session, start, 'before-settlement')
     assert.match(env.recovery.context(fork), /execution outcome unknown/)
-    assert.equal(latestRecord(fork).source.phase, 'start')
+    assert.equal(latestRecord(fork).phase, 'start')
     const restored = Session.create('restored-notices', session.snapshotEvents(), { ...session.header, id: 'restored-notices' })
     assert.match(env.recovery.context(restored), /Accepted visible output/)
     assert.deepEqual(restored.deriveMessages(), [])
@@ -189,10 +183,10 @@ test('recovery metadata stays bounded while persisted notices retain the full ou
       const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
       const restored = Session.create(saved.header.id, saved.events, saved.header)
       const notice = latestRecord(restored)
-      assert.equal(notice.source.outcome.isWellFormed(), true, 'truncation must not create an unpaired surrogate')
-      assert.equal(notice.source.outcome, expected)
-      assert.ok(notice.source.output.endsWith(text), 'history must retain output beyond the recovery metadata limit')
-      assert.equal(Buffer.from(notice.source.output, 'utf8').toString('utf8'), notice.source.output)
+      assert.equal(notice.outcome.isWellFormed(), true, 'truncation must not create an unpaired surrogate')
+      assert.equal(notice.outcome, expected)
+      assert.ok(notice.output.endsWith(text), 'history must retain output beyond the recovery metadata limit')
+      assert.equal(Buffer.from(notice.output, 'utf8').toString('utf8'), notice.output)
     }
   } finally { await env.close() }
 })
@@ -216,8 +210,8 @@ test('restored recovery distinguishes empty output, failed output and an absent 
       const saved = JSON.parse(JSON.stringify({ header: session.header, events: session.snapshotEvents() }))
       const restored = Session.create(saved.header.id, saved.events, saved.header)
       const notice = latestRecord(restored)
-      assert.equal(notice.source.outcome, expected)
-      assert.ok(notice.source.output.endsWith(expected))
+      assert.equal(notice.outcome, expected)
+      assert.ok(notice.output.endsWith(expected))
       assert.ok(env.recovery.context(restored).endsWith(expected))
     }
   } finally { await env.close() }

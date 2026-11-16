@@ -28,6 +28,8 @@ jobs:
           && (github.event.action != 'ready_for_review' || github.event.pull_request.user.type == 'Bot')
           && (github.event_name == 'pull_request_target' || github.event.sender.type != 'Bot'))
     uses: promplate/code-review/.github/workflows/review.yml@main
+    with:
+      codex-config: ${{ vars.CODEX_CONFIG }}
+      model-catalog: ${{ vars.CODEX_MODEL_CATALOG }}
     secrets:
-      codex-config: ${{ secrets.CODEX_CONFIG }}
       codex-auth: ${{ secrets.CODEX_AUTH }}

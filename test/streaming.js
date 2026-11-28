@@ -150,7 +150,7 @@ for (const changed of [false, true]) {
   })
 }
 
-for (const mutation of ['call-id', 'tool-name', 'extra-call', 'text-replacement']) {
+for (const mutation of ['call-id', 'tool-name', 'text-replacement']) {
   let effect
   await scenario(`authoritative-${mutation}-change-cannot-replay`, {
     async *stream(_request, attempt) {
@@ -165,8 +165,6 @@ for (const mutation of ['call-id', 'tool-name', 'extra-call', 'text-replacement'
       await effect('first')
       yield { type: 'block-end', index: 0, block: mutation === 'text-replacement' ? { type: 'text', text: 'The tool call was replaced.' }
         : { type: 'tool-call', id: mutation === 'call-id' ? 'changed-id' : 'python-1', name: mutation === 'tool-name' ? 'probe' : 'python', arguments: args } }
-      if (mutation === 'extra-call') yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'extra-id', name: 'python',
-        arguments: JSON.stringify({ code: 'counter += 10\n', description: 'This unadmitted call must not execute' }) } }
       yield finish()
     },
   }, async ({ host, effects, observed }) => {
@@ -179,6 +177,70 @@ for (const mutation of ['call-id', 'tool-name', 'extra-call', 'text-replacement'
     assert.match(JSON.stringify(result.content), /STATE 1 True/, 'changed final identities must neither replay Python nor outlive their step cleanup')
   })
 }
+
+let deferredEffect, deferredEffects
+await scenario('second-call-runs-as-a-whole-cell-after-the-streamed-one', {
+  async *stream() {
+    yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='first')\n", description: 'Streamed cell' }), 'python-1')
+    await deferredEffect('first')
+    const deferredArgs = JSON.stringify({ code: "await probe(value='second')\n", description: 'Deferred cell' })
+    yield { type: 'tool-call-delta', index: 1, id: 'python-2', name: 'python', argumentsDelta: deferredArgs }
+    yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'python-2', name: 'python', arguments: deferredArgs } }
+    await pause(50)
+    assert.deepEqual(deferredEffects.map(({ value }) => value), ['first'], 'a second call must not execute while the response generates')
+    yield finish()
+  },
+}, async ({ host, effects, observed, dispatches }) => {
+  deferredEffect = observed; deferredEffects = effects
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['first', 'second'])
+  const results = host.events.filter(event => event.type === 'tool/result').map(event => event.data.message)
+  assert.deepEqual(results.map(message => message.source.callId).sort(), ['python-1', 'python-2'])
+  assert.deepEqual(results.map(message => message.isError), [false, false])
+  assert.equal(dispatches.filter(({ name }) => name === 'python_stream').length, 1)
+  assert.deepEqual(dispatches.filter(({ name, parent }) => name === 'python' && !parent).map(({ callId }) => callId).sort(), ['python-1', 'python-2'])
+})
+
+let reclosingEffect
+await scenario('admitted-source-re-closed-at-another-index-cannot-replay', {
+  async *stream() {
+    const args = JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\n", description: 'Re-closed invocation' })
+    yield delta(args, 'python-1')
+    await reclosingEffect('once')
+    yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'replaced-id', name: 'python', arguments: args } }
+    yield finish()
+  },
+}, async ({ host, effects, observed }) => {
+  reclosingEffect = observed
+  await assert.rejects(host.run({ signal: AbortSignal.timeout(15000) }))
+  assert.deepEqual(effects.map(({ value }) => value), ['once'])
+  assert.equal(host.events.filter(event => event.type === 'tool/result' && event.data.message.source.callId === 'replaced-id').length, 0)
+})
+
+const replacementArgs = JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\n", description: 'Replay under a new call id' })
+let replacement
+await scenario('admitted-source-under-a-new-call-id-cannot-replay', {
+  setup({ ctx }) {
+    let dispatched = false
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      if (exec.name === 'python' && !result.isError && !dispatched) {
+        dispatched = true
+        replacement = await ctx.tools.execute({ agent: exec.agent, signal: exec.signal, toolSet: exec.toolSet,
+          calls: [{ type: 'tool-call', id: 'replacement-id', name: 'python', arguments: replacementArgs }] })
+      }
+      return next()
+    })
+  },
+  async *stream() {
+    yield delta(replacementArgs, 'python-1')
+    yield finish()
+  },
+}, async ({ host, effects }) => {
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.equal(replacement.results[0].result.isError, true)
+  assert.match(JSON.stringify(replacement.results[0].result), /identity differs/)
+  assert.deepEqual(effects.map(({ value }) => value), ['once'])
+})
 
 for (const failure of ['max-tokens', 'disconnect', 'missing-finish']) {
   let effect

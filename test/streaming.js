@@ -212,9 +212,32 @@ await scenario('admitted-source-re-closed-at-another-index-cannot-replay', {
   },
 }, async ({ host, effects, observed }) => {
   reclosingEffect = observed
-  await assert.rejects(host.run({ signal: AbortSignal.timeout(15000) }))
+  await host.run({ signal: AbortSignal.timeout(15000) })
   assert.deepEqual(effects.map(({ value }) => value), ['once'])
-  assert.equal(host.events.filter(event => event.type === 'tool/result' && event.data.message.source.callId === 'replaced-id').length, 0)
+  const duplicate = host.events.filter(event => event.type === 'tool/result' && event.data.message.source.callId === 'replaced-id')
+  assert.equal(duplicate.length, 1, 'the duplicate must be refused as a result, not dispatched')
+  assert.equal(duplicate[0].data.message.isError, true)
+  assert.match(JSON.stringify(duplicate[0].data.message.content), /repeats the admitted source/)
+})
+
+let completeEffects
+await scenario('complete-call-before-a-streamed-one-preserves-order', {
+  async *stream() {
+    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'python-1', name: 'python',
+      arguments: JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='first')\n", description: 'Complete cell' }) } }
+    yield { type: 'tool-call-delta', index: 1, id: 'python-2', name: 'python',
+      argumentsDelta: JSON.stringify({ code: "await probe(value='second')\n", description: 'Later cell' }) }
+    await pause(50)
+    assert.deepEqual(completeEffects.map(({ value }) => value), [], 'a later call must not stream past an earlier complete one')
+    yield finish()
+  },
+}, async ({ host, effects }) => {
+  completeEffects = effects
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['first', 'second'])
+  const results = host.events.filter(event => event.type === 'tool/result').map(event => event.data.message)
+  assert.deepEqual(results.map(message => message.isError), [false, false])
+  assert.doesNotMatch(JSON.stringify(results), /kernel busy/)
 })
 
 const replacementArgs = JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\n", description: 'Replay under a new call id' })
@@ -238,7 +261,7 @@ await scenario('admitted-source-under-a-new-call-id-cannot-replay', {
 }, async ({ host, effects }) => {
   await host.run({ signal: AbortSignal.timeout(15000) })
   assert.equal(replacement.results[0].result.isError, true)
-  assert.match(JSON.stringify(replacement.results[0].result), /identity differs/)
+  assert.match(JSON.stringify(replacement.results[0].result), /repeats the admitted source/)
   assert.deepEqual(effects.map(({ value }) => value), ['once'])
 })
 

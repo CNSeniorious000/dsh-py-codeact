@@ -144,7 +144,7 @@ for (const streaming of [false, true]) {
 const ctx = new Context(), waiting = Promise.withResolvers(), release = Promise.withResolvers()
 // 0.2.3-alpha.3 lists through the selected root; an unloaded root means the plugin's tools are gone with it.
 const definitions = () => {
-  try { return ctx.tools.setRoot ? ctx.tools.getAll() : definitions() } catch { return [] }
+  try { return ctx.tools.setRoot ? ctx.tools.getAll() : ctx.tools.definitions() } catch { return [] }
 }
 class DelayedProjections extends SessionProjectionRegistry {
   async register(definition) {

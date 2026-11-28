@@ -5,6 +5,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import codeAct, { apply as applyCodeAct } from '../lib/index.js'
 import Tools from '@deepseek-ai/dsh-tools'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import settings, { Config, apply, readStreaming, readToolConcurrency } from '../lib/settings.js'
 
 for (const missing of ['sandboxPolicy', 'subprocess']) test(`execution follows the ${missing} provider lifetime`, async () => {
@@ -12,6 +13,7 @@ for (const missing of ['sandboxPolicy', 'subprocess']) test(`execution follows t
   const provide = (name) => ctx.plugin({ name: `fixture-${name}`, apply(child) { child.provide(name, {}) } })
   let mounted
   try {
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(Tools)
     await provide(missing === 'subprocess' ? 'sandboxPolicy' : 'subprocess')

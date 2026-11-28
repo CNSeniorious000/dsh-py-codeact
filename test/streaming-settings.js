@@ -18,7 +18,9 @@ async function bounded(operation) {
   finally { clearTimeout(timer) }
 }
 
-for (const missing of ['sessions', 'sessionProjections', 'llm']) {
+// 0.2.3-alpha.2 made sessionProjections a requirement of SystemPrompt itself, so no host on this line can
+// bootstrap without it; the older hosts that could are covered by their own compatibility jobs.
+for (const missing of ['sessions', 'llm']) {
   const ctx = new Context()
   try {
     await ctx.plugin(LocalSubprocess)
@@ -49,9 +51,11 @@ const host = await createHost({
   },
   async *stream(request, number) {
     const streaming = number % 2 === 0
-    const prompt = JSON.stringify(request)
-    assert.match(prompt, streaming ? /Stable statements execute once/ : /LAST expression is echoed/)
-    assert.doesNotMatch(prompt, streaming ? /LAST expression is echoed/ : /Stable statements execute once/)
+    // A mode switch appends a replacement system message, so history carries the other mode's text; the step's own
+    // instructions are the last system message.
+    const current = JSON.stringify(request.messages.filter(message => message.role === 'system').at(-1)?.content ?? '')
+    assert.match(current, streaming ? /Stable statements execute once/ : /LAST expression is echoed/)
+    assert.doesNotMatch(current, streaming ? /LAST expression is echoed/ : /Stable statements execute once/)
     const code = 'import os\nfrom __dsh__.tools import probe\ncounter = globals().get("counter", 0) + 1\nawait probe(value=counter)\nprint("STATE", counter, os.getpid())\ncounter\n'
     yield { type: 'tool-call-delta', index: 0, id: `cell-${number}`, name: 'python', argumentsDelta: '{"code":' + JSON.stringify(code).slice(0, -1) }
     // A settings write during generation affects the next request, including when this one has not started executing.

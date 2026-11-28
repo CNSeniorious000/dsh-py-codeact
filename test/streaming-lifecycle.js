@@ -145,8 +145,11 @@ const ctx = new Context(), waiting = Promise.withResolvers(), release = Promise.
 class DelayedProjections extends SessionProjectionRegistry {
   async register(definition) {
     const handle = await super.register(definition)
-    waiting.resolve()
-    await release.promise
+    // SystemPrompt registers its own admission projection while mounting; only this plugin's registrations are held.
+    if (definition.key.startsWith('dsh-py-codeact/')) {
+      waiting.resolve()
+      await release.promise
+    }
     return handle
   }
 }

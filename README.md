@@ -268,7 +268,7 @@ A pure CPU loop (`while True: pass`) never reaches an await point. After `hardIn
 
 By default the kernel gets an allowlist — `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM` — not the empty environment the worker-thread runtime uses. CPython running IPython needs a profile dir and a `PATH` for shell escapes; the point is excluding ambient credentials, which an allowlist does just as well. `inheritEnv: true` passes the whole harness environment.
 
-Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
+Execution requires DSH 0.2.1-rc.2 or later with `sandboxPolicy` and `subprocess` services. The supported host line ends at `0.2.3-alpha.2`; `0.2.3-alpha.3` replaced `setExecutor` with `setRoot` and ships no matching PTC executor release yet, so it is not supported until upstream catches up. The Python interpreter runs through the host’s managed subprocess provider, including descendant termination, and resolves the session’s `sandboxPolicy` and uses `ctx.sandbox.confine` in `read-only` and `workspace-write` modes. Only an explicit `danger-full-access` policy skips confinement. A missing policy/provider fails closed. Interpreter provisioning is host setup; model cells run inside the confined process. The initial cwd comes from the working-directory service when available; the immutable session cwd still defines the sandbox boundary.
 
 Changing a session’s sandbox mode or effective working directory retires its existing kernel, so variables and open handles are lost. Pending bridged calls are cancelled and drained before a replacement starts. Other sessions keep their interpreters.
 
@@ -280,11 +280,7 @@ Changing a session’s sandbox mode or effective working directory retires its e
 dsh plugin --profile <name> add dsh-py-codeact
 ```
 
-On DSH 0.2.2 and other hosts with the split tool-executor API, the Python SDK renderer is **required**. Install it alongside the plugin, using the exact version of your DSH host (for example, `0.2.2-rc.1`):
-
-```sh
-dsh plugin --profile <name> add dsh-py-codeact @deepseek-ai/dsh-tool-executor-ptc@<dsh-version>
-```
+The Python SDK renderer is bundled. Hosts that still export one (`0.2.2-rc.x`) supply it; `0.2.3-alpha.2` removed it from the released executor, so the plugin uses its vendored copy and no extra package is installed.
 
 The renderer peer is optional in package metadata only to preserve legacy hosts, which export the renderer from `dsh-tools` and cannot satisfy the new executor's host peers. Split-API hosts must provide it; a missing renderer produces an explicit installation error. Other import failures retain their original diagnostic.
 
@@ -304,7 +300,7 @@ Streaming was verified with a live provider on DSH 0.2.2-rc.1 headless: bridged 
 
 ## Test
 
-`bun run test` covers the installed host, including its registry API. CI tests the pinned development host and the exact 0.2.1-rc.2, 0.2.2-rc.1, and 0.2.2-rc.2 host sets on Ubuntu, macOS, and Windows. Each 0.2.2 host also runs streaming and browser tests on all three platforms. `bun run test:streaming` requires the matching DSH 0.2.2 host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
+`bun run test` covers the installed host, including its registry API. CI tests the pinned development host (`0.2.3-alpha.2`) and the exact 0.2.1-rc.2, 0.2.2-rc.1, and 0.2.2-rc.2 host sets on Ubuntu, macOS, and Windows. Every host newer than 0.2.1-rc.2 also runs streaming and browser tests on all three platforms. `bun run test:streaming` requires the matching DSH host set and exercises real AgentLoop lifecycle events, tool policies, persistence, and a Python worker with controlled model streams.
 
 `bun run test:web` installs official DSH and a packed plugin in a temporary directory, then tests streaming, whole-cell execution, Stop, Inspect, approvals, and cold history restoration in Chromium. It requires Bun, pnpm, and uv; all test servers use automatically assigned ports.
 

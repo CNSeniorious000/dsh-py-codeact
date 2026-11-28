@@ -22,7 +22,10 @@ async function environment(options) {
   new SessionProjectionRegistry(ctx)
   new SystemPrompt(ctx, { includeHarnessIdentity: false })
   new ToolsService(ctx)
-  ctx.tools.setExecutor({ describe: () => ({ schemas: [] }), execute: () => { throw new Error('This recovery fixture does not execute tools') } })
+  // 0.2.3-alpha.3 selects a root registry; an empty native root never executes this fixture's calls either.
+  const { NativeToolRegistry } = await import('@deepseek-ai/dsh-tools/pipeline').catch(() => ({}))
+  if (ctx.tools.setRoot && NativeToolRegistry) ctx.tools.setRoot(new NativeToolRegistry('recovery-fixture'))
+  else ctx.tools.setExecutor({ describe: () => ({ schemas: [] }), execute: () => { throw new Error('This recovery fixture does not execute tools') } })
   return { ctx, recovery: await installRecovery(ctx, options), async close() { await ctx.fiber.dispose() } }
 }
 

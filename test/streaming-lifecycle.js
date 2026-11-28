@@ -142,6 +142,10 @@ for (const streaming of [false, true]) {
 }
 
 const ctx = new Context(), waiting = Promise.withResolvers(), release = Promise.withResolvers()
+// 0.2.3-alpha.3 lists through the selected root; an unloaded root means the plugin's tools are gone with it.
+const definitions = () => {
+  try { return ctx.tools.setRoot ? ctx.tools.getAll() : definitions() } catch { return [] }
+}
 class DelayedProjections extends SessionProjectionRegistry {
   async register(definition) {
     const handle = await super.register(definition)
@@ -167,20 +171,20 @@ try {
   release.resolve()
   await disposal
   await Promise.resolve(pending).catch(() => {})
-  assert.equal(ctx.tools.definitions().length, 0)
+  assert.equal(definitions().length, 0)
   const replacement = await ctx.plugin({ ...plugin, name: 'replacement-streaming', apply: (child) => apply(child, { streaming: true }) })
-  assert.ok(ctx.tools.definitions().some(tool => tool.name === 'python'))
+  assert.ok(definitions().some(tool => tool.name === 'python'))
   await replacement.update({ streaming: true })
-  assert.equal(ctx.tools.definitions().filter(tool => tool.name === 'python').length, 1)
+  assert.equal(definitions().filter(tool => tool.name === 'python').length, 1)
   await llm.dispose()
-  assert.equal(ctx.tools.definitions().length, 0, 'dependent tools must unload with the LLM service')
+  assert.equal(definitions().length, 0, 'dependent tools must unload with the LLM service')
   await ctx.plugin(LlmRuntime)
-  for (let tries = 0; !ctx.tools.definitions().some(tool => tool.name === 'python'); tries++) {
+  for (let tries = 0; !definitions().some(tool => tool.name === 'python'); tries++) {
     assert.ok(tries < 100, 'streaming did not reactivate after its service returned')
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   await replacement.dispose()
-  assert.equal(ctx.tools.definitions().length, 0)
+  assert.equal(definitions().length, 0)
   console.log('PASS: HMR and required-service replacement release and recreate streaming effects')
   console.log('PASS: disposal during projection registration leaves no late tools or stale registrations')
 } finally { release.resolve(); await ctx.fiber.dispose() }

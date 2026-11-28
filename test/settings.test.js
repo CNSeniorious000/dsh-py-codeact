@@ -16,6 +16,9 @@ for (const missing of ['sandboxPolicy', 'subprocess']) test(`execution follows t
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(Tools)
+    // 0.2.3-alpha.3 needs a root registry; `mode: both` leaves the host's own in place, so stand one up.
+    const { NativeToolRegistry } = await import('@deepseek-ai/dsh-tools/pipeline').catch(() => ({}))
+    if (NativeToolRegistry && ctx.tools.setRoot) ctx.tools.setRoot(new NativeToolRegistry('fixture'))
     await provide(missing === 'subprocess' ? 'sandboxPolicy' : 'subprocess')
     mounted = ctx.plugin(codeAct, { mode: 'both', streaming: false })
     await new Promise(resolve => setTimeout(resolve, 0))

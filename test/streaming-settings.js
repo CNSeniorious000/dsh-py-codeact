@@ -92,7 +92,7 @@ try {
 } finally { await host.close() }
 
 for (const streaming of [false, true]) {
-  let admitted = false, rejectBinding = false, code, bindingHost
+  let admitted = false, rejectBinding = false, code, bindingHost, toggle
   const method = streaming ? 'execStream' : 'exec', execute = PythonKernel.prototype[method], catalogues = []
   PythonKernel.prototype[method] = function (source, signal, specs, shell) {
     catalogues.push(specs?.map(({ name }) => name))
@@ -104,8 +104,15 @@ for (const streaming of [false, true]) {
     bindingHost = await createHost({
       id: `binding-cache-${streaming}`, streaming,
       setup({ ctx }) {
-        ctx.tools.register(defineTool({ name: 'binding_probe', description: 'Observe a changing catalogue.', parameters: {},
-          output: { schema: { type: 'string' }, render: () => [] }, execute: () => 'bound' }), { when: () => admitted })
+        // 0.2.3-alpha.3 dropped the `when` registration option; register and dispose to change the catalogue instead.
+        const probe = defineTool({ name: 'binding_probe', description: 'Observe a changing catalogue.', parameters: {},
+          output: { schema: { type: 'string' }, render: () => [] }, execute: () => 'bound' })
+        let dispose
+        toggle = (value) => {
+          admitted = value
+          if (value && dispose === undefined) dispose = ctx.tools.register(probe)
+          else if (!value && dispose !== undefined) { dispose(); dispose = undefined }
+        }
       },
       async *stream() {
         yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: `binding-${catalogues.length}`, name: 'python', arguments: JSON.stringify({ code, description: 'Inspect available bindings' }) } }
@@ -119,15 +126,15 @@ for (const streaming of [false, true]) {
       return bindingHost.events.findLast(event => event.type === 'tool/result').data.message.content.map(block => block.text ?? '').join('\n')
     }
     assert.match(await run(), /BOUND False/)
-    admitted = true; rejectBinding = true
+    toggle(true); rejectBinding = true
     assert.match(await run(), /binding rejected before execution/)
     assert.match(await run(), /BOUND True/, 'a failed catalogue must be retried before executing the next cell')
     assert.ok(catalogues.at(-1)?.includes('binding_probe'))
-    admitted = false
+    toggle(false)
     assert.match(await run(), /BOUND False/)
-    admitted = true
+    toggle(true)
     assert.match(await run(inspect + 'raise RuntimeError("after rebinding")\n'), /BOUND True[\s\S]*after rebinding/)
-    admitted = false
+    toggle(false)
     assert.match(await run(), /BOUND False/, 'a runtime error must invalidate the previous catalogue cache too')
     assert.ok(catalogues.at(-1))
     console.log(`PASS: binding failures streaming=${streaming} retry new catalogues and discard stale ones`)
@@ -149,9 +156,11 @@ for (const [streaming, restricted] of [[false, false], [true, false], [true, tru
     async *stream(request) {
       assert.match(JSON.stringify(request), streaming ? /Stable statements execute once/ : /LAST expression is echoed/)
       if (restricted) {
-        assert.ok(ctx.tools.executable('python_stream', agent, toolSet))
+        // 0.2.3-alpha.3 resolves the capability through the selected root; both forms honor the restriction.
+        const executable = (name) => ctx.tools.setRoot ? ctx.tools.get(name, agent) !== undefined : ctx.tools.executable(name, agent, toolSet) !== undefined
+        assert.ok(executable('python_stream'))
         releaseRestriction = agent.ctx.tools.restrict({ deny: ['python_stream'] })
-        assert.equal(ctx.tools.executable('python_stream', agent, toolSet), undefined)
+        assert.equal(executable('python_stream'), false)
       }
       yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'complete-cell', name: 'python',
         arguments: JSON.stringify({ code: 'from __dsh__.tools import probe\ncounter = globals().get("counter", 0) + 1\nawait probe(value=counter)\nprint("FALLBACK", counter)\ncounter\n', description: 'Execute a completed Python call' }) } }

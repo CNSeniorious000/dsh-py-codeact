@@ -258,6 +258,22 @@ await scenario('buffered-source-diverging-from-its-close-runs-whole', {
   assert.deepEqual(results.map(message => message.isError), [false])
 })
 
+await scenario('buffered-source-renamed-at-its-close-runs-whole', {
+  async *stream() {
+    const code = "from __dsh__.tools import probe\nawait probe(value='renamed')\n"
+    yield { type: 'tool-call-delta', index: 0, id: 'python-1', argumentsDelta: '{"code":"' + encode(code) }
+    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'python-2', name: 'python',
+      arguments: JSON.stringify({ code, description: 'Renamed at close' }) } }
+    yield finish()
+  },
+}, async ({ host, effects }) => {
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['renamed'])
+  const results = host.events.filter(event => event.type === 'tool/result').map(event => event.data.message)
+  assert.deepEqual(results.map(message => message.isError), [false])
+  assert.equal(results[0].source.callId, 'python-2', 'the committed call runs under its own identity')
+})
+
 let deniedEffect
 await scenario('denied-streamed-cell-drains-before-the-next-call', {
   config: { hardInterruptMs: 1000 },

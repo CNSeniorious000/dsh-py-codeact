@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url'
 // Test the published integration surface: registry DSH, a packed plugin, and its actual browser client.
 const repository = fileURLToPath(new URL('../', import.meta.url))
 const plugin = JSON.parse(await readFile(join(repository, 'package.json'), 'utf8')), version = plugin.devDependencies['@deepseek-ai/dsh-tools']
+// The 0.2.3 line moved to the alpha toolchain; older hosts keep the versions their own peers declare.
+const [cordis, schemastery] = version.startsWith('0.2.3-') ? ['4.2.0-alpha.2', '3.20.0-alpha.2'] : ['4.1.0', '3.19.0']
 // Linux confinement replaces /tmp, so the packed worker and its interpreter must remain outside it.
 const requestedDirectory = process.argv[2] ? resolve(process.argv[2]) : await mkdtemp(join(homedir(), '.codeact-web-'))
 await mkdir(requestedDirectory, { recursive: true })
@@ -117,7 +119,7 @@ try {
   await cp(packed, join(directory, tarball))
   await writeFile(join(directory, 'package.json'), JSON.stringify({ private: true, type: 'module', dependencies: {
     ...Object.fromEntries(Object.keys(plugin.peerDependencies).filter(name => name.startsWith('@deepseek-ai/dsh-')).map(name => [name, version])),
-    '@deepseek-ai/dsh': version, '@deepseek-ai/cordis': '4.1.0', '@deepseek-ai/schemastery': '3.19.0', 'dsh-py-codeact': `file:./${tarball}`, playwright: '1.61.1',
+    '@deepseek-ai/dsh': version, '@deepseek-ai/cordis': cordis, '@deepseek-ai/schemastery': schemastery, 'dsh-py-codeact': `file:./${tarball}`, playwright: '1.61.1',
   } }))
   // DSH's package manager installs private copies, never links to a global Bun cache or installation.
   // Bun resolves Windows command shims while preserving the installed pnpm version.

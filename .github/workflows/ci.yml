@@ -105,9 +105,14 @@ jobs:
             const p = await Bun.file("package.json").json(), version = process.env.DSH_VERSION;
             for (const name of Object.keys(p.devDependencies)) if (name.startsWith("@deepseek-ai/dsh-")) p.devDependencies[name] = version;
             if (version === "0.2.1-rc.2") {
-              delete p.devDependencies["@deepseek-ai/dsh-tool-executor-ptc"];
               p.devDependencies["@deepseek-ai/cordis"] = "4.0.5";
               p.devDependencies["@deepseek-ai/schemastery"] = "3.18.5";
+            } else if (version.startsWith("0.2.3-")) {
+              p.devDependencies["@deepseek-ai/cordis"] = "4.2.0-alpha.2";
+              p.devDependencies["@deepseek-ai/schemastery"] = "3.20.0-alpha.2";
+            } else {
+              p.devDependencies["@deepseek-ai/cordis"] = "4.1.0";
+              p.devDependencies["@deepseek-ai/schemastery"] = "3.19.0";
             }
             await Bun.write("package.json", JSON.stringify(p, null, 2) + "\n");
           '

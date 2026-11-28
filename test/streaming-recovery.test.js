@@ -117,7 +117,7 @@ test('settlement projection exposes the authoritative complete assistant call', 
     const message = createAssistantMessage({ source: { provider: 'fixture', model: 'controlled' },
       content: [{ type: 'tool-call', id: 'python-1', name: 'python', arguments: '{"code":"print(42)","description":"Print a value"}' }] })
     const event = session.append('assistant/message', { turn: 1, step: 1, message }, { surfaceOp: 'append' })
-    assert.deepEqual(env.recovery.lastAssistant(session), { seq: event.seq, type: event.type, interrupted: false, count: 1, call: { id: 'python-1', name: 'python', hash: hashArguments(message.content[0].arguments) } })
+    assert.deepEqual(env.recovery.lastAssistant(session), { seq: event.seq, type: event.type, interrupted: false, calls: [{ id: 'python-1', name: 'python', hash: hashArguments(message.content[0].arguments) }] })
   } finally { await env.close() }
 })
 

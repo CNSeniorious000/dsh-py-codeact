@@ -240,6 +240,43 @@ await scenario('complete-call-before-a-streamed-one-preserves-order', {
   assert.doesNotMatch(JSON.stringify(results), /kernel busy/)
 })
 
+let bufferedEffects
+await scenario('buffered-source-diverging-from-its-close-runs-whole', {
+  async *stream() {
+    yield { type: 'tool-call-delta', index: 0, id: 'python-1', argumentsDelta: '{"code":"' + encode("from __dsh__.tools import probe\nawait probe(value='buffered')\n") }
+    await pause(40)
+    assert.deepEqual(bufferedEffects.map(({ value }) => value), [], 'source still waiting for its name must not execute')
+    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'python-1', name: 'python',
+      arguments: JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='authoritative')\n", description: 'Close wins' }) } }
+    yield finish()
+  },
+}, async ({ host, effects }) => {
+  bufferedEffects = effects
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['authoritative'])
+  const results = host.events.filter(event => event.type === 'tool/result').map(event => event.data.message)
+  assert.deepEqual(results.map(message => message.isError), [false])
+})
+
+let deniedEffect
+await scenario('denied-streamed-cell-drains-before-the-next-call', {
+  config: { hardInterruptMs: 1000 },
+  setup({ ctx }) { ctx.tools.guard(exec => exec.name === 'python' && exec.callId === 'python-1' ? 'final Python policy denied' : undefined) },
+  async *stream() {
+    yield delta(JSON.stringify({ code: "from __dsh__.tools import probe\nimport asyncio\nawait probe(value='first')\nawait asyncio.sleep(0.3)\n", description: 'Streamed cell' }), 'python-1')
+    await deniedEffect('first')
+    yield { type: 'tool-call-delta', index: 1, id: 'python-2', name: 'python', argumentsDelta: JSON.stringify({ code: "await probe(value='second')\n", description: 'Next cell' }) }
+    yield finish()
+  },
+}, async ({ host, effects, observed }) => {
+  deniedEffect = observed
+  await host.run({ signal: AbortSignal.timeout(15000) })
+  assert.deepEqual(effects.map(({ value }) => value), ['first', 'second'])
+  const results = host.events.filter(event => event.type === 'tool/result').map(event => event.data.message)
+  assert.deepEqual(results.map(message => message.isError), [true, false])
+  assert.doesNotMatch(JSON.stringify(results), /kernel busy/)
+})
+
 const replacementArgs = JSON.stringify({ code: "from __dsh__.tools import probe\nawait probe(value='once')\n", description: 'Replay under a new call id' })
 let replacement
 await scenario('admitted-source-under-a-new-call-id-cannot-replay', {
